@@ -1,0 +1,8 @@
+/build/
+/out/
+/package/
+/reference/browser-baseline-20260712.zip
+/.vs/
+.codex/startup-status.json
+*.user
+*.pdb

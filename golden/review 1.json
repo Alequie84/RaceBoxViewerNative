@@ -1,0 +1,21 @@
+{
+  "annotations": [
+    {
+      "active_lap": "R16",
+      "active_lap_index": 16,
+      "comment": "headroom needs to be added to this and all telemetry bars, you can make the graphs 1/5 times taller so they are easier to read, also a little less space between them. ",
+      "compare_lap_index": 6,
+      "id": 1,
+      "normalized_x": 0.412887841463089,
+      "normalized_y": 0.06818182021379471,
+      "plot_index": 4,
+      "surface": "Steering - Left / + Right %",
+      "telemetry_time_seconds": 434.625477,
+      "telemetry_time_us": 434625477,
+      "view_mode": "Single Lap"
+    }
+  ],
+  "format": "racebox-annotation-review",
+  "session": "session",
+  "version": 1
+}
