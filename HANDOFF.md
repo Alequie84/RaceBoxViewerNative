@@ -66,9 +66,9 @@ Outputs:
 - GUI: `build\release\RaceBoxViewer.exe`
 - validation CLI: `build\release\racebox_cli.exe`
 - portable folder: `package\RaceBoxViewer`
-- portable ZIP: `out\RaceBoxViewerNative-<VERSION>-win64.zip` (currently `.010`)
+- portable ZIP: `out\RaceBoxViewerNative-<VERSION>-win64.zip` (currently `.015`)
 
-The executable accepts VBO, RaceBox CSV, and Sanwa CSV paths on its command line or through **File > Open telemetry**. The demo launcher supplies all three golden files, including Sanwa.
+The executable accepts VBO, RaceBox CSV, and Sanwa CSV paths on its command line or through **File > Open telemetry**. Portable `.015` and later packages install all three golden files under `demo`, plus `Start RaceBox Demo.cmd`. When launched without file arguments, the packaged executable auto-loads that demo only if all three files exist; explicit user paths always take priority. Ordinary development builds have no adjacent `demo` folder and therefore still start empty unless the toolbox launcher supplies the three golden files.
 
 ## Architecture and source ownership
 

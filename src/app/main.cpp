@@ -29,6 +29,21 @@ ID3D11RenderTargetView* g_render_target{};
 bool g_software_renderer{};
 float g_pending_dpi_scale{};
 
+std::vector<std::filesystem::path> bundled_demo_files() {
+    wchar_t executable_path[MAX_PATH]{};
+    const auto length = GetModuleFileNameW(nullptr, executable_path, static_cast<DWORD>(std::size(executable_path)));
+    if (length == 0 || length >= std::size(executable_path)) return {};
+    const auto demo = std::filesystem::path(executable_path).parent_path() / L"demo";
+    std::vector<std::filesystem::path> files{
+        demo / L"session.vbo",
+        demo / L"session.csv",
+        demo / L"sanwa.csv"};
+    for (const auto& file : files) {
+        if (!std::filesystem::is_regular_file(file)) return {};
+    }
+    return files;
+}
+
 void release_render_target() {
     if (g_render_target) g_render_target->Release();
     g_render_target = nullptr;
@@ -149,6 +164,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
         }
         LocalFree(arguments);
     }
+    if (startup_files.empty()) startup_files = bundled_demo_files();
 
     WNDCLASSEXW window_class{sizeof(WNDCLASSEXW), CS_CLASSDC, window_proc, 0, 0, instance,
         LoadIconW(instance, MAKEINTRESOURCEW(101)), nullptr, nullptr, nullptr,

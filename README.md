@@ -4,9 +4,19 @@ Windows-native RaceBox and Sanwa telemetry analysis using C++20, DirectX 11, Dea
 
 Developer continuation notes and the browser-reference comparison are in [HANDOFF.md](HANDOFF.md). Codex startup guidance is in [AGENTS.md](AGENTS.md), and reusable developer commands are in [scripts/toolbox/README.md](scripts/toolbox/README.md).
 
+## Built with Codex and GPT-5.6
+
+RaceBox Telemetry Viewer was developed through a hands-on human/AI collaboration. The project owner supplied RC racing and mechanical expertise, real telemetry, visible troubleshooting observations, product decisions, and acceptance criteria. **OpenAI Codex powered by GPT-5.6** inspected the original React/Vite prototype, planned the native architecture, implemented and refactored the C++20 application, diagnosed synchronization and map-calibration problems, and produced the automated tests, packaging tools, developer handoff, and release documentation.
+
+GPT-5.6 was used as an engineering reasoning partner rather than as a replacement for domain judgment. Each change followed a repeatable loop: inspect the running application, compare behavior with the recorded data, convert the owner's feedback into measurable rules, edit the smallest responsible part of the code, run the seven native test targets, rebuild, and visually verify the new executable with the real RaceBox/VBO/Sanwa session. Higher-reasoning Codex runs were especially useful for the browser-to-native migration, multi-clock telemetry alignment, distance-normalized three-lap comparison, analysis-only GPS correction, resize-safe map projection, and deterministic insight evidence design.
+
+The released application does not call a language model at runtime and never uploads telemetry automatically. Codex and GPT-5.6 were used to build and validate the product; the driver's visible insight cards are generated locally from disclosed formulas, thresholds, confidence gates, and measured telemetry.
+
 ## Run
 
-Open a VBO, RaceBox CSV, and Sanwa CSV together from **File > Open telemetry**, or pass all three paths to `RaceBoxViewer.exe`. The known Richmond fixture automatically loads the bundled clean aerial; the same Sanwa data is merged whether the files are opened from the menu, the command line, or the demo launcher.
+The portable package is judge-ready: double-click `RaceBoxViewer.exe` or `Start RaceBox Demo.cmd` and the bundled Richmond VBO, RaceBox CSV, and Sanwa CSV load automatically. The executable uses the demo only when all three files are present beside the packaged app and no user files were supplied. Opening your own telemetry from **File > Open telemetry** or passing paths on the command line overrides the demo.
+
+The known Richmond fixture automatically loads the bundled clean aerial; the same native-rate Sanwa data is merged whether the files are opened from the menu, the command line, or the demo launcher.
 
 The dockable workspace includes Track Map, Playback, Telemetry, Laps and Sectors, Radio Alignment, Analysis, G-G, Altitude, Insights, and Diagnostics. Window layout and application preferences are stored in `%LOCALAPPDATA%\RaceBoxViewerNative`.
 
@@ -102,6 +112,8 @@ powershell -ExecutionPolicy Bypass -File scripts/toolbox/Build-Test-Native.ps1 -
 ```
 
 The GUI is `build/release/RaceBoxViewer.exe`; the validation CLI is `build/release/racebox_cli.exe`. Run repeat-playback soak testing with `scripts/soak.ps1`; add `-Warp` for the Microsoft software renderer.
+
+The portable ZIP includes `demo/session.vbo`, `demo/session.csv`, `demo/sanwa.csv`, and `Start RaceBox Demo.cmd`. These demo files are not copied beside ordinary development builds, so an unparameterized development executable still starts empty.
 
 Golden validation can also be run directly:
 
