@@ -1,0 +1,115 @@
+# RaceBox Telemetry Viewer 2 Architecture
+
+Version `2.0.0.001` is a controlled rebuild around the proven native telemetry
+engine. It is not a rewrite of the parser, clock alignment, lap timing, map
+calibration, IMU analysis, or deterministic insight formulas.
+
+## Product shell
+
+The Windows release is `RaceBoxTelemetryViewer.exe`. Its guided shell exposes
+five driver-facing workspaces:
+
+1. **Race Day** — event/run planning, pre-run checklist, setup and conditions,
+   post-run notes, tire history, and previous/current setup analysis.
+2. **Session** — the normal map, playback, lap list, telemetry, events, sectors,
+   notes, and annotations.
+3. **Compare** — Reference plus Compare A, with optional Compare B and an
+   independent Playback lap.
+4. **Crew Chief** — deterministic insights, disclosed rules, optional private
+   Crew Chief chat, and developer notes.
+5. **Reports** — session summary, lap table, theoretical sectors,
+   deterministic findings, and the existing export actions.
+
+The default dock arrangement is locked to prevent accidental panel moves.
+**Layout: Locked / Custom** deliberately enables panel and splitter editing.
+Text scale, theme, comparison choices, graph order, and layout mode persist.
+Errors and background-job state are shown in the global header instead of being
+hidden inside the Playback panel.
+
+## Target boundaries
+
+```text
+racebox_domain
+  telemetry, parsing, synchronization, map math, IMU and deterministic analysis
+        |
+racebox_application
+  application state, lap roles, selections, jobs, notifications, OS contracts
+        |
+  +-----+---------------------+
+  |                           |
+Windows adapters          future macOS adapters
+Win32/DX11/WARP           SDL3/Metal
+WinHTTP                   native/portable HTTP transport
+Windows file dialogs      asynchronous SDL/native file dialogs
+LocalAppData              Application Support / Caches / Logs
+```
+
+`racebox_core` remains a compatibility aggregate while the existing UI adopts
+the new boundaries incrementally. This keeps the golden engine stable and
+avoids a high-risk, all-at-once migration.
+
+The portable service contracts are in:
+
+- `include/racebox/application/state.hpp`
+- `include/racebox/application/services.hpp`
+
+They cover file dialogs, HTTP, application directories, atomic writing, asset
+lookup, logging, protected secret lookup, and system appearance. Network and
+secret services are optional: opening, analyzing, comparing, reporting, and
+saving telemetry must continue to work offline.
+
+## Portable build check
+
+Windows presets continue to build the complete app. A portable preset configures
+only targets that have no Win32, DirectX, WinHTTP, shell, registry, or WIC
+dependency. It is an architecture check, not a claim that the macOS window is
+already implemented.
+
+The eventual Apple Silicon shell should add:
+
+- SDL3 window, input, DPI, clipboard, and asynchronous file-dialog adapters;
+- a Metal renderer for Dear ImGui and ImPlot;
+- macOS Application Support, Caches, and Logs directory adapters;
+- a Keychain-backed optional secret provider;
+- a macOS HTTP transport for the optional Crew Chief connection;
+- package signing, notarization, and a universal application bundle only after
+  the Apple Silicon build is stable.
+
+The domain and application targets must stay free of platform headers. macOS
+work should implement adapters behind the existing contracts instead of adding
+`#ifdef` branches to telemetry formulas.
+
+## Data and migration
+
+- Existing `.rbxsession` and `.rbxlap` version-1 archives remain readable.
+- New archives use manifest version 2 and store the versioned workspace as a
+  bounded `workspace.json` entry. Writes use a same-directory temporary file
+  and atomic replacement so a failed save does not destroy the previous file.
+- Race Day version 3 stores privacy-bounded source identities beside local
+  relative paths. The identity contains basename, size, timestamp, and an
+  optional algorithm-tagged fingerprint—never telemetry contents.
+- Source repair distinguishes **Exact**, **Probable**, **Ambiguous**, and
+  **Missing**. Only one unique exact fingerprint may relink automatically;
+  probable or ambiguous choices require the driver to confirm.
+- UI layout version 4 migrates older layouts once, preserves a pre-v4 backup,
+  and starts with the guided layout locked.
+
+Raw GPS and telemetry remain immutable. Display alignment, stationary IMU zero,
+corner analysis, and other derived corrections remain disclosed,
+reversible calculations.
+
+## Validation gates
+
+Every Windows release must:
+
+1. configure and build all release targets;
+2. pass the golden parser/alignment/lap/map checks;
+3. pass analysis, IMU, Crew Chief, Race Day, archive migration, source matching,
+   application-state, UI-preference, WARP, plot-order, and memory tests;
+4. verify the portable package contains the executable, CLI, version, launcher,
+   documentation, and all three demo inputs;
+5. launch the freshly built executable with VBO, RaceBox CSV, and Sanwa data;
+6. visually check all five workspaces at normal and enlarged text sizes.
+
+The React/Vite prototype is frozen historical reference material. It is not a
+v2 target and is not part of the current build, test, or release workflow.

@@ -4,5 +4,7 @@
 /reference/browser-baseline-20260712.zip
 /.vs/
 .codex/startup-status.json
+__pycache__/
+*.pyc
 *.user
 *.pdb

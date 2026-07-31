@@ -64,6 +64,30 @@ std::optional<std::filesystem::path> open_race_day_file(HWND owner) {
     return result;
 }
 
+std::optional<std::filesystem::path> open_annotation_file(HWND owner) {
+    IFileOpenDialog* dialog = nullptr;
+    if (FAILED(CoCreateInstance(
+            CLSID_FileOpenDialog, nullptr, CLSCTX_ALL,
+            IID_PPV_ARGS(&dialog)))) {
+        return std::nullopt;
+    }
+    dialog->SetTitle(L"Open RaceBox Annotation Review");
+    const COMDLG_FILTERSPEC filters[] = {
+        {L"RaceBox annotation review", L"*.json"}};
+    dialog->SetFileTypes(1, filters);
+    dialog->SetOptions(FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
+    std::optional<std::filesystem::path> result;
+    if (SUCCEEDED(dialog->Show(owner))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&item))) {
+            result = shell_path(item);
+            item->Release();
+        }
+    }
+    dialog->Release();
+    return result;
+}
+
 std::optional<std::filesystem::path> open_image_file(HWND owner) {
     IFileOpenDialog* dialog = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&dialog)))) return std::nullopt;

@@ -167,7 +167,8 @@ int main() {
         require(racebox_only.session.telemetry.size() == 13'863, "RaceBox-only load failed");
         require(racebox_only.session.radio.empty(), "RaceBox-only load invented radio samples");
 
-        const auto archive = std::filesystem::temp_directory_path() / L"racebox-native-roundtrip.rbxsession";
+        const auto archive = std::filesystem::temp_directory_path() /
+            L"racebox-native-\u03a9-roundtrip.rbxsession";
         std::string error;
         auto archive_session = session;
         archive_session.map_background = map_calibration;
@@ -176,6 +177,14 @@ int main() {
         archive_session.map_background.offset_north_m = -1.25F;
         archive_session.workspace_state_json = R"({"format":"racebox-native-workspace","version":2,"session_notes":"round trip"})";
         require(racebox::save_session_archive(archive_session, archive, error), error.c_str());
+        auto archive_temporary = archive;
+        archive_temporary += L".writing";
+        require(!std::filesystem::exists(archive_temporary),
+                "Successful archive save left its temporary file behind");
+        archive_session.workspace_state_json =
+            R"({"format":"racebox-native-workspace","version":4,"session_notes":"atomic overwrite"})";
+        require(racebox::save_session_archive(archive_session, archive, error),
+                "Existing archive could not be replaced atomically");
         racebox::Session restored;
         require(racebox::load_session_archive(archive, restored, error), error.c_str());
         require(restored.telemetry.size() == session.telemetry.size(), "Archive telemetry round trip failed");
@@ -189,7 +198,7 @@ int main() {
         close_to(restored.start_finish_line->a.latitude, archive_session.start_finish_line->a.latitude, 1e-10,
                  "Archive changed start/finish latitude");
         require(restored.workspace_state_json == archive_session.workspace_state_json,
-                "Archive lost driver-analysis workspace state");
+                "Version-2 archive lost its separate workspace document");
         close_to(restored.map_background.reference_latitude, map_calibration.reference_latitude, 1e-10,
                  "Archive changed map latitude");
         close_to(restored.map_background.metres_per_pixel, map_calibration.metres_per_pixel, 1e-8,
@@ -206,6 +215,36 @@ int main() {
         close_to(restored.map_background.offset_east_m, 2.5, 1e-6, "Archive changed map east offset");
         close_to(restored.map_background.offset_north_m, -1.25, 1e-6, "Archive changed map north offset");
         std::filesystem::remove(archive);
+        const auto invalid_lap_archive =
+            std::filesystem::temp_directory_path() /
+            L"racebox-native-invalid-lap.rbxsession";
+        auto invalid_lap_session = session;
+        invalid_lap_session.map_background = {};
+        invalid_lap_session.workspace_state_json.clear();
+        invalid_lap_session.laps.front().end_index =
+            invalid_lap_session.telemetry.size();
+        require(racebox::save_session_archive(
+                    invalid_lap_session, invalid_lap_archive, error),
+                "Could not create invalid-lap archive fixture");
+        racebox::Session rejected_archive;
+        require(!racebox::load_session_archive(
+                    invalid_lap_archive, rejected_archive, error),
+                "Archive with an out-of-range lap was accepted");
+        std::filesystem::remove(invalid_lap_archive);
+        const auto mismatched_archive =
+            std::filesystem::temp_directory_path() /
+            L"racebox-native-mismatched-columns.rbxsession";
+        auto mismatched_session = session;
+        mismatched_session.map_background = {};
+        mismatched_session.workspace_state_json.clear();
+        mismatched_session.telemetry.speed_kmh.pop_back();
+        require(racebox::save_session_archive(
+                    mismatched_session, mismatched_archive, error),
+                "Could not create mismatched-column archive fixture");
+        require(!racebox::load_session_archive(
+                    mismatched_archive, rejected_archive, error),
+                "Archive with mismatched telemetry columns was accepted");
+        std::filesystem::remove(mismatched_archive);
         const auto lap_archive = std::filesystem::temp_directory_path() / L"racebox-native-lap-roundtrip.rbxlap";
         require(racebox::save_lap_archive(session, *lap_17, lap_archive, error), error.c_str());
         racebox::Session restored_lap;

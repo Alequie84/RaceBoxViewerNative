@@ -7,7 +7,10 @@
       "binaryDir": "${sourceDir}/build/release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_INSTALL_PREFIX": "${sourceDir}/package/RaceBoxViewer"
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/package/RaceBoxTelemetryViewer",
+        "RACEBOX_BUILD_WINDOWS_APP": "ON",
+        "RACEBOX_BUILD_CLI": "ON",
+        "BUILD_TESTING": "ON"
       }
     },
     {
@@ -16,16 +19,34 @@
       "binaryDir": "${sourceDir}/build/debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_INSTALL_PREFIX": "${sourceDir}/package/RaceBoxViewerDebug"
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/package/RaceBoxTelemetryViewerDebug"
+      }
+    },
+    {
+      "name": "portable-core-release",
+      "displayName": "Portable core and CLI (no native UI)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/core-only-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "RACEBOX_BUILD_WINDOWS_APP": "OFF",
+        "RACEBOX_BUILD_CLI": "ON",
+        "BUILD_TESTING": "ON"
       }
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "windows-release" },
-    { "name": "debug", "configurePreset": "windows-debug" }
+    { "name": "debug", "configurePreset": "windows-debug" },
+    { "name": "portable-core-release", "configurePreset": "portable-core-release" }
   ],
   "testPresets": [
-    { "name": "release", "configurePreset": "windows-release", "output": { "outputOnFailure": true } }
+    { "name": "release", "configurePreset": "windows-release", "output": { "outputOnFailure": true } },
+    { "name": "debug", "configurePreset": "windows-debug", "output": { "outputOnFailure": true } },
+    {
+      "name": "portable-core-release",
+      "configurePreset": "portable-core-release",
+      "output": { "outputOnFailure": true }
+    }
   ]
 }
-

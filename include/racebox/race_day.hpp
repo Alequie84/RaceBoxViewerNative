@@ -1,6 +1,7 @@
 #pragma once
 
 #include "racebox/core.hpp"
+#include "racebox/source_identity.hpp"
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -14,7 +15,7 @@
 namespace racebox::race_day {
 
 inline constexpr std::string_view kFileFormat{"racebox-race-day"};
-inline constexpr int kFileVersion = 2;
+inline constexpr int kFileVersion = 3;
 inline constexpr std::string_view kAnalyticsCsvVersion{"racebox-session-analytics-csv-v1"};
 inline constexpr std::string_view kSetupAnalyticsVersion{"racebox-setup-analytics-v3"};
 inline constexpr std::size_t kMaximumSetupKnowledgeRecords = 200;
@@ -56,6 +57,10 @@ struct Run {
     char main_group{'A'};
     int main_leg{};
     std::vector<std::filesystem::path> telemetry_files;
+    // Parallel to telemetry_files. Version-3 Race Day files retain only the
+    // basename, byte size, timestamp, and optional caller-provided fingerprint
+    // needed for safe relinking; no telemetry content is copied here.
+    std::vector<source_identity::SourceIdentity> telemetry_source_identities;
     std::vector<ChecklistItem> checklist;
     std::string pre_run_notes;
     std::string setup_changes;
@@ -207,6 +212,24 @@ Run& add_custom(Day& day, std::string label);
 [[nodiscard]] bool has_racebox_csv(const Run& run);
 [[nodiscard]] bool has_sanwa_csv(const Run& run);
 [[nodiscard]] bool has_primary_telemetry(const Run& run);
+
+enum class TelemetrySourceState {
+    Available,
+    Changed,
+    Missing,
+};
+
+// Checks the current file against its persisted basename, size, and modified
+// time. A replaced file is never silently accepted merely because the old path
+// still exists.
+[[nodiscard]] TelemetrySourceState telemetry_source_state(
+    const Run& run, std::size_t source_index,
+    bool verify_content = false) noexcept;
+
+// Captures identity metadata only for newly attached sources. Existing stored
+// identities remain authoritative until an exact relink or explicit user
+// confirmation replaces them.
+void refresh_telemetry_source_identities(Run& run);
 
 bool save(const Day& day, const std::filesystem::path& destination, std::string& error) noexcept;
 bool load(const std::filesystem::path& source, Day& day, std::string& error) noexcept;

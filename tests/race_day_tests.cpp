@@ -184,6 +184,27 @@ int main() {
         current.setup_changes = "Rear spring 2.6 to 2.8";
         current.post_run_notes = "More rotation, but nervous on power.";
         current.checklist.front().checked = true;
+        const auto identity_source =
+            std::filesystem::temp_directory_path() /
+            L"racebox-race-day-\u03a9-source-identity.vbo";
+        {
+            std::ofstream telemetry(identity_source,
+                std::ios::binary | std::ios::trunc);
+            telemetry << "privacy-bounded source identity";
+        }
+        current.telemetry_files = {identity_source};
+        racebox::race_day::refresh_telemetry_source_identities(current);
+        require(current.telemetry_source_identities.size() == 1,
+                "Telemetry source identity was not captured");
+        require(current.telemetry_source_identities.front().content_fingerprint.has_value(),
+                "Telemetry source fingerprint was not captured");
+        require(racebox::race_day::telemetry_source_state(current, 0) ==
+                    racebox::race_day::TelemetrySourceState::Available,
+                "Unchanged telemetry attachment was not available");
+        require(racebox::race_day::telemetry_source_state(
+                    current, 0, true) ==
+                    racebox::race_day::TelemetrySourceState::Available,
+                "Unchanged telemetry fingerprint did not verify");
 
         racebox::race_day::SetupKnowledgeRecord spring_result;
         spring_result.id = "setup-result-spring";
@@ -245,6 +266,10 @@ int main() {
         const auto path = std::filesystem::temp_directory_path() / L"racebox-race-day-test.rbxday";
         std::string error;
         require(racebox::race_day::save(day, path, error), error.c_str());
+        auto race_day_temporary = path;
+        race_day_temporary += L".writing";
+        require(!std::filesystem::exists(race_day_temporary),
+                "Successful Race Day save left plaintext temporary data");
         racebox::race_day::Day restored;
         require(racebox::race_day::load(path, restored, error), error.c_str());
         std::error_code ignored;
@@ -254,11 +279,41 @@ int main() {
                 "Tire warmer temperature did not persist");
         require(restored.runs[1].checklist.front().checked, "Checklist state did not persist");
         require(restored.runs[1].setup_changes == current.setup_changes, "Setup changes did not persist");
+        require(restored.runs[1].telemetry_source_identities.size() == 1,
+                "Race Day v3 source identity did not persist");
+        const auto expected_filename_u8 =
+            identity_source.filename().generic_u8string();
+        const std::string expected_filename(
+            reinterpret_cast<const char*>(expected_filename_u8.data()),
+            expected_filename_u8.size());
+        require(restored.runs[1].telemetry_source_identities.front()
+                    .canonical_filename == expected_filename,
+                "Race Day source identity retained the wrong filename");
+        require(restored.runs[1].telemetry_source_identities.front()
+                    .size_bytes == 31,
+                "Race Day source identity retained the wrong byte size");
         require(restored.setup_knowledge.size() == 2, "Setup-knowledge records did not persist");
         require(restored.setup_knowledge.front().evidence.quality_confidence == 84,
                 "Setup-knowledge evidence did not round trip");
         require(restored.setup_knowledge.front().thinking == "xhigh",
                 "Setup-knowledge agent metadata did not round trip");
+        {
+            std::ofstream replacement(identity_source,
+                std::ios::binary | std::ios::trunc);
+            replacement << "different telemetry recording at the same path";
+        }
+        require(racebox::race_day::telemetry_source_state(
+                    restored.runs[1], 0) ==
+                    racebox::race_day::TelemetrySourceState::Changed,
+                "Replaced telemetry file was silently accepted");
+        require(racebox::race_day::save(restored, path, error),
+                "Race Day with a changed source could not preserve its identity");
+        racebox::race_day::Day changed_round_trip;
+        require(racebox::race_day::load(path, changed_round_trip, error),
+                "Race Day changed-source identity could not be reloaded");
+        require(changed_round_trip.runs[1]
+                    .telemetry_source_identities.front().size_bytes == 31,
+                "Saving silently blessed the replacement telemetry file");
 
         const auto legacy_path =
             std::filesystem::temp_directory_path() / L"racebox-race-day-v1-test.rbxday";
@@ -278,6 +333,7 @@ int main() {
                 "Version-1 race-day file unexpectedly created setup knowledge");
         std::filesystem::remove(path, ignored);
         std::filesystem::remove(legacy_path, ignored);
+        std::filesystem::remove(identity_source, ignored);
 
         const auto session = synthetic_session();
         const auto imu = racebox::imu::analyze(session.telemetry);

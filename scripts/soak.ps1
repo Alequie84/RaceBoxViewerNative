@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$executable = Join-Path $root 'build\release\RaceBoxViewer.exe'
+$executable = Join-Path $root 'build\release\RaceBoxTelemetryViewer.exe'
 if (-not (Test-Path -LiteralPath $executable)) { throw 'Build the release executable before running the soak test.' }
 $arguments = @('--soak')
 if ($Warp) { $arguments += '--warp' }

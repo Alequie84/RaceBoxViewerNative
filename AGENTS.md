@@ -1,6 +1,8 @@
-# RaceBox Viewer Native Agent Guide
+# RaceBox Telemetry Viewer 2 Agent Guide
 
-This repository is the active C++ application. Read `HANDOFF.md` before changing code.
+This repository is the active C++ application. Version `0.1.0.029` is protected
+on `main`/tag `v0.1.0.029`; current v2 work belongs on branch `v2`. Read
+`HANDOFF.md` and `docs/v2-architecture.md` before changing code.
 
 ## Project Context
 
@@ -21,7 +23,7 @@ This repository is the active C++ application. Read `HANDOFF.md` before changing
    - crowded, clipped, overlapping, or hard-to-discover controls;
    - regressions from the documented native behavior;
    - dead code, duplicate state, and unnecessary data copies.
-6. Report the most important findings first, ordered by severity, before proposing a broad refactor. Small, clearly requested fixes may be implemented directly.
+5. Report the most important findings first, ordered by severity, before proposing a broad refactor. Small, clearly requested fixes may be implemented directly.
 
 Use archived browser behavior only as a read-only historical reference. The native product and its golden fixture are authoritative.
 
@@ -43,13 +45,18 @@ Use archived browser behavior only as a read-only historical reference. The nati
 - Keep parsing and analysis off the render thread.
 - Cache heavy map and plot geometry. Playback should move lightweight overlays.
 - Prefer contiguous channel buffers and bounded caches over cloned row objects.
+- Keep `racebox_domain` and `racebox_application` free of Win32, DirectX,
+  WinHTTP, WIC, registry, shell, and other platform-specific dependencies.
+- Preserve the guided Race Day, Session, Compare, Crew Chief, and Reports
+  workflow. The default dock layout stays locked until the user selects
+  Customize.
 - Preserve user files, image backups, and unrelated working-tree changes.
 - Use `scripts/toolbox` for repeatable build, test, launch, and state checks.
 - Update `HANDOFF.md`, the toolbox documentation, and tests when behavior or workflows change.
 
 ## Verification
 
-Release versions come from the root `VERSION` file and use `major.minor.patch.build` with a three-digit final component. The current sequence is `.010`, then `.011`, `.012`, and so on. Before creating a new user-facing release, run `scripts\bump-version.ps1` once; do not overwrite or delete earlier numbered ZIPs.
+Release versions come from the root `VERSION` file and use `major.minor.patch.build` with a three-digit final component. Version 2 starts at `2.0.0.001`, followed by `.002`, `.003`, and so on. Before creating a new user-facing release, run `scripts\bump-version.ps1` once; do not overwrite or delete earlier numbered ZIPs.
 
 Run the native-only validation and package workflow:
 

@@ -1,8 +1,10 @@
-#include "racebox/core.hpp"
+#include "racebox/domain.hpp"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <ctime>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -14,6 +16,18 @@ namespace racebox {
 namespace {
 
 constexpr Timestamp kSecond = 1'000'000;
+
+std::int64_t utc_epoch_seconds(const std::tm& value) {
+    using namespace std::chrono;
+    const year_month_day date{
+        year{value.tm_year + 1900},
+        month{static_cast<unsigned>(value.tm_mon + 1)},
+        day{static_cast<unsigned>(value.tm_mday)}};
+    if (!date.ok()) return -1;
+    const auto point = sys_days{date} + hours{value.tm_hour} +
+                       minutes{value.tm_min} + seconds{value.tm_sec};
+    return duration_cast<seconds>(point.time_since_epoch()).count();
+}
 
 struct ParsedVbo {
     TelemetrySeries telemetry;
@@ -104,7 +118,7 @@ std::int64_t iso_epoch_us(const std::string& input) {
     std::istringstream stream(input.substr(0, 19));
     stream >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
     if (stream.fail()) return 0;
-    const auto epoch = _mkgmtime64(&tm);
+    const auto epoch = utc_epoch_seconds(tm);
     if (epoch < 0) return 0;
     std::int64_t fractional = 0;
     const auto dot = input.find('.', 19);
@@ -172,7 +186,7 @@ std::optional<std::int64_t> filename_epoch_us(const std::filesystem::path& path)
         tm.tm_hour = std::stoi(digits.substr(6, 2));
         tm.tm_min = std::stoi(digits.substr(8, 2));
         tm.tm_sec = std::stoi(digits.substr(10, 2));
-        const auto epoch = _mkgmtime64(&tm);
+        const auto epoch = utc_epoch_seconds(tm);
         if (epoch > 0) return epoch * kSecond;
     }
     return std::nullopt;

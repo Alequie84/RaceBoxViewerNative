@@ -7,6 +7,8 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <fstream>
 #include <system_error>
 
@@ -24,6 +26,20 @@ float grid_spacing_or(const Json& object, float fallback) {
     const auto value = object.find("map_grid_spacing_m");
     if (value == object.end() || !value->is_number()) return fallback;
     return std::clamp(value->get<float>(), 5.0F, 25.0F);
+}
+
+float normalize_text_scale(float value) {
+    constexpr std::array supported{1.0F, 1.15F, 1.30F, 1.50F};
+    const auto requested = std::clamp(value, supported.front(), supported.back());
+    return *std::min_element(supported.begin(), supported.end(), [requested](float left, float right) {
+        return std::abs(left - requested) < std::abs(right - requested);
+    });
+}
+
+float text_scale_or(const Json& object, float fallback) {
+    const auto value = object.find("text_scale");
+    return value != object.end() && value->is_number()
+        ? normalize_text_scale(value->get<float>()) : fallback;
 }
 
 int layout_version_or(const Json& object, int fallback) {
@@ -45,10 +61,10 @@ UiWorkspace workspace_or(const Json& object, UiWorkspace fallback) {
     const auto value = object.find("active");
     if (value == object.end() || !value->is_string()) return fallback;
     const auto& name = value->get_ref<const std::string&>();
-    if (name == "overview") return UiWorkspace::Overview;
-    if (name == "analysis") return UiWorkspace::Analysis;
+    if (name == "session" || name == "overview") return UiWorkspace::Session;
     if (name == "compare") return UiWorkspace::Compare;
-    if (name == "sectors") return UiWorkspace::Sectors;
+    if (name == "crew_chief" || name == "analysis") return UiWorkspace::CrewChief;
+    if (name == "reports" || name == "sectors") return UiWorkspace::Reports;
     if (name == "race_day") return UiWorkspace::RaceDay;
     return fallback;
 }
@@ -59,13 +75,13 @@ const char* density_name(TelemetryDensity density) {
 
 const char* workspace_name(UiWorkspace workspace) {
     switch (workspace) {
-        case UiWorkspace::Analysis: return "analysis";
+        case UiWorkspace::Session: return "session";
         case UiWorkspace::Compare: return "compare";
-        case UiWorkspace::Sectors: return "sectors";
+        case UiWorkspace::CrewChief: return "crew_chief";
+        case UiWorkspace::Reports: return "reports";
         case UiWorkspace::RaceDay: return "race_day";
-        case UiWorkspace::Overview: return "overview";
     }
-    return "overview";
+    return "session";
 }
 
 std::string windows_error_message(DWORD error) {
@@ -99,6 +115,7 @@ UiPreferencesLoadResult load_ui_preferences(const std::filesystem::path& path) n
         preferences.separate_compare_maps = boolean_or(value, "separate_compare_maps", preferences.separate_compare_maps);
         preferences.analysis_aligned_map_traces = boolean_or(
             value, "analysis_aligned_map_traces", preferences.analysis_aligned_map_traces);
+        preferences.text_scale = text_scale_or(value, preferences.text_scale);
 
         result.source_layout_version = layout_version_or(value, 0);
         preferences.layout_version = result.source_layout_version;
@@ -116,6 +133,10 @@ UiPreferencesLoadResult load_ui_preferences(const std::filesystem::path& path) n
         if (const auto workspace = value.find("workspace"); workspace != value.end() && workspace->is_object()) {
             preferences.workspace.active = workspace_or(*workspace, preferences.workspace.active);
             preferences.workspace.telemetry_density = density_or(*workspace, preferences.workspace.telemetry_density);
+            preferences.workspace.compare_b_enabled = boolean_or(
+                *workspace, "compare_b_enabled", preferences.workspace.compare_b_enabled);
+            preferences.workspace.customize_layout = boolean_or(
+                *workspace, "customize_layout", preferences.workspace.customize_layout);
             if (const auto panels = workspace->find("utility_panels"); panels != workspace->end() && panels->is_object()) {
                 auto& visibility = preferences.workspace.utility_panels;
                 visibility.radio_alignment = boolean_or(*panels, "radio_alignment", visibility.radio_alignment);
@@ -169,11 +190,14 @@ bool save_ui_preferences_atomic(const std::filesystem::path& path, const UiPrefe
             {"map_grid_spacing_m", std::clamp(preferences.map_grid_spacing_m, 5.0F, 25.0F)},
             {"separate_compare_maps", preferences.separate_compare_maps},
             {"analysis_aligned_map_traces", preferences.analysis_aligned_map_traces},
+            {"text_scale", normalize_text_scale(preferences.text_scale)},
             {"layout_version", std::max(0, preferences.layout_version)},
             {"telemetry_plot_order", std::move(plot_order)},
             {"workspace",
              {{"active", workspace_name(preferences.workspace.active)},
               {"telemetry_density", density_name(preferences.workspace.telemetry_density)},
+              {"compare_b_enabled", preferences.workspace.compare_b_enabled},
+              {"customize_layout", preferences.workspace.customize_layout},
               {"utility_panels",
                {{"radio_alignment", panels.radio_alignment},
                 {"theoretical_analysis", panels.theoretical_analysis},
@@ -218,11 +242,11 @@ bool save_ui_preferences_atomic(const std::filesystem::path& path, const UiPrefe
     }
 }
 
-LayoutMigrationPreparation prepare_layout_v3_migration(const std::filesystem::path& settings_directory,
+LayoutMigrationPreparation prepare_layout_v4_migration(const std::filesystem::path& settings_directory,
                                                         int source_layout_version) noexcept {
     LayoutMigrationPreparation result;
     result.rebuild_required = source_layout_version < kCurrentUiLayoutVersion;
-    result.backup_path = settings_directory / L"layout-pre-v3.ini";
+    result.backup_path = settings_directory / L"layout-pre-v4.ini";
     if (!result.rebuild_required) return result;
 
     try {

@@ -29,6 +29,7 @@ struct Texture {
 
 std::vector<std::filesystem::path> open_telemetry_files(HWND owner);
 std::optional<std::filesystem::path> open_race_day_file(HWND owner);
+std::optional<std::filesystem::path> open_annotation_file(HWND owner);
 std::optional<std::filesystem::path> open_image_file(HWND owner);
 std::optional<std::filesystem::path> save_file(HWND owner, const wchar_t* title, const wchar_t* extension, const wchar_t* filter);
 bool load_texture(ID3D11Device* device, const std::filesystem::path& path, Texture& texture, std::string& error);
@@ -45,8 +46,9 @@ public:
     void enable_soak_mode();
 
 private:
-    enum class WorkspaceSection { Overview, Analysis, Compare, Sectors, RaceDay };
+    enum class WorkspaceSection { Session, Compare, CrewChief, Reports, RaceDay };
     enum class TelemetryTab { Telemetry, Imu, Events, Sectors };
+    enum class InsightsTab { Insights, Rules, CrewChief, DevNotes };
 
     struct PlotData {
         std::vector<double> time;
@@ -77,13 +79,23 @@ private:
         int active_lap_index{};
         int compare_lap_index{};
         int compare_b_lap_index{};
+        bool compare_b_enabled{};
         int playback_lap_index{};
         ViewMode view_mode{ViewMode::SingleLap};
         std::array<char, 256> note{};
     };
 
+    struct PendingRaceDayRelink {
+        std::size_t run_index{};
+        std::size_t source_index{};
+        std::vector<std::filesystem::path> candidate_paths;
+        std::vector<source_identity::SourceIdentity> candidate_identities;
+        source_identity::MatchResult result;
+    };
+
     void draw_app_header();
-    bool build_overview_layout(ImGuiID dockspace, ImVec2 origin, ImVec2 size);
+    void draw_global_notification();
+    bool build_guided_layout(ImGuiID dockspace, ImVec2 origin, ImVec2 size);
     void draw_playback();
     void draw_map();
     void draw_telemetry();
@@ -97,6 +109,7 @@ private:
     void draw_annotations();
     void draw_crew_chief();
     void draw_race_day();
+    void draw_reports();
     void draw_dev_notes();
     void draw_events_tab();
     void draw_sectors_tab();
@@ -108,11 +121,14 @@ private:
     void load_background();
     void load_triangulated_background();
     void export_annotations();
+    void import_annotations();
     void export_driver_analysis();
     void new_race_day();
     void open_race_day();
     void save_race_day(bool choose_path);
     void attach_race_day_telemetry();
+    void begin_race_day_source_relink(std::size_t source_index);
+    void draw_race_day_source_relink_popup();
     void analyze_race_day_runs();
     void handle_annotation_surface(const char* surface, int plot_index, float origin_x, float origin_y,
                                    float width, float height, bool hovered, const char* stable_plot_id = nullptr);
@@ -178,12 +194,17 @@ private:
     bool show_speed_color_{true};
     bool show_average_track_guide_{true};
     bool separate_compare_maps_{};
+    bool compare_b_enabled_{};
     bool show_analysis_aligned_traces_{true};
     bool show_map_grid_{true};
     float map_grid_spacing_m_{10.0F};
-    WorkspaceSection workspace_section_{WorkspaceSection::Overview};
+    WorkspaceSection workspace_section_{WorkspaceSection::Session};
     TelemetryTab requested_telemetry_tab_{TelemetryTab::Telemetry};
     bool telemetry_tab_request_pending_{};
+    InsightsTab requested_insights_tab_{InsightsTab::Insights};
+    bool insights_tab_request_pending_{};
+    float text_scale_{1.0F};
+    bool customize_layout_{};
     bool show_radio_panel_{};
     bool show_analysis_panel_{};
     bool show_gg_panel_{};
@@ -220,6 +241,7 @@ private:
     bool race_day_include_q4_{};
     bool race_day_triple_a_{};
     bool race_day_dirty_{};
+    std::optional<PendingRaceDayRelink> pending_race_day_relink_;
     std::string race_day_question_{
         "Compare the previous run with the current run. Did the setup change improve the car, "
         "what evidence supports that, what may be a driver or condition effect, and what should I test next?"};

@@ -12,9 +12,9 @@ $map = Join-Path $RaceBoxNativeRoot 'assets\rrr-map.png'
 $browserMap = Join-Path $RaceBoxBrowserRoot 'public\assets\rrr-map.png'
 $version = (Get-Content -LiteralPath (Join-Path $RaceBoxNativeRoot 'VERSION') -Raw).Trim()
 if ($version -notmatch '^\d+\.\d+\.\d+\.\d{3}$') { throw "Invalid release VERSION: $version" }
-$zip = Join-Path $RaceBoxNativeRoot "out\RaceBoxViewerNative-$version-win64.zip"
+$zip = Join-Path $RaceBoxNativeRoot "out\RaceBoxTelemetryViewer-$version-win64.zip"
 $listener = Get-NetTCPConnection -LocalPort 5173 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-$nativeProcess = Get-Process -Name RaceBoxViewer -ErrorAction SilentlyContinue | Select-Object -First 1
+$nativeProcess = Get-Process -Name RaceBoxTelemetryViewer -ErrorAction SilentlyContinue | Select-Object -First 1
 
 $state = [ordered]@{
     native_root = $RaceBoxNativeRoot

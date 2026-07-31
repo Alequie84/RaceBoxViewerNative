@@ -563,7 +563,7 @@ Response post_report_request(
         if (path.empty()) path = L"/";
         const auto secure = components.nScheme == INTERNET_SCHEME_HTTPS;
 
-        InternetHandle session(WinHttpOpen(L"RaceBoxViewerNative/CrewChief",
+        InternetHandle session(WinHttpOpen(L"RaceBoxTelemetryViewer/2 CrewChief",
             WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
         if (!session.get()) throw std::runtime_error("Crew Chief network session could not start");
         WinHttpSetTimeouts(session.get(), 10'000, 10'000,

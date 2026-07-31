@@ -1,6 +1,6 @@
 #include "racebox/driver_analysis.hpp"
 
-#include "racebox/core.hpp"
+#include "racebox/domain.hpp"
 
 #include <algorithm>
 #include <array>

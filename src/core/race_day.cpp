@@ -1,14 +1,19 @@
 #include "racebox/race_day.hpp"
 
 #include <nlohmann/json.hpp>
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <cwctype>
 #include <fstream>
 #include <iomanip>
@@ -22,9 +27,28 @@ namespace {
 
 using json = nlohmann::json;
 
+constexpr std::uintmax_t kMaximumRaceDayBytes =
+    32ULL * 1024ULL * 1024ULL;
+
 std::string bounded(std::string value, std::size_t maximum) {
     if (value.size() > maximum) value.resize(maximum);
     return value;
+}
+
+std::string path_to_utf8(const std::filesystem::path& path) {
+    const auto encoded = path.generic_u8string();
+    return {
+        reinterpret_cast<const char*>(encoded.data()),
+        encoded.size(),
+    };
+}
+
+std::filesystem::path path_from_utf8(std::string_view value) {
+    std::u8string encoded(value.size(), u8'\0');
+    if (!value.empty()) {
+        std::memcpy(encoded.data(), value.data(), value.size());
+    }
+    return std::filesystem::path(encoded);
 }
 
 bool contains_sanwa_header(const std::filesystem::path& path) {
@@ -749,6 +773,123 @@ std::filesystem::path resolved_path(const std::filesystem::path& path, const std
     return (base / path).lexically_normal();
 }
 
+std::optional<source_identity::ModifiedTimeUnixNs> modified_time_unix_ns(
+    const std::filesystem::path& path) {
+    std::error_code error;
+    const auto modified = std::filesystem::last_write_time(path, error);
+    if (error) return std::nullopt;
+    // C++20 library support for file_clock::to_sys is uneven on current
+    // MSVC. Capture both clocks together and translate through their current
+    // offset; source matching intentionally allows two seconds for filesystem
+    // timestamp rounding and this conversion's sub-millisecond jitter.
+    const auto file_now =
+        std::filesystem::file_time_type::clock::now();
+    const auto system_now = std::chrono::system_clock::now();
+    const auto system_time = system_now + (modified - file_now);
+    const auto nanoseconds =
+        std::chrono::time_point_cast<std::chrono::nanoseconds>(system_time)
+            .time_since_epoch()
+            .count();
+    return static_cast<source_identity::ModifiedTimeUnixNs>(nanoseconds);
+}
+
+std::optional<std::string> file_fingerprint(
+    const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return std::nullopt;
+    constexpr std::uint64_t offset = 14695981039346656037ULL;
+    constexpr std::uint64_t prime = 1099511628211ULL;
+    std::uint64_t hash = offset;
+    std::array<char, 64 * 1024> buffer{};
+    while (input) {
+        input.read(buffer.data(),
+                   static_cast<std::streamsize>(buffer.size()));
+        const auto count = input.gcount();
+        for (std::streamsize index = 0; index < count; ++index) {
+            hash ^= static_cast<unsigned char>(
+                buffer[static_cast<std::size_t>(index)]);
+            hash *= prime;
+        }
+    }
+    if (!input.eof()) return std::nullopt;
+    std::ostringstream result;
+    result << "fnv1a64:" << std::hex << std::setfill('0')
+           << std::setw(16) << hash;
+    return result.str();
+}
+
+source_identity::SourceIdentity metadata_for_path(
+    const std::filesystem::path& path) {
+    std::error_code error;
+    if (!path.empty() && std::filesystem::is_regular_file(path, error) &&
+        !error) {
+        const auto size = std::filesystem::file_size(path, error);
+        if (!error) {
+            return source_identity::make_source_identity(
+                path_to_utf8(path.filename()), size,
+                modified_time_unix_ns(path));
+        }
+    }
+    return source_identity::make_source_identity(
+        path_to_utf8(path.filename()), 0);
+}
+
+source_identity::SourceIdentity identity_for_path(
+    const std::filesystem::path& path,
+    const source_identity::SourceIdentity* fallback = nullptr) {
+    auto captured = metadata_for_path(path);
+    if (captured.size_bytes > 0 || std::filesystem::is_regular_file(path)) {
+        if (const auto fingerprint = file_fingerprint(path)) {
+            captured.content_fingerprint = *fingerprint;
+        } else if (fallback && fallback->content_fingerprint &&
+                   fallback->size_bytes == captured.size_bytes) {
+            captured.content_fingerprint = fallback->content_fingerprint;
+        }
+        return captured;
+    }
+    if (fallback) return *fallback;
+    return captured;
+}
+
+json source_identity_json(const source_identity::SourceIdentity& identity) {
+    json result{
+        {"filename", bounded(identity.canonical_filename, 1024)},
+        {"size_bytes", identity.size_bytes},
+    };
+    if (identity.modified_time_unix_ns) {
+        result["modified_time_unix_ns"] =
+            *identity.modified_time_unix_ns;
+    }
+    if (identity.content_fingerprint) {
+        result["content_fingerprint"] =
+            bounded(*identity.content_fingerprint, 512);
+    }
+    return result;
+}
+
+source_identity::SourceIdentity read_source_identity(
+    const json& value,
+    const std::filesystem::path& path) {
+    if (!value.is_object()) return identity_for_path(path);
+    const auto filename = bounded(
+        value.value("filename", path_to_utf8(path.filename())), 1024);
+    const auto size = value.value("size_bytes", std::uint64_t{});
+    std::optional<source_identity::ModifiedTimeUnixNs> modified;
+    if (const auto timestamp = value.find("modified_time_unix_ns");
+        timestamp != value.end() && timestamp->is_number_integer()) {
+        modified = timestamp->get<source_identity::ModifiedTimeUnixNs>();
+    }
+    std::optional<std::string_view> fingerprint;
+    std::string fingerprint_storage;
+    if (const auto stored = value.find("content_fingerprint");
+        stored != value.end() && stored->is_string()) {
+        fingerprint_storage = bounded(stored->get<std::string>(), 512);
+        if (!fingerprint_storage.empty()) fingerprint = fingerprint_storage;
+    }
+    return source_identity::make_source_identity(
+        filename, size, modified, fingerprint);
+}
+
 LoadResult load_single_source(const LoadRequest& request) {
     LoadResult result;
     if (!request.gpx.empty()) {
@@ -904,7 +1045,72 @@ bool has_primary_telemetry(const Run& run) {
     });
 }
 
+TelemetrySourceState telemetry_source_state(
+    const Run& run, std::size_t source_index,
+    bool verify_content) noexcept {
+    try {
+        if (source_index >= run.telemetry_files.size()) {
+            return TelemetrySourceState::Missing;
+        }
+        std::error_code error;
+        const auto& path = run.telemetry_files[source_index];
+        if (!std::filesystem::is_regular_file(path, error) || error) {
+            return TelemetrySourceState::Missing;
+        }
+        if (source_index >= run.telemetry_source_identities.size()) {
+            // In-memory callers from older integrations did not carry source
+            // identities. They remain loadable; the next explicit attachment
+            // refresh captures an identity.
+            return TelemetrySourceState::Available;
+        }
+        const auto& expected =
+            run.telemetry_source_identities[source_index];
+        auto current = metadata_for_path(path);
+        if (verify_content && expected.content_fingerprint) {
+            current.content_fingerprint =
+                file_fingerprint(path);
+        }
+        const std::array candidates{
+            source_identity::Candidate{"current", current},
+        };
+        const auto match =
+            source_identity::match_source(expected, candidates);
+        if (match.suggestions.empty()) {
+            return TelemetrySourceState::Changed;
+        }
+        const auto& evidence = match.suggestions.front();
+        const auto timestamp_matches =
+            !expected.modified_time_unix_ns ||
+            evidence.modified_time_match;
+        const auto fingerprint_matches =
+            !verify_content || !expected.content_fingerprint ||
+            evidence.fingerprint_match;
+        return evidence.filename_match && evidence.size_match &&
+                       timestamp_matches && fingerprint_matches
+            ? TelemetrySourceState::Available
+            : TelemetrySourceState::Changed;
+    } catch (...) {
+        return TelemetrySourceState::Missing;
+    }
+}
+
+void refresh_telemetry_source_identities(Run& run) {
+    std::vector<source_identity::SourceIdentity> refreshed;
+    refreshed.reserve(run.telemetry_files.size());
+    for (std::size_t index = 0; index < run.telemetry_files.size(); ++index) {
+        const auto* previous = index < run.telemetry_source_identities.size()
+            ? &run.telemetry_source_identities[index]
+            : nullptr;
+        refreshed.push_back(previous
+            ? *previous
+            : identity_for_path(run.telemetry_files[index]));
+    }
+    run.telemetry_source_identities = std::move(refreshed);
+}
+
 bool save(const Day& day, const std::filesystem::path& destination, std::string& error) noexcept {
+    auto temporary = destination;
+    temporary += L".writing";
     try {
         const auto base = destination.parent_path().empty() ? std::filesystem::current_path() : destination.parent_path();
         json root{
@@ -925,14 +1131,31 @@ bool save(const Day& day, const std::filesystem::path& destination, std::string&
                 {"main_group", std::string(1, run.main_group)},
                 {"main_leg", run.main_leg},
                 {"telemetry_files", json::array()},
+                {"telemetry_sources", json::array()},
                 {"pre_run_notes", bounded(run.pre_run_notes, 16'000)},
                 {"setup_changes", bounded(run.setup_changes, 16'000)},
                 {"post_run_notes", bounded(run.post_run_notes, 16'000)},
                 {"conditions", conditions_json(run.conditions)},
                 {"checklist", json::array()},
             };
-            for (const auto& path : run.telemetry_files) {
-                value["telemetry_files"].push_back(stored_path(path, base).generic_string());
+            for (std::size_t index = 0;
+                 index < run.telemetry_files.size() && index < 8;
+                 ++index) {
+                const auto& path = run.telemetry_files[index];
+                const auto* previous =
+                    index < run.telemetry_source_identities.size()
+                    ? &run.telemetry_source_identities[index]
+                    : nullptr;
+                const auto identity = previous
+                    ? *previous
+                    : identity_for_path(path);
+                const auto stored =
+                    path_to_utf8(stored_path(path, base));
+                value["telemetry_files"].push_back(stored);
+                value["telemetry_sources"].push_back({
+                    {"path", stored},
+                    {"identity", source_identity_json(identity)},
+                });
             }
             for (const auto& item : run.checklist) {
                 value["checklist"].push_back({
@@ -995,8 +1218,8 @@ bool save(const Day& day, const std::filesystem::path& destination, std::string&
             });
         }
 
-        auto temporary = destination;
-        temporary += L".tmp";
+        std::error_code cleanup_error;
+        std::filesystem::remove(temporary, cleanup_error);
         if (!destination.parent_path().empty()) std::filesystem::create_directories(destination.parent_path());
         {
             std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
@@ -1005,18 +1228,35 @@ bool save(const Day& day, const std::filesystem::path& destination, std::string&
             output.flush();
             if (!output) throw std::runtime_error("Could not finish writing the race-day file");
         }
+#ifdef _WIN32
         if (!MoveFileExW(temporary.c_str(), destination.c_str(),
                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
             std::error_code ignored;
             std::filesystem::remove(temporary, ignored);
             throw std::runtime_error("Could not replace the race-day file");
         }
+#else
+        std::error_code replace_error;
+        std::filesystem::rename(
+            temporary, destination, replace_error);
+        if (replace_error) {
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+            throw std::runtime_error(
+                "Could not replace the race-day file: " +
+                replace_error.message());
+        }
+#endif
         error.clear();
         return true;
     } catch (const std::exception& exception) {
+        std::error_code cleanup_error;
+        std::filesystem::remove(temporary, cleanup_error);
         error = exception.what();
         return false;
     } catch (...) {
+        std::error_code cleanup_error;
+        std::filesystem::remove(temporary, cleanup_error);
         error = "Could not save the race-day file";
         return false;
     }
@@ -1024,13 +1264,24 @@ bool save(const Day& day, const std::filesystem::path& destination, std::string&
 
 bool load(const std::filesystem::path& source, Day& day, std::string& error) noexcept {
     try {
+        std::error_code size_error;
+        const auto byte_size =
+            std::filesystem::file_size(source, size_error);
+        if (size_error || byte_size > kMaximumRaceDayBytes) {
+            throw std::runtime_error(
+                "Race-day file is missing or larger than 32 MB");
+        }
         std::ifstream input(source, std::ios::binary);
         if (!input) throw std::runtime_error("Could not open the race-day file");
         const auto root = json::parse(input);
         if (!root.is_object() || root.value("format", std::string{}) != kFileFormat) {
             throw std::runtime_error("This is not a RaceBox race-day file");
         }
-        if (root.value("version", 0) > kFileVersion) {
+        const auto file_version = root.value("version", 0);
+        if (file_version < 1) {
+            throw std::runtime_error("The race-day file version is invalid");
+        }
+        if (file_version > kFileVersion) {
             throw std::runtime_error("The race-day file is newer than this application");
         }
         Day loaded;
@@ -1056,9 +1307,47 @@ bool load(const std::filesystem::path& source, Day& day, std::string& error) noe
             if (const auto conditions = value.find("conditions"); conditions != value.end()) {
                 run.conditions = read_conditions(*conditions);
             }
-            for (const auto& path : value.value("telemetry_files", json::array())) {
-                if (!path.is_string() || run.telemetry_files.size() >= 8) break;
-                run.telemetry_files.push_back(resolved_path(std::filesystem::path(path.get<std::string>()), base));
+            if (file_version >= 3 && value.contains("telemetry_sources") &&
+                value["telemetry_sources"].is_array() &&
+                !value["telemetry_sources"].empty()) {
+                for (const auto& source_value :
+                     value["telemetry_sources"]) {
+                    if (!source_value.is_object() ||
+                        run.telemetry_files.size() >= 8) {
+                        break;
+                    }
+                    const auto stored = source_value.find("path");
+                    if (stored == source_value.end() ||
+                        !stored->is_string()) {
+                        continue;
+                    }
+                    const auto path = resolved_path(
+                        path_from_utf8(bounded(
+                            stored->get<std::string>(), 4096)),
+                        base);
+                    run.telemetry_files.push_back(path);
+                    const auto identity =
+                        source_value.find("identity");
+                    run.telemetry_source_identities.push_back(
+                        identity == source_value.end()
+                            ? identity_for_path(path)
+                            : read_source_identity(*identity, path));
+                }
+            } else {
+                for (const auto& path :
+                     value.value("telemetry_files", json::array())) {
+                    if (!path.is_string() ||
+                        run.telemetry_files.size() >= 8) {
+                        break;
+                    }
+                    const auto resolved = resolved_path(
+                        path_from_utf8(bounded(
+                            path.get<std::string>(), 4096)),
+                        base);
+                    run.telemetry_files.push_back(resolved);
+                    run.telemetry_source_identities.push_back(
+                        identity_for_path(resolved));
+                }
             }
             for (const auto& item : value.value("checklist", json::array())) {
                 if (!item.is_object() || run.checklist.size() >= 32) break;
@@ -1254,6 +1543,19 @@ nlohmann::json build_prior_setup_results(
 
 LoadResult load_run_telemetry(const Run& run) {
     if (run.telemetry_files.empty()) throw std::runtime_error("No telemetry files are attached to this run");
+    for (std::size_t index = 0; index < run.telemetry_files.size();
+         ++index) {
+        switch (telemetry_source_state(run, index, true)) {
+            case TelemetrySourceState::Available:
+                break;
+            case TelemetrySourceState::Changed:
+                throw std::runtime_error(
+                    "A telemetry attachment changed after it was saved. Review and confirm the file in Race Day first.");
+            case TelemetrySourceState::Missing:
+                throw std::runtime_error(
+                    "A telemetry attachment is missing. Relink it in Race Day first.");
+        }
+    }
     if (run.telemetry_files.size() == 1) {
         const auto extension = lower_extension(run.telemetry_files.front());
         if (extension == L".rbxsession" || extension == L".rbxlap") {

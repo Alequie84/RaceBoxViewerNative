@@ -4,13 +4,23 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <limits>
 #include <span>
 #include <stdexcept>
+#include <system_error>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 namespace racebox {
 namespace {
@@ -99,13 +109,76 @@ bool decode_radio(std::span<const std::byte> input, RadioSeries& radio) {
     std::uint32_t magic = 0, version = 0;
     return read_value(input, magic) && read_value(input, version) && magic == 0x52584252 && version == 1 &&
            read_vector(input, radio.elapsed_us) && read_vector(input, radio.steering_percent) &&
-           read_vector(input, radio.trigger_percent) && read_vector(input, radio.voltage);
+           read_vector(input, radio.trigger_percent) && read_vector(input, radio.voltage) &&
+           input.empty();
+}
+
+constexpr std::uint64_t kMaximumManifestBytes = 4ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaximumWorkspaceBytes = 8ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaximumTelemetryBytes = 128ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaximumRadioBytes = 128ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaximumBackgroundBytes = 64ULL * 1024ULL * 1024ULL;
+constexpr std::size_t kMaximumArchiveLaps = 10'000;
+constexpr std::size_t kMaximumArchiveMarkers = 10'000;
+
+struct ZipReaderCloser {
+    mz_zip_archive* archive{};
+    explicit ZipReaderCloser(mz_zip_archive* value) : archive(value) {}
+    ~ZipReaderCloser() {
+        if (archive) mz_zip_reader_end(archive);
+    }
+    ZipReaderCloser(const ZipReaderCloser&) = delete;
+    ZipReaderCloser& operator=(const ZipReaderCloser&) = delete;
+};
+
+struct ZipWriterCloser {
+    mz_zip_archive* archive{};
+    explicit ZipWriterCloser(mz_zip_archive* value) : archive(value) {}
+    ~ZipWriterCloser() {
+        close();
+    }
+    void close() {
+        if (!archive) return;
+        mz_zip_writer_end(archive);
+        archive = nullptr;
+    }
+    ZipWriterCloser(const ZipWriterCloser&) = delete;
+    ZipWriterCloser& operator=(const ZipWriterCloser&) = delete;
+};
+
+struct FileCloser {
+    std::FILE* file{};
+    explicit FileCloser(std::FILE* value) : file(value) {}
+    ~FileCloser() {
+        close();
+    }
+    void close() {
+        if (!file) return;
+        std::fclose(file);
+        file = nullptr;
+    }
+    FileCloser(const FileCloser&) = delete;
+    FileCloser& operator=(const FileCloser&) = delete;
+};
+
+std::FILE* open_binary_file(
+    const std::filesystem::path& path, bool writing) {
+#ifdef _WIN32
+    std::FILE* file = nullptr;
+    if (_wfopen_s(&file, path.c_str(),
+                  writing ? L"wb" : L"rb") != 0) {
+        return nullptr;
+    }
+    return file;
+#else
+    return std::fopen(
+        path.string().c_str(), writing ? "wb" : "rb");
+#endif
 }
 
 json manifest_for(const Session& session, std::string_view format) {
     json manifest = {
-        {"format", format}, {"version", 1}, {"name", session.name},
-        {"workspace_state_json", session.workspace_state_json},
+        {"format", format}, {"version", 2}, {"name", session.name},
         {"alignment", {
             {"compatible", session.alignment.compatible}, {"anchor_us", session.alignment.radio_anchor_us},
             {"correction_us", session.alignment.fine_correction_us}, {"trigger_sign", session.alignment.trigger_sign},
@@ -135,6 +208,9 @@ json manifest_for(const Session& session, std::string_view format) {
                  {"source_crop_right_px", session.map_background.source_crop_right_px},
                  {"source_crop_bottom_px", session.map_background.source_crop_bottom_px}}}
     };
+    if (!session.workspace_state_json.empty()) {
+        manifest["workspace_entry"] = "workspace.json";
+    }
     if (session.start_finish_line) {
         const auto& line = *session.start_finish_line;
         manifest["start_finish_line"] = {
@@ -151,42 +227,127 @@ bool add_file(mz_zip_archive& archive, std::string_view name, std::span<const st
     return mz_zip_writer_add_mem(&archive, std::string(name).c_str(), data.data(), data.size(), MZ_BEST_SPEED) != 0;
 }
 
-std::vector<std::byte> archive_file(mz_zip_archive& archive, const char* name) {
-    size_t size = 0;
-    void* data = mz_zip_reader_extract_file_to_heap(&archive, name, &size, 0);
-    if (!data) return {};
+std::vector<std::byte> archive_file(
+    mz_zip_archive& archive,
+    const char* name,
+    std::uint64_t maximum_size) {
+    const auto index = mz_zip_reader_locate_file(&archive, name, nullptr, 0);
+    if (index < 0) return {};
+    mz_zip_archive_file_stat stat{};
+    if (!mz_zip_reader_file_stat(&archive, static_cast<mz_uint>(index), &stat) ||
+        stat.m_uncomp_size > maximum_size ||
+        stat.m_uncomp_size > static_cast<mz_uint64>(std::numeric_limits<std::size_t>::max())) {
+        return {};
+    }
+    const auto size = static_cast<std::size_t>(stat.m_uncomp_size);
     std::vector<std::byte> output(size);
-    std::memcpy(output.data(), data, size);
-    mz_free(data);
+    if (size > 0 &&
+        !mz_zip_reader_extract_to_mem(
+            &archive, static_cast<mz_uint>(index), output.data(),
+            output.size(), 0)) {
+        return {};
+    }
     return output;
+}
+
+bool replace_file_atomically(
+    const std::filesystem::path& temporary,
+    const std::filesystem::path& destination,
+    std::string& error) {
+#ifdef _WIN32
+    if (MoveFileExW(temporary.c_str(), destination.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) {
+        return true;
+    }
+    error = "Could not replace the destination archive";
+    return false;
+#else
+    std::error_code filesystem_error;
+    std::filesystem::rename(temporary, destination, filesystem_error);
+    if (!filesystem_error) return true;
+    error = "Could not replace the destination archive: " + filesystem_error.message();
+    return false;
+#endif
+}
+
+bool supported_background_extension(const std::filesystem::path& entry) {
+    auto extension = entry.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+        [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+    return extension == ".png" || extension == ".jpg" || extension == ".jpeg" ||
+           extension == ".bmp";
 }
 
 }  // namespace
 
 bool save_archive(const Session& session, const std::filesystem::path& destination, std::string_view format, std::string& error) {
+    auto temporary = destination;
+    temporary += L".writing";
     try {
+        std::error_code cleanup_error;
+        std::filesystem::remove(temporary, cleanup_error);
         const auto telemetry = encode_telemetry(session.telemetry);
         const auto radio = encode_radio(session.radio);
         auto manifest = manifest_for(session, format);
-        if (!session.map_background.image_path.empty()) {
+        if (!session.map_background.image_path.empty() &&
+            std::filesystem::is_regular_file(session.map_background.image_path)) {
+            if (!supported_background_extension(
+                    session.map_background.image_path)) {
+                throw std::runtime_error("Map background image type is unsupported");
+            }
             manifest["map"]["image_entry"] = "background" + session.map_background.image_path.extension().string();
         }
         const auto manifest_text = manifest.dump(2);
+        if (manifest_text.size() > kMaximumManifestBytes ||
+            session.workspace_state_json.size() > kMaximumWorkspaceBytes) {
+            throw std::runtime_error("Archive metadata is too large");
+        }
+        if (!session.workspace_state_json.empty()) {
+            const auto workspace =
+                json::parse(session.workspace_state_json, nullptr, false);
+            if (workspace.is_discarded()) {
+                throw std::runtime_error("Session workspace data is invalid");
+            }
+        }
+        auto* archive_file_handle =
+            open_binary_file(temporary, true);
+        if (!archive_file_handle) {
+            throw std::runtime_error("Could not create archive");
+        }
+        FileCloser close_file{archive_file_handle};
         mz_zip_archive archive{};
-        if (!mz_zip_writer_init_file(&archive, destination.string().c_str(), 0)) throw std::runtime_error("Could not create archive");
+        if (!mz_zip_writer_init_cfile(
+                &archive, archive_file_handle, 0)) {
+            throw std::runtime_error("Could not create archive");
+        }
+        ZipWriterCloser close_archive{&archive};
         const auto manifest_bytes = std::as_bytes(std::span(manifest_text));
         bool ok = add_file(archive, "manifest.json", manifest_bytes) && add_file(archive, "telemetry.bin", telemetry) && add_file(archive, "radio.bin", radio);
+        if (ok && !session.workspace_state_json.empty()) {
+            ok = add_file(archive, "workspace.json",
+                std::as_bytes(std::span(session.workspace_state_json)));
+        }
         if (ok && !session.map_background.image_path.empty() && std::filesystem::exists(session.map_background.image_path)) {
             std::ifstream image(session.map_background.image_path, std::ios::binary);
             std::vector<char> bytes((std::istreambuf_iterator<char>(image)), {});
+            if (bytes.size() > kMaximumBackgroundBytes) {
+                throw std::runtime_error("Map background is too large");
+            }
             const auto extension = session.map_background.image_path.extension().string();
             ok = add_file(archive, "background" + extension, std::as_bytes(std::span(bytes)));
         }
         ok = ok && mz_zip_writer_finalize_archive(&archive) != 0;
-        mz_zip_writer_end(&archive);
+        close_archive.close();
+        close_file.close();
         if (!ok) throw std::runtime_error("Archive write failed");
+        if (!replace_file_atomically(temporary, destination, error)) {
+            std::filesystem::remove(temporary, cleanup_error);
+            return false;
+        }
         return true;
     } catch (const std::exception& exception) {
+        std::error_code cleanup_error;
+        std::filesystem::remove(temporary, cleanup_error);
         error = exception.what();
         return false;
     }
@@ -249,35 +410,151 @@ bool save_lap_archive(const Session& session, const LapInfo& lap, const std::fil
 
 bool load_session_archive(const std::filesystem::path& source, Session& session, std::string& error) {
     try {
+        auto* archive_file_handle =
+            open_binary_file(source, false);
+        if (!archive_file_handle) {
+            throw std::runtime_error("Could not open archive");
+        }
+        FileCloser close_file{archive_file_handle};
         mz_zip_archive archive{};
-        if (!mz_zip_reader_init_file(&archive, source.string().c_str(), 0)) throw std::runtime_error("Could not open archive");
-        const auto manifest_bytes = archive_file(archive, "manifest.json");
-        const auto telemetry_bytes = archive_file(archive, "telemetry.bin");
-        const auto radio_bytes = archive_file(archive, "radio.bin");
+        if (!mz_zip_reader_init_cfile(
+                &archive, archive_file_handle, 0, 0)) {
+            throw std::runtime_error("Could not open archive");
+        }
+        ZipReaderCloser close_archive{&archive};
+        const auto manifest_bytes = archive_file(
+            archive, "manifest.json", kMaximumManifestBytes);
+        const auto telemetry_bytes = archive_file(
+            archive, "telemetry.bin", kMaximumTelemetryBytes);
+        const auto radio_bytes = archive_file(
+            archive, "radio.bin", kMaximumRadioBytes);
         if (manifest_bytes.empty() || telemetry_bytes.empty()) {
-            mz_zip_reader_end(&archive);
             throw std::runtime_error("Archive is missing required files");
         }
         const std::string manifest_text(reinterpret_cast<const char*>(manifest_bytes.data()), manifest_bytes.size());
         const auto manifest = json::parse(manifest_text);
         const auto format = manifest.value("format", "");
-        if ((format != "racebox-session" && format != "racebox-lap") || manifest.value("version", 0) != 1) throw std::runtime_error("Unsupported archive version");
+        const auto manifest_version = manifest.value("version", 0);
+        if ((format != "racebox-session" && format != "racebox-lap") ||
+            (manifest_version != 1 && manifest_version != 2)) {
+            throw std::runtime_error("Unsupported archive version");
+        }
         session = {};
         session.name = manifest.value("name", "Saved session");
-        session.workspace_state_json = manifest.value("workspace_state_json", std::string{});
+        if (session.name.size() > 300) session.name.resize(300);
+        if (manifest_version == 1) {
+            session.workspace_state_json =
+                manifest.value("workspace_state_json", std::string{});
+        } else if (const auto workspace_entry =
+                manifest.find("workspace_entry");
+                   workspace_entry != manifest.end() &&
+                   workspace_entry->is_string()) {
+            const auto entry = workspace_entry->get<std::string>();
+            if (entry != "workspace.json") {
+                throw std::runtime_error("Archive workspace entry is invalid");
+            }
+            const auto workspace_bytes = archive_file(
+                archive, entry.c_str(), kMaximumWorkspaceBytes);
+            if (workspace_bytes.empty()) {
+                throw std::runtime_error("Archive workspace is missing or too large");
+            }
+            session.workspace_state_json.assign(
+                reinterpret_cast<const char*>(workspace_bytes.data()),
+                workspace_bytes.size());
+            const auto workspace =
+                json::parse(session.workspace_state_json, nullptr, false);
+            if (workspace.is_discarded() || !workspace.is_object()) {
+                throw std::runtime_error("Archive workspace data is invalid");
+            }
+        }
         if (!decode_telemetry(telemetry_bytes, session.telemetry)) throw std::runtime_error("Telemetry payload is corrupt");
         if (!radio_bytes.empty() && !decode_radio(radio_bytes, session.radio)) throw std::runtime_error("Radio payload is corrupt");
-        for (const auto& value : manifest.value("laps", json::array())) {
-            session.laps.push_back({value[0], value[1], value[2], value[3], value[4], static_cast<LapPhase>(value[5].get<int>())});
+        session.telemetry.validate();
+        session.radio.validate();
+        if (session.telemetry.empty()) {
+            throw std::runtime_error("Archive telemetry is empty");
         }
-        for (const auto& value : manifest.value("markers", json::array())) session.sector_markers.push_back({value[0], value[1], value[2]});
+        if (!std::is_sorted(session.telemetry.time_us.begin(),
+                            session.telemetry.time_us.end())) {
+            throw std::runtime_error("Archive telemetry times are not ordered");
+        }
+        if (!std::is_sorted(session.radio.elapsed_us.begin(),
+                            session.radio.elapsed_us.end())) {
+            throw std::runtime_error("Archive radio times are not ordered");
+        }
+        const auto laps = manifest.value("laps", json::array());
+        if (!laps.is_array() || laps.size() > kMaximumArchiveLaps) {
+            throw std::runtime_error("Archive lap list is invalid or too large");
+        }
+        for (const auto& value : laps) {
+            if (!value.is_array() || value.size() != 6) {
+                throw std::runtime_error("Archive contains an invalid lap");
+            }
+            const auto raw_lap = value.at(0).get<std::int32_t>();
+            const auto race_lap = value.at(1).get<std::int32_t>();
+            const auto begin = value.at(2).get<std::uint64_t>();
+            const auto end = value.at(3).get<std::uint64_t>();
+            const auto duration = value.at(4).get<Timestamp>();
+            const auto phase_value = value.at(5).get<int>();
+            if (begin > end || end >= session.telemetry.size() ||
+                duration < 0 ||
+                phase_value < static_cast<int>(LapPhase::Complete) ||
+                phase_value > static_cast<int>(LapPhase::Invalid)) {
+                throw std::runtime_error("Archive lap range is invalid");
+            }
+            session.laps.push_back({
+                raw_lap, race_lap, static_cast<std::size_t>(begin),
+                static_cast<std::size_t>(end), duration,
+                static_cast<LapPhase>(phase_value),
+            });
+        }
+        const auto markers = manifest.value("markers", json::array());
+        if (!markers.is_array() ||
+            markers.size() > kMaximumArchiveMarkers) {
+            throw std::runtime_error(
+                "Archive sector-marker list is invalid or too large");
+        }
+        for (const auto& value : markers) {
+            if (!value.is_array() || value.size() != 3) {
+                throw std::runtime_error(
+                    "Archive contains an invalid sector marker");
+            }
+            const auto latitude = value.at(0).get<double>();
+            const auto longitude = value.at(1).get<double>();
+            const auto fraction = value.at(2).get<double>();
+            if (!std::isfinite(latitude) || !std::isfinite(longitude) ||
+                !std::isfinite(fraction) || latitude < -90.0 ||
+                latitude > 90.0 || longitude < -180.0 ||
+                longitude > 180.0 || fraction < 0.0 || fraction > 1.0) {
+                throw std::runtime_error(
+                    "Archive sector marker is outside valid bounds");
+            }
+            session.sector_markers.push_back(
+                {latitude, longitude, fraction});
+        }
         if (const auto line = manifest.find("start_finish_line"); line != manifest.end() && line->is_object()) {
             const auto a = line->value("a", json::array());
             const auto b = line->value("b", json::array());
             if (a.size() >= 2 && b.size() >= 2) {
+                const auto a_latitude = a[0].get<double>();
+                const auto a_longitude = a[1].get<double>();
+                const auto b_latitude = b[0].get<double>();
+                const auto b_longitude = b[1].get<double>();
+                const auto valid_coordinate = [](double latitude,
+                                                 double longitude) {
+                    return std::isfinite(latitude) &&
+                        std::isfinite(longitude) &&
+                        latitude >= -90.0 && latitude <= 90.0 &&
+                        longitude >= -180.0 && longitude <= 180.0;
+                };
+                if (!valid_coordinate(a_latitude, a_longitude) ||
+                    !valid_coordinate(b_latitude, b_longitude)) {
+                    throw std::runtime_error(
+                        "Archive start/finish line is invalid");
+                }
                 session.start_finish_line = PhysicalLine{
-                    PhysicalMarker{a[0].get<double>(), a[1].get<double>(), 0.0},
-                    PhysicalMarker{b[0].get<double>(), b[1].get<double>(), 0.0}};
+                    PhysicalMarker{a_latitude, a_longitude, 0.0},
+                    PhysicalMarker{b_latitude, b_longitude, 0.0}};
             }
         }
         const auto alignment = manifest.at("alignment");
@@ -327,21 +604,30 @@ bool load_session_archive(const std::filesystem::path& source, Session& session,
             }
             const auto entry = map.value("image_entry", "");
             if (!entry.empty()) {
-                const auto bytes = archive_file(archive, entry.c_str());
-                if (!bytes.empty()) {
-                    const auto cache = settings_directory() / L"map-cache";
-                    std::filesystem::create_directories(cache);
-                    const auto extension = std::filesystem::path(entry).extension();
-                    const auto filename = std::to_wstring(std::hash<std::wstring>{}(source.wstring())) + extension.wstring();
-                    const auto image_path = cache / filename;
-                    std::ofstream image(image_path, std::ios::binary);
-                    image.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-                    session.map_background.image_path = image_path;
+                if (!supported_background_extension(entry)) {
+                    throw std::runtime_error("Archive map image type is unsupported");
                 }
+                const auto bytes = archive_file(
+                    archive, entry.c_str(), kMaximumBackgroundBytes);
+                if (bytes.empty()) {
+                    throw std::runtime_error(
+                        "Archive map image is missing or too large");
+                }
+                const auto cache = settings_directory() / L"map-cache";
+                std::filesystem::create_directories(cache);
+                const auto extension = std::filesystem::path(entry).extension();
+                const auto filename = std::to_wstring(std::hash<std::wstring>{}(source.wstring())) + extension.wstring();
+                const auto image_path = cache / filename;
+                std::ofstream image(image_path, std::ios::binary);
+                image.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+                if (!image) {
+                    throw std::runtime_error(
+                        "Archive map image could not be cached");
+                }
+                session.map_background.image_path = image_path;
             }
         }
         session.theoretical_best = calculate_theoretical_best(session);
-        mz_zip_reader_end(&archive);
         return true;
     } catch (const std::exception& exception) {
         error = exception.what();

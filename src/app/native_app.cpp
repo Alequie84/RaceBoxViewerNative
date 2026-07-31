@@ -1,4 +1,5 @@
 #include "native_app.hpp"
+#include "racebox/plot_decimation.hpp"
 #include "racebox_version.h"
 #include "ui_preferences.hpp"
 #include "ui_theme.hpp"
@@ -24,6 +25,14 @@ namespace racebox::app {
 namespace {
 
 constexpr Timestamp kSecond = 1'000'000;
+
+std::string path_utf8(const std::filesystem::path& path) {
+    const auto encoded = path.generic_u8string();
+    return {
+        reinterpret_cast<const char*>(encoded.data()),
+        encoded.size(),
+    };
+}
 
 std::string environment_variable(const char* name) {
     const auto length = GetEnvironmentVariableA(name, nullptr, 0);
@@ -346,9 +355,25 @@ nlohmann::json race_day_run_context(const race_day::Day& day, const race_day::Ru
     };
 }
 
-float application_header_height() {
+float application_header_height(float text_scale) {
     const auto* viewport = ImGui::GetMainViewport();
-    return 104.0F * std::clamp(viewport ? viewport->DpiScale : 1.0F, 1.0F, 2.0F);
+    const auto dpi_scale = std::clamp(viewport ? viewport->DpiScale : 1.0F, 1.0F, 2.0F);
+    const auto normalized_text_scale = std::clamp(text_scale, 1.0F, 1.5F);
+    return (136.0F + (normalized_text_scale - 1.0F) * 96.0F) * dpi_scale;
+}
+
+void set_dock_tree_customizable(ImGuiDockNode* node, bool customizable) {
+    if (!node) return;
+    constexpr auto lock_flags = static_cast<ImGuiDockNodeFlags>(
+        static_cast<int>(ImGuiDockNodeFlags_NoResize) |
+        static_cast<int>(ImGuiDockNodeFlags_NoDocking));
+    if (customizable) {
+        node->LocalFlags = static_cast<ImGuiDockNodeFlags>(node->LocalFlags & ~lock_flags);
+    } else {
+        node->LocalFlags = static_cast<ImGuiDockNodeFlags>(node->LocalFlags | lock_flags);
+    }
+    set_dock_tree_customizable(node->ChildNodes[0], customizable);
+    set_dock_tree_customizable(node->ChildNodes[1], customizable);
 }
 
 std::string recorded_time_label(const Session* session) {
@@ -674,7 +699,10 @@ NativeApp::NativeApp(HWND window, ID3D11Device* device, bool software_renderer)
     show_map_grid_ = preferences.show_map_grid;
     map_grid_spacing_m_ = preferences.map_grid_spacing_m;
     separate_compare_maps_ = preferences.separate_compare_maps;
+    compare_b_enabled_ = preferences.workspace.compare_b_enabled;
     show_analysis_aligned_traces_ = preferences.analysis_aligned_map_traces;
+    text_scale_ = preferences.text_scale;
+    customize_layout_ = preferences.workspace.customize_layout;
     telemetry_plot_order_ = preferences.telemetry_plot_order;
     compact_telemetry_ = preferences.workspace.telemetry_density == TelemetryDensity::Compact;
     show_radio_panel_ = preferences.workspace.utility_panels.radio_alignment;
@@ -686,16 +714,17 @@ NativeApp::NativeApp(HWND window, ID3D11Device* device, bool software_renderer)
     loaded_layout_version_ = loaded.source_layout_version;
     build_default_layout_ = !std::filesystem::exists(settings_directory() / L"layout.ini") || loaded.layout_rebuild_required;
     if (loaded.layout_rebuild_required) {
-        const auto migration = prepare_layout_v3_migration(settings_directory(), loaded.source_layout_version);
+        const auto migration = prepare_layout_v4_migration(settings_directory(), loaded.source_layout_version);
         if (!migration.safe_to_rebuild) {
             build_default_layout_ = false;
             write_log(migration.error);
         } else if (migration.backup_created) {
-            write_log("Legacy dock layout backed up before the v3 Overview migration");
+            write_log("Legacy dock layout backed up before the v4 guided-workspace migration");
         }
     }
     if (!loaded.warning.empty()) write_log(loaded.warning);
     ui::apply_theme(light_theme_ ? ui::ThemeMode::Light : ui::ThemeMode::Dark, ui::dpi_scale_for_window(window_));
+    ImGui::GetStyle().FontScaleMain = text_scale_;
     write_log(software_renderer ? "Native UI started with WARP software renderer" : "Native UI started with DirectX 11 hardware renderer");
 }
 
@@ -711,10 +740,13 @@ NativeApp::~NativeApp() {
     preferences.map_grid_spacing_m = map_grid_spacing_m_;
     preferences.separate_compare_maps = separate_compare_maps_;
     preferences.analysis_aligned_map_traces = show_analysis_aligned_traces_;
+    preferences.text_scale = text_scale_;
     preferences.layout_version = loaded_layout_version_;
     preferences.telemetry_plot_order = telemetry_plot_order_;
     preferences.workspace.active = static_cast<UiWorkspace>(workspace_section_);
     preferences.workspace.telemetry_density = compact_telemetry_ ? TelemetryDensity::Compact : TelemetryDensity::Detailed;
+    preferences.workspace.compare_b_enabled = compare_b_enabled_;
+    preferences.workspace.customize_layout = customize_layout_;
     preferences.workspace.utility_panels.radio_alignment = show_radio_panel_;
     preferences.workspace.utility_panels.theoretical_analysis = show_analysis_panel_;
     preferences.workspace.utility_panels.diagnostics = show_diagnostics_panel_;
@@ -759,7 +791,7 @@ const LapInfo* NativeApp::compare_lap() const {
 }
 
 const LapInfo* NativeApp::compare_b_lap() const {
-    if (!session_ || session_->laps.empty()) return nullptr;
+    if (!compare_b_enabled_ || !session_ || session_->laps.empty()) return nullptr;
     const auto index = std::clamp(compare_b_lap_index_, 0, static_cast<int>(session_->laps.size() - 1));
     return &session_->laps[index];
 }
@@ -780,7 +812,8 @@ bool NativeApp::ensure_unique_complete_comparison_roles() {
     for (std::size_t index = 0; index < session_->laps.size(); ++index) {
         if (session_->laps[index].phase == LapPhase::Complete) complete_laps.push_back(static_cast<int>(index));
     }
-    if (complete_laps.size() < 3) return false;
+    const auto required_laps = compare_b_enabled_ ? std::size_t{3} : std::size_t{2};
+    if (complete_laps.size() < required_laps) return false;
     std::stable_sort(complete_laps.begin(), complete_laps.end(), [&](int left, int right) {
         return session_->laps[static_cast<std::size_t>(left)].duration_us <
                session_->laps[static_cast<std::size_t>(right)].duration_us;
@@ -805,10 +838,10 @@ bool NativeApp::ensure_unique_complete_comparison_roles() {
 
     const auto reference = choose(fastest_reference_ ? complete_laps.front() : active_lap_index_);
     const auto compare_a = choose(compare_lap_index_);
-    const auto compare_b = choose(compare_b_lap_index_);
+    const auto compare_b = compare_b_enabled_ ? choose(compare_b_lap_index_) : compare_b_lap_index_;
     const auto previous_reference = active_lap_index_;
     const auto changed = reference != active_lap_index_ || compare_a != compare_lap_index_ ||
-                         compare_b != compare_b_lap_index_;
+                         (compare_b_enabled_ && compare_b != compare_b_lap_index_);
     active_lap_index_ = reference;
     compare_lap_index_ = compare_a;
     compare_b_lap_index_ = compare_b;
@@ -854,6 +887,7 @@ std::string NativeApp::serialize_workspace_state() const {
         {"formula_version", std::string(driver_analysis::kFormulaVersion)},
         {"fastest_reference", fastest_reference_}, {"reference_index", active_lap_index_},
         {"compare_a_index", compare_lap_index_}, {"compare_b_index", compare_b_lap_index_},
+        {"compare_b_enabled", compare_b_enabled_},
         {"playback_index", playback_lap_index_}, {"view_mode", static_cast<int>(view_mode_)},
         {"session_notes", std::string(session_notes_.data())},
         {"crew_chief", {
@@ -904,7 +938,9 @@ std::string NativeApp::serialize_workspace_state() const {
             {"plot_id", annotation.plot_id}, {"plot_index", annotation.plot_index},
             {"x", annotation.normalized_x}, {"y", annotation.normalized_y}, {"cursor_us", annotation.cursor_us},
             {"reference_index", annotation.active_lap_index}, {"compare_a_index", annotation.compare_lap_index},
-            {"compare_b_index", annotation.compare_b_lap_index}, {"playback_index", annotation.playback_lap_index},
+            {"compare_b_index", annotation.compare_b_lap_index},
+            {"compare_b_enabled", annotation.compare_b_enabled},
+            {"playback_index", annotation.playback_lap_index},
             {"view_mode", static_cast<int>(annotation.view_mode)}, {"note", std::string(annotation.note.data())}
         });
     }
@@ -927,6 +963,7 @@ void NativeApp::restore_workspace_state() {
         active_lap_index_ = std::clamp(state.value("reference_index", active_lap_index_), 0, maximum);
         compare_lap_index_ = std::clamp(state.value("compare_a_index", compare_lap_index_), 0, maximum);
         compare_b_lap_index_ = std::clamp(state.value("compare_b_index", compare_b_lap_index_), 0, maximum);
+        compare_b_enabled_ = state.value("compare_b_enabled", compare_b_enabled_);
         playback_lap_index_ = std::clamp(state.value("playback_index", playback_lap_index_), 0, maximum);
         view_mode_ = static_cast<ViewMode>(std::clamp(state.value("view_mode", static_cast<int>(view_mode_)), 0, 2));
         const auto notes = state.value("session_notes", std::string{});
@@ -938,6 +975,7 @@ void NativeApp::restore_workspace_state() {
             crew_chief_after_slot_ = crew->value("after_slot", std::string{"compare_a"}) == "compare_b"
                 ? driver_analysis::ComparisonSlot::CompareB
                 : driver_analysis::ComparisonSlot::CompareA;
+            if (!compare_b_enabled_) crew_chief_after_slot_ = driver_analysis::ComparisonSlot::CompareA;
             crew_chief_history_.clear();
             for (const auto& turn : crew->value("history", nlohmann::json::array())) {
                 if (!turn.is_object() || crew_chief_history_.size() >= 20) break;
@@ -1012,6 +1050,7 @@ void NativeApp::restore_workspace_state() {
             annotation.active_lap_index = value.value("reference_index", active_lap_index_);
             annotation.compare_lap_index = value.value("compare_a_index", compare_lap_index_);
             annotation.compare_b_lap_index = value.value("compare_b_index", compare_b_lap_index_);
+            annotation.compare_b_enabled = value.value("compare_b_enabled", compare_b_enabled_);
             annotation.playback_lap_index = value.value("playback_index", playback_lap_index_);
             annotation.view_mode = static_cast<ViewMode>(std::clamp(value.value("view_mode", 0), 0, 2));
             const auto note = value.value("note", std::string{});
@@ -1327,18 +1366,23 @@ void NativeApp::poll_loader() {
         restore_workspace_state();
         if (!ensure_unique_complete_comparison_roles() && view_mode_ == ViewMode::Compare) {
             view_mode_ = ViewMode::SingleLap;
-            error_ = "Compare mode needs three different complete laps";
+            error_ = compare_b_enabled_
+                ? "Compare mode needs three different complete laps when Compare B is enabled"
+                : "Compare mode needs two different complete laps";
         }
         if (view_mode_ == ViewMode::Compare) {
             workspace_section_ = WorkspaceSection::Compare;
         } else if (workspace_section_ == WorkspaceSection::Compare) {
-            workspace_section_ = WorkspaceSection::Overview;
+            workspace_section_ = WorkspaceSection::Session;
         }
-        if (workspace_section_ == WorkspaceSection::Analysis) {
-            requested_telemetry_tab_ = TelemetryTab::Events;
-            telemetry_tab_request_pending_ = true;
-        } else if (workspace_section_ == WorkspaceSection::Sectors) {
+        if (workspace_section_ == WorkspaceSection::CrewChief) {
+            requested_insights_tab_ = InsightsTab::CrewChief;
+            insights_tab_request_pending_ = true;
+        } else if (workspace_section_ == WorkspaceSection::Reports) {
             requested_telemetry_tab_ = TelemetryTab::Sectors;
+            telemetry_tab_request_pending_ = true;
+        } else if (workspace_section_ == WorkspaceSection::Session) {
+            requested_telemetry_tab_ = TelemetryTab::Telemetry;
             telemetry_tab_request_pending_ = true;
         }
         if (corner_zones_.empty() && active_lap()) {
@@ -1370,6 +1414,7 @@ void NativeApp::poll_loader() {
 
 bool NativeApp::render() {
     poll_loader();
+    ImGui::GetStyle().FontScaleMain = text_scale_;
     hover_seen_this_frame_ = false;
     annotation_click_consumed_ = false;
     annotation_editor_hovered_ = false;
@@ -1406,7 +1451,7 @@ bool NativeApp::render() {
     draw_review_locked([&] { draw_app_header(); });
 
     const auto* viewport = ImGui::GetMainViewport();
-    const auto header_height = application_header_height();
+    const auto header_height = application_header_height(text_scale_);
     const auto host_origin = viewport->WorkPos + ImVec2(0.0F, header_height);
     const auto host_size = ImVec2(viewport->WorkSize.x, std::max(1.0F, viewport->WorkSize.y - header_height));
     ImGui::SetNextWindowPos(host_origin, ImGuiCond_Always);
@@ -1420,17 +1465,25 @@ bool NativeApp::render() {
     ImGui::Begin("##RaceBoxDockHost", nullptr, host_flags);
     const auto dockspace = ImHashStr("RaceBoxViewerDockspace");
     if (build_default_layout_) {
-        const auto layout_built = build_overview_layout(dockspace, ImGui::GetWindowPos(), ImGui::GetWindowSize());
+        const auto layout_built = build_guided_layout(dockspace, ImGui::GetWindowPos(), ImGui::GetWindowSize());
         build_default_layout_ = false;
         if (layout_built) loaded_layout_version_ = kCurrentUiLayoutVersion;
-        else error_ = "The Overview dock layout could not be completed; it will be retried after restart";
+        else error_ = "The guided dock layout could not be completed; it will be retried after restart";
     }
     ImGui::DockSpace(dockspace, ImVec2(0.0F, 0.0F), ImGuiDockNodeFlags_PassthruCentralNode);
+    set_dock_tree_customizable(ImGui::DockBuilderGetNode(dockspace), customize_layout_);
     ImGui::End();
     ImGui::PopStyleVar(2);
 
     if (workspace_section_ == WorkspaceSection::RaceDay) {
         draw_review_locked([&] { draw_race_day(); });
+        draw_annotations();
+        handle_annotation_workspace();
+        if (!hover_seen_this_frame_) hover_cursor_us_.reset();
+        return !exit_requested_;
+    }
+    if (workspace_section_ == WorkspaceSection::Reports) {
+        draw_review_locked([&] { draw_reports(); });
         draw_annotations();
         handle_annotation_workspace();
         if (!hover_seen_this_frame_) hover_cursor_us_.reset();
@@ -1452,7 +1505,7 @@ bool NativeApp::render() {
     return !exit_requested_;
 }
 
-bool NativeApp::build_overview_layout(ImGuiID dockspace, ImVec2 origin, ImVec2 size) {
+bool NativeApp::build_guided_layout(ImGuiID dockspace, ImVec2 origin, ImVec2 size) {
     ImGui::DockBuilderRemoveNode(dockspace);
     ImGui::DockBuilderAddNode(dockspace, ImGuiDockNodeFlags_DockSpace);
     ImGui::DockBuilderSetNodePos(dockspace, origin);
@@ -1488,7 +1541,7 @@ bool NativeApp::build_overview_layout(ImGuiID dockspace, ImVec2 origin, ImVec2 s
 void NativeApp::draw_app_header() {
     const auto* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos, ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, application_header_height()), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, application_header_height(text_scale_)), ImGuiCond_Always);
     ImGui::SetNextWindowViewport(viewport->ID);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0F);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0F);
@@ -1503,17 +1556,33 @@ void NativeApp::draw_app_header() {
     }
 
     if (ImGui::BeginMenuBar()) {
+        const auto compact_header_controls =
+            viewport->WorkSize.x < 1450.0F * text_scale_;
         const auto toggle_theme = [&] {
             light_theme_ = !light_theme_;
             ui::apply_theme(light_theme_ ? ui::ThemeMode::Light : ui::ThemeMode::Dark,
                             ui::dpi_scale_for_window(window_));
+            ImGui::GetStyle().FontScaleMain = text_scale_;
             status_ = light_theme_ ? "Light mode enabled" : "Dark mode enabled";
+        };
+        const auto toggle_annotation = [&] {
+            annotation_mode_ = !annotation_mode_;
+            if (annotation_mode_) {
+                show_annotation_pins_ = true;
+                start_finish_placement_mode_ = false;
+                annotation_click_consumed_ = true;
+                status_ = "Annotation mode on: click anywhere to place a review pin; Esc finishes";
+            } else {
+                status_ = "Annotation mode off";
+            }
         };
         ImGui::TextColored(ImVec4(0.95F, 0.10F, 0.28F, 1.0F), "R");
         ImGui::SameLine(0.0F, 4.0F);
         ImGui::TextUnformatted("RACEBOX");
-        ImGui::SameLine(0.0F, 8.0F);
-        ImGui::TextDisabled("Telemetry Analysis");
+        if (!compact_header_controls) {
+            ImGui::SameLine(0.0F, 8.0F);
+            ImGui::TextDisabled("Telemetry Analysis");
+        }
         ImGui::SameLine(0.0F, 6.0F);
         ImGui::TextColored(ImVec4(0.34F, 0.72F, 0.92F, 1.0F), "v%s", RACEBOX_VERSION_STRING);
         ImGui::Separator();
@@ -1528,6 +1597,14 @@ void NativeApp::draw_app_header() {
         if (ImGui::MenuItem("Save processed session...", nullptr, false, session_.has_value())) save_session();
         if (ImGui::MenuItem("Save active lap archive...", nullptr, false, active_lap() != nullptr)) save_active_lap();
         if (ImGui::MenuItem("Export active lap CSV...", nullptr, false, active_lap() != nullptr)) export_active_lap();
+        ImGui::SeparatorText("Review");
+        if (ImGui::MenuItem("Import annotation review...", nullptr, false,
+                            session_.has_value())) {
+            import_annotations();
+        }
+        if (ImGui::MenuItem("Export annotation review...", nullptr, false, !annotations_.empty())) {
+            export_annotations();
+        }
         const auto triangulated_available = session_ && uses_parking_track_background(*session_);
         if (ImGui::MenuItem("Import triangulated Google map", nullptr, false, triangulated_available)) {
             load_triangulated_background();
@@ -1563,6 +1640,20 @@ void NativeApp::draw_app_header() {
         ImGui::MenuItem("Metric units", nullptr, &metric_units_);
         ImGui::MenuItem("Annotation mode", nullptr, &annotation_mode_);
         ImGui::MenuItem("Compact telemetry", nullptr, &compact_telemetry_);
+        if (ImGui::BeginMenu("Text size")) {
+            const auto text_size = [&](const char* label, float scale) {
+                if (ImGui::MenuItem(label, nullptr, std::abs(text_scale_ - scale) < 0.001F)) {
+                    text_scale_ = scale;
+                    ImGui::GetStyle().FontScaleMain = text_scale_;
+                    status_ = std::format("Text size set to {:.0f}%", text_scale_ * 100.0F);
+                }
+            };
+            text_size("100%", 1.0F);
+            text_size("115%", 1.15F);
+            text_size("130%", 1.30F);
+            text_size("150%", 1.50F);
+            ImGui::EndMenu();
+        }
         if (ImGui::BeginMenu("Panels")) {
             ImGui::MenuItem("Radio Alignment", nullptr, &show_radio_panel_);
             ImGui::MenuItem("Theoretical Analysis", nullptr, &show_analysis_panel_);
@@ -1571,7 +1662,16 @@ void NativeApp::draw_app_header() {
             ImGui::MenuItem("Diagnostics", nullptr, &show_diagnostics_panel_);
             ImGui::EndMenu();
         }
-        if (ImGui::MenuItem("Reset to Overview layout")) build_default_layout_ = true;
+        if (ImGui::MenuItem("Customize layout", nullptr, &customize_layout_)) {
+            status_ = customize_layout_
+                ? "Layout editing enabled: drag tabs and splitters to customize the workspace"
+                : "Layout locked: accidental tab moves and splitter drags are disabled";
+        }
+        if (ImGui::MenuItem("Reset to guided layout")) {
+            customize_layout_ = false;
+            build_default_layout_ = true;
+            status_ = "Guided layout restored and locked";
+        }
         ImGui::EndMenu();
     }
 
@@ -1590,14 +1690,28 @@ void NativeApp::draw_app_header() {
                         plot_fit_pending_ = true;
                         driver_analysis_dirty_ = true;
                     } else {
-                        error_ = "Compare mode needs three different complete laps";
+                        error_ = compare_b_enabled_
+                            ? "Compare mode needs three different complete laps when Compare B is enabled"
+                            : "Compare mode needs two different complete laps";
                     }
                 } else {
                     workspace_section_ = section;
-                    if (section == WorkspaceSection::Overview) requested_telemetry_tab_ = TelemetryTab::Telemetry;
-                    if (section == WorkspaceSection::Analysis) requested_telemetry_tab_ = TelemetryTab::Events;
-                    if (section == WorkspaceSection::Sectors) requested_telemetry_tab_ = TelemetryTab::Sectors;
-                    telemetry_tab_request_pending_ = true;
+                    if (section == WorkspaceSection::Session) {
+                        requested_telemetry_tab_ = TelemetryTab::Telemetry;
+                        requested_insights_tab_ = InsightsTab::Insights;
+                        telemetry_tab_request_pending_ = true;
+                        insights_tab_request_pending_ = true;
+                    }
+                    if (section == WorkspaceSection::CrewChief) {
+                        requested_insights_tab_ = InsightsTab::CrewChief;
+                        insights_tab_request_pending_ = true;
+                    }
+                    if (section == WorkspaceSection::Reports) {
+                        requested_telemetry_tab_ = TelemetryTab::Sectors;
+                        requested_insights_tab_ = InsightsTab::Insights;
+                        telemetry_tab_request_pending_ = true;
+                        insights_tab_request_pending_ = true;
+                    }
                 }
             }
             ImGui::PopStyleColor(2);
@@ -1609,46 +1723,83 @@ void NativeApp::draw_app_header() {
             }
             ImGui::PopID();
         };
-        workspace_button("OVERVIEW", WorkspaceSection::Overview);
-        workspace_button("ANALYSIS", WorkspaceSection::Analysis);
-        workspace_button("COMPARE", WorkspaceSection::Compare);
-        workspace_button("SECTORS", WorkspaceSection::Sectors);
         workspace_button("RACE DAY", WorkspaceSection::RaceDay);
-
-        ImGui::SameLine(0.0F, 12.0F);
-        if (ImGui::SmallButton(light_theme_ ? "THEME: LIGHT" : "THEME: DARK")) {
-            toggle_theme();
-        }
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Switch between light and dark graphics.");
-        }
-
-        ImGui::SameLine(0.0F, 12.0F);
-        ImGui::PushStyleColor(ImGuiCol_Button, annotation_mode_
-            ? ImVec4(0.62F, 0.08F, 0.16F, 0.95F) : ImVec4(0.10F, 0.13F, 0.18F, 0.92F));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75F, 0.10F, 0.20F, 1.0F));
-        if (ImGui::SmallButton(annotation_mode_ ? "ANNOTATION ON (ESC)" : "ANNOTATE")) {
-            annotation_mode_ = true;
-            show_annotation_pins_ = true;
-            start_finish_placement_mode_ = false;
-            annotation_click_consumed_ = true;
-            status_ = "Annotation mode on: click anywhere to place a review pin; Esc finishes";
-        }
-        ImGui::PopStyleColor(2);
-        if (!annotation_mode_ && ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Place numbered review pins anywhere in the interface. Press Esc when finished.");
-        }
+        workspace_button("SESSION", WorkspaceSection::Session);
+        workspace_button("COMPARE", WorkspaceSection::Compare);
+        workspace_button("CREW CHIEF", WorkspaceSection::CrewChief);
+        workspace_button("REPORTS", WorkspaceSection::Reports);
 
         const auto renderer = software_renderer_ ? "WARP" : "DX11";
-        const auto renderer_size = ImGui::CalcTextSize(renderer).x;
-        const auto status_size = ImGui::CalcTextSize(status_.c_str()).x;
-        const auto desired_x = ImGui::GetWindowWidth() - renderer_size - std::min(status_size, 360.0F) - 34.0F;
-        if (desired_x > ImGui::GetCursorPosX() + 20.0F) {
-            ImGui::SetCursorPosX(desired_x);
-            ImGui::TextDisabled("%s", status_.c_str());
-            ImGui::SameLine();
-            ImGui::TextColored(software_renderer_ ? ImVec4(1.0F, 0.55F, 0.2F, 1.0F) :
-                ImVec4(0.25F, 0.8F, 0.45F, 1.0F), "%s", renderer);
+        if (compact_header_controls) {
+            ImGui::SameLine(0.0F, 8.0F);
+            if (ImGui::BeginMenu("TOOLS")) {
+                if (ImGui::MenuItem(
+                        light_theme_ ? "Use dark theme" : "Use light theme")) {
+                    toggle_theme();
+                }
+                if (ImGui::MenuItem(
+                        customize_layout_ ? "Lock layout" : "Customize layout")) {
+                    customize_layout_ = !customize_layout_;
+                    status_ = customize_layout_
+                        ? "Layout editing enabled: drag tabs and splitters to customize the workspace"
+                        : "Layout locked: accidental tab moves and splitter drags are disabled";
+                }
+                if (ImGui::MenuItem(
+                        annotation_mode_ ? "Finish annotation mode" : "Annotate",
+                        nullptr, annotation_mode_)) {
+                    toggle_annotation();
+                }
+                ImGui::Separator();
+                ImGui::TextDisabled("Renderer: %s", renderer);
+                ImGui::EndMenu();
+            }
+        } else {
+            ImGui::SameLine(0.0F, 12.0F);
+            if (ImGui::SmallButton(
+                    light_theme_ ? "THEME: LIGHT" : "THEME: DARK")) {
+                toggle_theme();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Switch between light and dark graphics.");
+            }
+
+            ImGui::SameLine(0.0F, 8.0F);
+            if (ImGui::SmallButton(
+                    customize_layout_ ? "LAYOUT: CUSTOM" : "LAYOUT: LOCKED")) {
+                customize_layout_ = !customize_layout_;
+                status_ = customize_layout_
+                    ? "Layout editing enabled: drag tabs and splitters to customize the workspace"
+                    : "Layout locked: accidental tab moves and splitter drags are disabled";
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(customize_layout_
+                    ? "Click to lock the current panel arrangement."
+                    : "Click to allow panel dragging and splitter resizing.");
+            }
+
+            ImGui::SameLine(0.0F, 12.0F);
+            ImGui::PushStyleColor(ImGuiCol_Button, annotation_mode_
+                ? ImVec4(0.62F, 0.08F, 0.16F, 0.95F)
+                : ImVec4(0.10F, 0.13F, 0.18F, 0.92F));
+            ImGui::PushStyleColor(
+                ImGuiCol_ButtonHovered,
+                ImVec4(0.75F, 0.10F, 0.20F, 1.0F));
+            if (ImGui::SmallButton(
+                    annotation_mode_ ? "ANNOTATION ON (ESC)" : "ANNOTATE")) {
+                if (!annotation_mode_) toggle_annotation();
+            }
+            ImGui::PopStyleColor(2);
+            if (!annotation_mode_ && ImGui::IsItemHovered()) {
+                ImGui::SetTooltip(
+                    "Place numbered review pins anywhere in the interface. Press Esc when finished.");
+            }
+
+            ImGui::SameLine(0.0F, 10.0F);
+            ImGui::TextColored(
+                software_renderer_
+                    ? ImVec4(1.0F, 0.55F, 0.2F, 1.0F)
+                    : ImVec4(0.25F, 0.8F, 0.45F, 1.0F),
+                "%s", renderer);
         }
         ImGui::EndMenuBar();
     }
@@ -1695,8 +1846,10 @@ void NativeApp::draw_app_header() {
             ImGui::TextColored(ImVec4(0.20F, 0.78F, 0.40F, 1.0F), "REF %s", lap_short(active_lap()).c_str());
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(1.0F, 0.68F, 0.12F, 1.0F), "A %s", lap_short(compare_lap()).c_str());
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.95F, 0.25F, 0.28F, 1.0F), "B %s", lap_short(compare_b_lap()).c_str());
+            if (compare_b_enabled_) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.95F, 0.25F, 0.28F, 1.0F), "B %s", lap_short(compare_b_lap()).c_str());
+            }
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.10F, 0.85F, 0.95F, 1.0F), "PLAY %s", lap_short(playback_lap()).c_str());
         } else {
@@ -1704,8 +1857,35 @@ void NativeApp::draw_app_header() {
         }
         ImGui::EndTable();
     }
+    draw_global_notification();
     ImGui::End();
     ImGui::PopStyleVar(3);
+}
+
+void NativeApp::draw_global_notification() {
+    ImGui::Separator();
+    std::string* attention = nullptr;
+    if (!error_.empty()) attention = &error_;
+    else if (!race_day_error_.empty()) attention = &race_day_error_;
+    else if (!crew_chief_error_.empty()) attention = &crew_chief_error_;
+
+    if (attention) {
+        ImGui::TextColored(ui::color(ui::ColorToken::Danger), "NEEDS ATTENTION");
+        ImGui::SameLine();
+        const auto dismiss_width = ImGui::CalcTextSize("Dismiss").x + ImGui::GetStyle().FramePadding.x * 2.0F;
+        ImGui::PushTextWrapPos(std::max(ImGui::GetCursorPosX() + 120.0F,
+            ImGui::GetWindowWidth() - dismiss_width - 26.0F));
+        ImGui::TextWrapped("%s", attention->c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Dismiss##global-notification")) attention->clear();
+        return;
+    }
+
+    ImGui::TextColored(loading_ ? ui::color(ui::ColorToken::Warning) : ui::color(ui::ColorToken::Playback),
+        "%s", loading_ ? "WORKING" : "STATUS");
+    ImGui::SameLine();
+    ImGui::TextWrapped("%s", status_.c_str());
 }
 
 void NativeApp::draw_playback() {
@@ -1725,7 +1905,9 @@ void NativeApp::draw_playback() {
         view_mode_ = static_cast<ViewMode>(mode);
         if (view_mode_ == ViewMode::Compare && !ensure_unique_complete_comparison_roles()) {
             view_mode_ = previous_mode;
-            error_ = "Compare mode needs three different complete laps";
+            error_ = compare_b_enabled_
+                ? "Compare mode needs three different complete laps when Compare B is enabled"
+                : "Compare mode needs two different complete laps";
         } else {
             continuous_drilldown_ = false;
             plot_cache_active_ = -1;
@@ -1801,7 +1983,7 @@ void NativeApp::draw_playback() {
             ImGui::Text("Altitude %.1f m   Distance %.1f%%", altitude, inspected_progress);
             if (radio.valid) ImGui::Text("Throttle %.0f%%   Brake %.0f%%   Steering %+.0f%%", radio.throttle, radio.brake, radio.steering);
             else ImGui::TextDisabled("Sanwa controls: not recorded at this point");
-            if (view_mode_ == ViewMode::Compare && active_lap() && compare_lap() && compare_b_lap()) {
+            if (view_mode_ == ViewMode::Compare && active_lap() && compare_lap()) {
                 refresh_plot_cache();
                 const auto role_row = [&](const char* role, const LapInfo* lap, ui::ColorToken token) {
                     const auto timestamp = time_at_progress(lap, inspected_progress);
@@ -1820,11 +2002,15 @@ void NativeApp::draw_playback() {
                 };
                 role_row("REF", active_lap(), ui::ColorToken::Reference);
                 role_row("A", compare_lap(), ui::ColorToken::CompareA);
-                role_row("B", compare_b_lap(), ui::ColorToken::CompareB);
+                if (compare_b_enabled_) role_row("B", compare_b_lap(), ui::ColorToken::CompareB);
                 if (!relative_delta_progress_.empty()) {
                     const auto delta_a = interpolate_curve(relative_delta_progress_, relative_delta_seconds_, inspected_progress);
-                    const auto delta_b = interpolate_curve(relative_delta_progress_, relative_delta_b_seconds_, inspected_progress);
-                    ImGui::Text("Relative time  A %+.3f s   B %+.3f s", delta_a, delta_b);
+                    if (compare_b_enabled_) {
+                        const auto delta_b = interpolate_curve(relative_delta_progress_, relative_delta_b_seconds_, inspected_progress);
+                        ImGui::Text("Relative time  A %+.3f s   B %+.3f s", delta_a, delta_b);
+                    } else {
+                        ImGui::Text("Relative time  A %+.3f s", delta_a);
+                    }
                 }
             }
         }
@@ -1841,22 +2027,68 @@ NativeApp::PlotData NativeApp::build_plot_data(const LapInfo* lap, std::size_t m
     if (lap) { begin = lap->begin_index; end = lap->end_index; }
     else { const auto range = active_range(); begin = range.first; end = range.second; }
     const auto count = end - begin + 1;
-    const auto stride = std::max<std::size_t>(1, count / max_points);
     const auto base = session_->telemetry.time_us[begin];
     const auto distance_profile = normalized_progress && lap
         ? build_distance_time_profile(*session_, *lap)
         : DistanceTimeProfile{};
-    output.time.reserve(count / stride + 1); output.elapsed.reserve(count / stride + 1);
-    output.speed.reserve(count / stride + 1); output.speed_mph.reserve(count / stride + 1);
-    output.lateral.reserve(count / stride + 1); output.longitudinal.reserve(count / stride + 1); output.altitude.reserve(count / stride + 1);
-    output.vertical.reserve(count / stride + 1); output.gyro_x.reserve(count / stride + 1);
-    output.gyro_y.reserve(count / stride + 1); output.gyro_z.reserve(count / stride + 1);
-    output.vehicle_yaw.reserve(count / stride + 1);
-    output.controls.reserve(count / stride + 1); output.steering.reserve(count / stride + 1);
-    for (auto index = begin; index <= end; index += stride) {
+    std::vector<std::array<double, 2>> radio_channels;
+    if (count > max_points && max_points > 0) {
+        radio_channels.reserve(count);
+        for (auto index = begin; index <= end; ++index) {
+            const auto radio = sample_radio(
+                *session_, session_->telemetry.time_us[index]);
+            radio_channels.push_back({
+                radio.valid ? radio.throttle - radio.brake
+                            : std::numeric_limits<double>::quiet_NaN(),
+                radio.valid ? radio.steering
+                            : std::numeric_limits<double>::quiet_NaN(),
+            });
+        }
+    }
+    constexpr std::size_t decimation_channels = 10;
+    const auto sample_indices = peak_preserving_indices(
+        count, max_points, decimation_channels,
+        [&](std::size_t offset, std::size_t channel) {
+            const auto index = begin + offset;
+            switch (channel) {
+                case 0: return static_cast<double>(
+                    session_->telemetry.speed_kmh[index]);
+                case 1: return static_cast<double>(
+                    session_->telemetry.lateral_g[index]);
+                case 2: return static_cast<double>(
+                    session_->telemetry.longitudinal_g[index]);
+                case 3: return static_cast<double>(
+                    session_->telemetry.vertical_g[index]);
+                case 4: return static_cast<double>(
+                    session_->telemetry.altitude_m[index]);
+                case 5: return static_cast<double>(
+                    session_->telemetry.gyro_x_dps[index]);
+                case 6: return static_cast<double>(
+                    session_->telemetry.gyro_y_dps[index]);
+                case 7: return static_cast<double>(
+                    session_->telemetry.gyro_z_dps[index]);
+                case 8: return radio_channels.empty()
+                    ? 0.0 : radio_channels[offset][0];
+                case 9: return radio_channels.empty()
+                    ? 0.0 : radio_channels[offset][1];
+                default: return 0.0;
+            }
+        });
+    const auto reserve = [&](auto& values) {
+        values.reserve(sample_indices.size());
+    };
+    reserve(output.time); reserve(output.elapsed);
+    reserve(output.speed); reserve(output.speed_mph);
+    reserve(output.lateral); reserve(output.longitudinal);
+    reserve(output.altitude); reserve(output.vertical);
+    reserve(output.gyro_x); reserve(output.gyro_y);
+    reserve(output.gyro_z); reserve(output.vehicle_yaw);
+    reserve(output.controls); reserve(output.steering);
+    for (const auto offset : sample_indices) {
+        const auto index = begin + offset;
         const auto radio = sample_radio(*session_, session_->telemetry.time_us[index]);
         output.time.push_back(normalized_progress && !distance_profile.progress.empty()
-            ? distance_profile.progress[index - begin]
+            ? distance_profile.progress[offset]
             : static_cast<double>(session_->telemetry.time_us[index] - base) / kSecond);
         output.elapsed.push_back(static_cast<double>(session_->telemetry.time_us[index] - base) / kSecond);
         output.speed.push_back(session_->telemetry.speed_kmh[index]);
@@ -1892,7 +2124,9 @@ void NativeApp::refresh_plot_cache() {
     const auto normalized = view_mode_ == ViewMode::Compare;
     primary_plot_cache_ = build_plot_data(view_mode_ == ViewMode::Continuous ? nullptr : active_lap(), 2200, normalized);
     compare_plot_cache_ = normalized ? build_plot_data(compare_lap(), 2200, true) : PlotData{};
-    compare_b_plot_cache_ = normalized ? build_plot_data(compare_b_lap(), 2200, true) : PlotData{};
+    compare_b_plot_cache_ = normalized && compare_b_enabled_
+        ? build_plot_data(compare_b_lap(), 2200, true)
+        : PlotData{};
     relative_delta_progress_.clear();
     relative_delta_seconds_.clear();
     relative_delta_b_seconds_.clear();
@@ -1908,7 +2142,7 @@ void NativeApp::refresh_plot_cache() {
         relative_delta_b_seconds_.reserve(sample_count);
         const auto compare_a_profile = compare_lap()
             ? build_distance_time_profile(*session_, *compare_lap()) : DistanceTimeProfile{};
-        const auto compare_b_profile = compare_b_lap()
+        const auto compare_b_profile = compare_b_enabled_ && compare_b_lap()
             ? build_distance_time_profile(*session_, *compare_b_lap()) : DistanceTimeProfile{};
         for (int sample = 0; sample < sample_count; ++sample) {
             const auto progress = static_cast<double>(sample) / (sample_count - 1) * 100.0;
@@ -2183,7 +2417,9 @@ void NativeApp::draw_telemetry() {
                     if (view_mode_ == ViewMode::Compare) {
                         annotate_reading(primary, values, "R", ui::color(ui::ColorToken::Reference), -20.0F);
                         annotate_reading(secondary, other, "A", ui::color(ui::ColorToken::CompareA), 0.0F);
-                        annotate_reading(tertiary, third, "B", ui::color(ui::ColorToken::CompareB), 20.0F);
+                        if (compare_b_enabled_) {
+                            annotate_reading(tertiary, third, "B", ui::color(ui::ColorToken::CompareB), 20.0F);
+                        }
                     } else {
                         annotate_reading(primary, values, "", inspection_color, -10.0F);
                     }
@@ -2226,7 +2462,9 @@ void NativeApp::draw_telemetry() {
         if (!relative_available) return;
         auto maximum_delta = 0.0;
         for (const auto value : relative_delta_seconds_) maximum_delta = std::max(maximum_delta, std::abs(value));
-        for (const auto value : relative_delta_b_seconds_) maximum_delta = std::max(maximum_delta, std::abs(value));
+        if (compare_b_enabled_) {
+            for (const auto value : relative_delta_b_seconds_) maximum_delta = std::max(maximum_delta, std::abs(value));
+        }
         const auto delta_limit = std::max(0.10, maximum_delta * 1.15);
         if (plot_fit_pending_) ImPlot::SetNextAxesLimits(linked_plot_x_min_, linked_plot_x_max_, -delta_limit, delta_limit, ImPlotCond_Always);
         auto plot_flags = ImPlotFlags_NoLegend | ImPlotFlags_NoTitle;
@@ -2240,9 +2478,11 @@ void NativeApp::draw_telemetry() {
             const ImPlotSpec delta_style{ImPlotProp_LineColor, ImVec4(1.0F, 0.68F, 0.12F, 1.0F), ImPlotProp_LineWeight, 2.0F};
             ImPlot::PlotLine("Compare A - Reference", relative_delta_progress_.data(), relative_delta_seconds_.data(),
                 static_cast<int>(std::min(relative_delta_progress_.size(), relative_delta_seconds_.size())), delta_style);
-            const ImPlotSpec delta_b_style{ImPlotProp_LineColor, ImVec4(0.95F, 0.25F, 0.28F, 1.0F), ImPlotProp_LineWeight, 1.8F};
-            ImPlot::PlotLine("Compare B - Reference", relative_delta_progress_.data(), relative_delta_b_seconds_.data(),
-                static_cast<int>(std::min(relative_delta_progress_.size(), relative_delta_b_seconds_.size())), delta_b_style);
+            if (compare_b_enabled_) {
+                const ImPlotSpec delta_b_style{ImPlotProp_LineColor, ImVec4(0.95F, 0.25F, 0.28F, 1.0F), ImPlotProp_LineWeight, 1.8F};
+                ImPlot::PlotLine("Compare B - Reference", relative_delta_progress_.data(), relative_delta_b_seconds_.data(),
+                    static_cast<int>(std::min(relative_delta_progress_.size(), relative_delta_b_seconds_.size())), delta_b_style);
+            }
             const double zero = 0.0;
             const ImPlotSpec zero_style{ImPlotProp_LineColor, ImVec4(0.55F, 0.60F, 0.66F, 0.8F),
                 ImPlotProp_LineWeight, 1.0F, ImPlotProp_Flags, ImPlotInfLinesFlags_Horizontal};
@@ -2273,8 +2513,10 @@ void NativeApp::draw_telemetry() {
                     draw_header_progress_badge(inspection_progress, inspection_progress);
                     ImPlot::Annotation(inspection_progress, inspection_delta, ui::color(ui::ColorToken::CompareA),
                         ImVec2(10.0F, -12.0F), true, "A %+.3f s", inspection_delta);
-                    ImPlot::Annotation(inspection_progress, inspection_delta_b, ui::color(ui::ColorToken::CompareB),
-                        ImVec2(10.0F, 12.0F), true, "B %+.3f s", inspection_delta_b);
+                    if (compare_b_enabled_) {
+                        ImPlot::Annotation(inspection_progress, inspection_delta_b, ui::color(ui::ColorToken::CompareB),
+                            ImVec2(10.0F, 12.0F), true, "B %+.3f s", inspection_delta_b);
+                    }
                 }
             }
 
@@ -2380,14 +2622,20 @@ void NativeApp::draw_telemetry() {
         }
         if (id == TelemetryPlotId::RelativeTime) {
             const auto a = interpolate_curve(relative_delta_progress_, relative_delta_seconds_, plot_cursor_x);
-            const auto b = interpolate_curve(relative_delta_progress_, relative_delta_b_seconds_, plot_cursor_x);
             ImGui::TextColored(ui::color(ui::ColorToken::CompareA), "A %+.3f", a);
-            ImGui::SameLine(); ImGui::TextColored(ui::color(ui::ColorToken::CompareB), "B %+.3f", b);
+            if (compare_b_enabled_) {
+                const auto b = interpolate_curve(relative_delta_progress_, relative_delta_b_seconds_, plot_cursor_x);
+                ImGui::SameLine();
+                ImGui::TextColored(ui::color(ui::ColorToken::CompareB), "B %+.3f", b);
+            }
         } else {
             ImGui::TextColored(ui::color(ui::ColorToken::Reference), "R %s", value_text(values_for(primary)).c_str());
             if (view_mode_ == ViewMode::Compare) {
                 ImGui::SameLine(); ImGui::TextColored(ui::color(ui::ColorToken::CompareA), "A %s", value_text(values_for(secondary)).c_str());
-                ImGui::SameLine(); ImGui::TextColored(ui::color(ui::ColorToken::CompareB), "B %s", value_text(values_for(tertiary)).c_str());
+                if (compare_b_enabled_) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ui::color(ui::ColorToken::CompareB), "B %s", value_text(values_for(tertiary)).c_str());
+                }
             }
         }
         ImGui::PopID();
@@ -2756,7 +3004,9 @@ void NativeApp::draw_map() {
             ImGui::SetNextItemWidth(160.0F);
             ImGui::SliderFloat("Grid spacing", &map_grid_spacing_m_, 5.0F, 25.0F, "%.0f m");
         }
-        if (view_mode_ == ViewMode::Compare) ImGui::Checkbox("Three separate lap maps", &separate_compare_maps_);
+        if (view_mode_ == ViewMode::Compare) {
+            ImGui::Checkbox("Separate lap maps", &separate_compare_maps_);
+        }
         if (view_mode_ == ViewMode::Compare) {
             ImGui::Checkbox("Analysis-aligned comparison traces", &show_analysis_aligned_traces_);
             ImGui::TextDisabled("Display-only whole-lap correction; raw GPS remains stored unchanged.");
@@ -3209,13 +3459,23 @@ void NativeApp::draw_map() {
         append(first); append(second); append(third);
         return laps;
     };
-    if (view_mode_ == ViewMode::Compare && separate_compare_maps_ && compare_lap() && compare_b_lap() && size.x >= 256.0F) {
+    if (view_mode_ == ViewMode::Compare && separate_compare_maps_ &&
+        compare_lap() &&
+        size.x >= (compare_b_enabled_ ? 480.0F : 320.0F)) {
+        const auto show_third_panel =
+            compare_b_enabled_ && compare_b_lap();
+        const auto panel_count = show_third_panel ? 3.0F : 2.0F;
         const auto gap = 8.0F;
-        const auto panel_size = ImVec2((size.x - gap * 2.0F) / 3.0F, size.y);
+        const auto panel_size = ImVec2(
+            (size.x - gap * (panel_count - 1.0F)) / panel_count,
+            size.y);
         const auto left_origin = origin;
         const auto middle_origin = origin + ImVec2(panel_size.x + gap, 0);
         const auto right_origin = origin + ImVec2((panel_size.x + gap) * 2.0F, 0);
-        const auto shared_projection = make_projection(map_laps(active_lap(), compare_lap(), compare_b_lap()), left_origin, panel_size);
+        const auto shared_projection = make_projection(
+            map_laps(active_lap(), compare_lap(),
+                     show_third_panel ? compare_b_lap() : nullptr),
+            left_origin, panel_size);
         auto primary_projection = shared_projection;
         auto compare_projection = shared_projection;
         auto compare_b_projection = shared_projection;
@@ -3223,13 +3483,18 @@ void NativeApp::draw_map() {
         compare_b_projection.panel_origin = right_origin;
         const auto left_contains = ImRect(left_origin, left_origin + panel_size).Contains(pointer);
         const auto middle_contains = ImRect(middle_origin, middle_origin + panel_size).Contains(pointer);
-        const auto right_contains = ImRect(right_origin, right_origin + panel_size).Contains(pointer);
+        const auto right_contains = show_third_panel &&
+            ImRect(right_origin, right_origin + panel_size).Contains(pointer);
         const auto left_hovered = map_hovered && left_contains;
         const auto middle_hovered = map_hovered && middle_contains;
         const auto right_hovered = map_hovered && right_contains;
         update_background_from_input(primary_projection, left_contains && (map_hovered || map_active));
         update_background_from_input(compare_projection, middle_contains && (map_hovered || map_active));
-        update_background_from_input(compare_b_projection, right_contains && (map_hovered || map_active));
+        if (show_third_panel) {
+            update_background_from_input(
+                compare_b_projection,
+                right_contains && (map_hovered || map_active));
+        }
         place_start_finish_from_click(active_lap(), primary_projection, left_hovered);
         draw->PushClipRect(left_origin, left_origin + panel_size, true);
         draw_panel(primary_projection); draw_average_track(primary_projection);
@@ -3243,14 +3508,25 @@ void NativeApp::draw_map() {
         draw_lap(compare_lap(), compare_projection, ui::color_u32(ui::ColorToken::CompareA), 2.8F, middle_hovered, "Compare A", 8.0F);
         draw_start_finish(compare_projection);
         draw->PopClipRect();
-        draw->PushClipRect(right_origin, right_origin + panel_size, true);
-        draw_panel(compare_b_projection); draw_average_track(compare_b_projection);
-        draw_lap(compare_b_lap(), compare_b_projection, ui::color_u32(ui::ColorToken::CompareB), 2.8F, right_hovered, "Compare B", 8.0F);
-        draw_start_finish(compare_b_projection);
-        draw->PopClipRect();
+        if (show_third_panel) {
+            draw->PushClipRect(
+                right_origin, right_origin + panel_size, true);
+            draw_panel(compare_b_projection);
+            draw_average_track(compare_b_projection);
+            draw_lap(compare_b_lap(), compare_b_projection,
+                ui::color_u32(ui::ColorToken::CompareB), 2.8F,
+                right_hovered, "Compare B", 8.0F);
+            draw_start_finish(compare_b_projection);
+            draw->PopClipRect();
+        }
         handle_annotation_surface("Track Map - Reference", -1, left_origin.x, left_origin.y, panel_size.x, panel_size.y, left_hovered);
         handle_annotation_surface("Track Map - Compare A", -1, middle_origin.x, middle_origin.y, panel_size.x, panel_size.y, middle_hovered);
-        handle_annotation_surface("Track Map - Compare B", -1, right_origin.x, right_origin.y, panel_size.x, panel_size.y, right_hovered);
+        if (show_third_panel) {
+            handle_annotation_surface(
+                "Track Map - Compare B", -1, right_origin.x,
+                right_origin.y, panel_size.x, panel_size.y,
+                right_hovered);
+        }
     } else {
         const auto projection = make_projection(view_mode_ == ViewMode::Compare
             ? map_laps(active_lap(), compare_lap(), compare_b_lap())
@@ -3344,29 +3620,50 @@ void NativeApp::draw_laps() {
         }
         ImGui::PopStyleColor();
     };
+    if (ImGui::Checkbox("Add Compare B (third trace)", &compare_b_enabled_)) {
+        if (compare_b_enabled_ && !ensure_unique_complete_comparison_roles()) {
+            compare_b_enabled_ = false;
+            error_ = "Compare B needs a third different complete lap";
+        } else {
+            if (!compare_b_enabled_) crew_chief_after_slot_ = driver_analysis::ComparisonSlot::CompareA;
+            error_.clear();
+            invalidate_comparison();
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Reference plus Compare A is the normal comparison. Enable this only when a third lap helps.");
+    }
     combo("REFERENCE", "##reference-lap", active_lap_index_, ImVec4(0.20F, 0.78F, 0.40F, 1.0F),
         [&](int value) { return session_->laps[static_cast<std::size_t>(value)].phase != LapPhase::Complete ||
-            value == compare_lap_index_ || value == compare_b_lap_index_; }, [&](std::size_t index) {
+            value == compare_lap_index_ || (compare_b_enabled_ && value == compare_b_lap_index_); }, [&](std::size_t index) {
             fastest_reference_ = false;
             cursor_us_ = session_->telemetry.time_us[session_->laps[index].begin_index];
         });
     combo("COMPARE A", "##compare-a-lap", compare_lap_index_, ImVec4(1.0F, 0.68F, 0.12F, 1.0F),
         [&](int value) { return session_->laps[static_cast<std::size_t>(value)].phase != LapPhase::Complete ||
-            value == active_lap_index_ || value == compare_b_lap_index_; }, [](std::size_t) {});
-    combo("COMPARE B", "##compare-b-lap", compare_b_lap_index_, ImVec4(0.95F, 0.25F, 0.28F, 1.0F),
-        [&](int value) { return session_->laps[static_cast<std::size_t>(value)].phase != LapPhase::Complete ||
-            value == active_lap_index_ || value == compare_lap_index_; }, [](std::size_t) {});
+            value == active_lap_index_ || (compare_b_enabled_ && value == compare_b_lap_index_); }, [](std::size_t) {});
+    if (compare_b_enabled_) {
+        combo("COMPARE B", "##compare-b-lap", compare_b_lap_index_, ImVec4(0.95F, 0.25F, 0.28F, 1.0F),
+            [&](int value) { return session_->laps[static_cast<std::size_t>(value)].phase != LapPhase::Complete ||
+                value == active_lap_index_ || value == compare_lap_index_; }, [](std::size_t) {});
+    }
     combo("PLAYBACK LAP", "##playback-lap", playback_lap_index_, ImVec4(0.10F, 0.85F, 0.95F, 1.0F),
         [](int) { return false; }, [](std::size_t) {});
     const auto complete_role = [&](int value) { return value >= 0 && value < static_cast<int>(session_->laps.size()) &&
         session_->laps[static_cast<std::size_t>(value)].phase == LapPhase::Complete; };
-    const auto valid_roles = active_lap_index_ != compare_lap_index_ && active_lap_index_ != compare_b_lap_index_ &&
-        compare_lap_index_ != compare_b_lap_index_ && complete_role(active_lap_index_) &&
-        complete_role(compare_lap_index_) && complete_role(compare_b_lap_index_);
+    const auto valid_roles = active_lap_index_ != compare_lap_index_ &&
+        complete_role(active_lap_index_) && complete_role(compare_lap_index_) &&
+        (!compare_b_enabled_ || (active_lap_index_ != compare_b_lap_index_ &&
+            compare_lap_index_ != compare_b_lap_index_ && complete_role(compare_b_lap_index_)));
     ImGui::BeginDisabled(!valid_roles);
     if (ImGui::Button("Compare selected laps")) { view_mode_ = ViewMode::Compare; invalidate_comparison(); }
     ImGui::EndDisabled();
-    if (!valid_roles) { ImGui::SameLine(); ImGui::TextDisabled("Reference, A and B need different complete laps"); }
+    if (!valid_roles) {
+        ImGui::SameLine();
+        ImGui::TextDisabled(compare_b_enabled_
+            ? "Reference, A and B need different complete laps"
+            : "Reference and A need different complete laps");
+    }
 
     ImGui::SeparatorText("ALL LAPS");
     if (ImGui::BeginTable("laps", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
@@ -3386,11 +3683,14 @@ void NativeApp::draw_laps() {
             std::string roles;
             if (active_lap_index_ == static_cast<int>(index)) roles += "R";
             if (compare_lap_index_ == static_cast<int>(index)) roles += roles.empty() ? "A" : "/A";
-            if (compare_b_lap_index_ == static_cast<int>(index)) roles += roles.empty() ? "B" : "/B";
+            if (compare_b_enabled_ && compare_b_lap_index_ == static_cast<int>(index)) {
+                roles += roles.empty() ? "B" : "/B";
+            }
             if (playback_lap_index_ == static_cast<int>(index)) roles += roles.empty() ? "P" : "/P";
             const auto label = roles.empty() ? lap_name : std::format("{}  {}", lap_name, roles);
             const auto reference_disabled = lap.phase != LapPhase::Complete ||
-                compare_lap_index_ == static_cast<int>(index) || compare_b_lap_index_ == static_cast<int>(index);
+                compare_lap_index_ == static_cast<int>(index) ||
+                (compare_b_enabled_ && compare_b_lap_index_ == static_cast<int>(index));
             ImGui::BeginDisabled(reference_disabled);
             if (ImGui::Selectable(label.c_str(), active_lap_index_ == static_cast<int>(index), ImGuiSelectableFlags_SpanAllColumns) && !reference_disabled) {
                 active_lap_index_ = static_cast<int>(index); fastest_reference_ = false;
@@ -3415,13 +3715,18 @@ void NativeApp::draw_laps() {
                 }
                 ImGui::EndDisabled();
                 ImGui::BeginDisabled(lap.phase != LapPhase::Complete || active_lap_index_ == static_cast<int>(index) ||
-                    compare_b_lap_index_ == static_cast<int>(index));
+                    (compare_b_enabled_ && compare_b_lap_index_ == static_cast<int>(index)));
                 if (ImGui::MenuItem("Set as Compare A")) { compare_lap_index_ = static_cast<int>(index); invalidate_comparison(); }
                 ImGui::EndDisabled();
-                ImGui::BeginDisabled(lap.phase != LapPhase::Complete || active_lap_index_ == static_cast<int>(index) ||
-                    compare_lap_index_ == static_cast<int>(index));
-                if (ImGui::MenuItem("Set as Compare B")) { compare_b_lap_index_ = static_cast<int>(index); invalidate_comparison(); }
-                ImGui::EndDisabled();
+                if (compare_b_enabled_) {
+                    ImGui::BeginDisabled(lap.phase != LapPhase::Complete || active_lap_index_ == static_cast<int>(index) ||
+                        compare_lap_index_ == static_cast<int>(index));
+                    if (ImGui::MenuItem("Set as Compare B")) {
+                        compare_b_lap_index_ = static_cast<int>(index);
+                        invalidate_comparison();
+                    }
+                    ImGui::EndDisabled();
+                }
                 if (ImGui::MenuItem("Set as Playback")) playback_lap_index_ = static_cast<int>(index);
                 ImGui::EndPopup();
             }
@@ -3450,7 +3755,7 @@ void NativeApp::draw_laps() {
         stats("Reference", active_lap(), ui::color(ui::ColorToken::Reference));
         if (view_mode_ == ViewMode::Compare) {
             stats("Compare A", compare_lap(), ui::color(ui::ColorToken::CompareA));
-            stats("Compare B", compare_b_lap(), ui::color(ui::ColorToken::CompareB));
+            if (compare_b_enabled_) stats("Compare B", compare_b_lap(), ui::color(ui::ColorToken::CompareB));
         }
     }
     handle_annotation_window("Laps and Sectors");
@@ -3668,6 +3973,7 @@ void NativeApp::handle_annotation_surface(const char* surface, int plot_index, f
     annotation.active_lap_index = active_lap_index_;
     annotation.compare_lap_index = compare_lap_index_;
     annotation.compare_b_lap_index = compare_b_lap_index_;
+    annotation.compare_b_enabled = compare_b_enabled_;
     annotation.playback_lap_index = playback_lap_index_;
     annotation.view_mode = view_mode_;
     selected_annotation_id_ = annotation.id;
@@ -3774,6 +4080,7 @@ void NativeApp::handle_annotation_workspace() {
     annotation.active_lap_index = active_lap_index_;
     annotation.compare_lap_index = compare_lap_index_;
     annotation.compare_b_lap_index = compare_b_lap_index_;
+    annotation.compare_b_enabled = compare_b_enabled_;
     annotation.playback_lap_index = playback_lap_index_;
     annotation.view_mode = view_mode_;
     selected_annotation_id_ = annotation.id;
@@ -3790,11 +4097,14 @@ void NativeApp::go_to_annotation(const Annotation& annotation) {
     active_lap_index_ = std::clamp(annotation.active_lap_index, 0, static_cast<int>(session_->laps.size()) - 1);
     compare_lap_index_ = std::clamp(annotation.compare_lap_index, 0, static_cast<int>(session_->laps.size()) - 1);
     compare_b_lap_index_ = std::clamp(annotation.compare_b_lap_index, 0, static_cast<int>(session_->laps.size()) - 1);
+    compare_b_enabled_ = annotation.compare_b_enabled;
     playback_lap_index_ = std::clamp(annotation.playback_lap_index, 0, static_cast<int>(session_->laps.size()) - 1);
     fastest_reference_ = false;
     if (view_mode_ == ViewMode::Compare && !ensure_unique_complete_comparison_roles()) {
         view_mode_ = ViewMode::SingleLap;
-        error_ = "Saved compare view needs three different complete laps";
+        error_ = compare_b_enabled_
+            ? "Saved compare view needs three different complete laps when Compare B is enabled"
+            : "Saved compare view needs two different complete laps";
     }
     cursor_us_ = std::clamp(annotation.cursor_us, session_->telemetry.time_us.front(), session_->telemetry.time_us.back());
     plot_cache_active_ = -1;
@@ -3814,7 +4124,14 @@ void NativeApp::draw_annotations() {
     if (!session_) { ImGui::TextDisabled("No session loaded"); ImGui::End(); return; }
     refresh_driver_analysis();
     if (ImGui::BeginTabBar("insights-tabs")) {
-        if (ImGui::BeginTabItem("Insights")) {
+        const auto tab_flags = [&](InsightsTab tab) {
+            return insights_tab_request_pending_ && requested_insights_tab_ == tab
+                ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+        };
+        if (ImGui::BeginTabItem("Insights", nullptr, tab_flags(InsightsTab::Insights))) {
+            if (insights_tab_request_pending_ && requested_insights_tab_ == InsightsTab::Insights) {
+                insights_tab_request_pending_ = false;
+            }
             ImGui::TextDisabled("Deterministic formula set %s; raw GPS is never rewritten.", driver_analysis_.formula_version.c_str());
             if (ImGui::Button("Export analysis JSON...")) export_driver_analysis();
             for (std::size_t slot = 0; slot < driver_analysis_.comparisons.size(); ++slot) {
@@ -3920,7 +4237,10 @@ void NativeApp::draw_annotations() {
             }
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Rules / Formula")) {
+        if (ImGui::BeginTabItem("Rules / Formula", nullptr, tab_flags(InsightsTab::Rules))) {
+            if (insights_tab_request_pending_ && requested_insights_tab_ == InsightsTab::Rules) {
+                insights_tab_request_pending_ = false;
+            }
             auto rules_changed = false;
             if (ImGui::Button("Reset all rules")) { analysis_rules_ = driver_analysis::default_analysis_rules(); rules_changed = true; }
             ImGui::SameLine(); ImGui::TextDisabled("%s", driver_analysis::kFormulaVersion.data());
@@ -4043,11 +4363,17 @@ void NativeApp::draw_annotations() {
             if (rules_changed) { driver_analysis_dirty_ = true; refresh_driver_analysis(); }
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Crew Chief")) {
+        if (ImGui::BeginTabItem("Crew Chief", nullptr, tab_flags(InsightsTab::CrewChief))) {
+            if (insights_tab_request_pending_ && requested_insights_tab_ == InsightsTab::CrewChief) {
+                insights_tab_request_pending_ = false;
+            }
             draw_crew_chief();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Dev Notes")) {
+        if (ImGui::BeginTabItem("Dev Notes", nullptr, tab_flags(InsightsTab::DevNotes))) {
+            if (insights_tab_request_pending_ && requested_insights_tab_ == InsightsTab::DevNotes) {
+                insights_tab_request_pending_ = false;
+            }
             draw_dev_notes();
             ImGui::EndTabItem();
         }
@@ -4125,16 +4451,19 @@ void NativeApp::draw_crew_chief() {
     };
     ImGui::SeparatorText("BEFORE / AFTER");
     ImGui::Text("Before (Reference): %s", lap_name(before).c_str());
+    if (!compare_b_enabled_) crew_chief_after_slot_ = driver_analysis::ComparisonSlot::CompareA;
     auto after_slot = crew_chief_after_slot_ == driver_analysis::ComparisonSlot::CompareA ? 0 : 1;
     if (ImGui::RadioButton(std::format("After: Compare A - {}", lap_name(after_a)).c_str(), after_slot == 0)) {
         after_slot = 0;
         crew_chief_after_slot_ = driver_analysis::ComparisonSlot::CompareA;
         crew_chief_report_.reset();
     }
-    if (ImGui::RadioButton(std::format("After: Compare B - {}", lap_name(after_b)).c_str(), after_slot == 1)) {
-        after_slot = 1;
-        crew_chief_after_slot_ = driver_analysis::ComparisonSlot::CompareB;
-        crew_chief_report_.reset();
+    if (compare_b_enabled_) {
+        if (ImGui::RadioButton(std::format("After: Compare B - {}", lap_name(after_b)).c_str(), after_slot == 1)) {
+            after_slot = 1;
+            crew_chief_after_slot_ = driver_analysis::ComparisonSlot::CompareB;
+            crew_chief_report_.reset();
+        }
     }
 
     ImGui::SeparatorText("WHAT CHANGED");
@@ -4281,6 +4610,7 @@ void NativeApp::new_race_day() {
     race_day_current_run_ = std::min(1, static_cast<int>(race_day_.runs.size()) - 1);
     race_day_report_.reset();
     race_day_pending_knowledge_.reset();
+    pending_race_day_relink_.reset();
     selected_setup_knowledge_record_ = -1;
     race_day_relevant_history_count_ = 0;
     race_day_error_.clear();
@@ -4306,6 +4636,7 @@ void NativeApp::open_race_day() {
     race_day_current_run_ = std::min(1, static_cast<int>(race_day_.runs.size()) - 1);
     race_day_report_.reset();
     race_day_pending_knowledge_.reset();
+    pending_race_day_relink_.reset();
     selected_setup_knowledge_record_ = race_day_.setup_knowledge.empty()
         ? -1 : static_cast<int>(race_day_.setup_knowledge.size()) - 1;
     race_day_relevant_history_count_ = 0;
@@ -4332,7 +4663,8 @@ void NativeApp::save_race_day(bool choose_path) {
     race_day_path_ = std::move(destination);
     race_day_dirty_ = false;
     race_day_error_.clear();
-    status_ = std::format("Race day saved: {}", race_day_path_.filename().string());
+    status_ = std::format(
+        "Race day saved: {}", path_utf8(race_day_path_.filename()));
 }
 
 void NativeApp::attach_race_day_telemetry() {
@@ -4341,15 +4673,202 @@ void NativeApp::attach_race_day_telemetry() {
         selected_race_day_run_, 0, static_cast<int>(race_day_.runs.size()) - 1);
     auto files = open_telemetry_files(window_);
     if (files.empty()) return;
-    auto& attached = race_day_.runs[static_cast<std::size_t>(selected_race_day_run_)].telemetry_files;
+    auto& run = race_day_.runs[
+        static_cast<std::size_t>(selected_race_day_run_)];
+    auto& attached = run.telemetry_files;
     for (const auto& path : files) {
         if (attached.size() >= 8) break;
         if (std::find(attached.begin(), attached.end(), path) == attached.end()) attached.push_back(path);
     }
+    race_day::refresh_telemetry_source_identities(run);
     race_day_dirty_ = true;
     race_day_report_.reset();
     status_ = std::format("Attached {} telemetry source(s) to {}",
-        attached.size(), race_day_.runs[static_cast<std::size_t>(selected_race_day_run_)].label);
+        attached.size(), run.label);
+}
+
+void NativeApp::begin_race_day_source_relink(
+    std::size_t source_index) {
+    if (race_day_.runs.empty()) return;
+    const auto run_index = static_cast<std::size_t>(std::clamp(
+        selected_race_day_run_, 0,
+        static_cast<int>(race_day_.runs.size()) - 1));
+    auto& run = race_day_.runs[run_index];
+    if (source_index >= run.telemetry_files.size()) return;
+
+    race_day::refresh_telemetry_source_identities(run);
+    const auto candidates = open_telemetry_files(window_);
+    if (candidates.empty()) return;
+
+    race_day::Run candidate_run;
+    candidate_run.telemetry_files = candidates;
+    race_day::refresh_telemetry_source_identities(candidate_run);
+
+    std::vector<source_identity::Candidate> matcher_candidates;
+    matcher_candidates.reserve(candidates.size());
+    for (std::size_t index = 0; index < candidates.size(); ++index) {
+        matcher_candidates.push_back({
+            std::to_string(index),
+            candidate_run.telemetry_source_identities[index],
+        });
+    }
+
+    PendingRaceDayRelink pending;
+    pending.run_index = run_index;
+    pending.source_index = source_index;
+    pending.candidate_paths = candidates;
+    pending.candidate_identities =
+        candidate_run.telemetry_source_identities;
+    pending.result = source_identity::match_source(
+        run.telemetry_source_identities[source_index],
+        matcher_candidates);
+
+    const auto candidate_index_for =
+        [&](const std::optional<std::string>& id)
+            -> std::optional<std::size_t> {
+        if (!id) return std::nullopt;
+        for (std::size_t index = 0;
+             index < matcher_candidates.size(); ++index) {
+            if (matcher_candidates[index].id == *id) return index;
+        }
+        return std::nullopt;
+    };
+    if (pending.result.status == source_identity::MatchStatus::Exact &&
+        !pending.result.requires_user_confirmation) {
+        const auto match =
+            candidate_index_for(pending.result.recommended_candidate_id);
+        if (match) {
+            run.telemetry_files[source_index] =
+                pending.candidate_paths[*match];
+            run.telemetry_source_identities[source_index] =
+                pending.candidate_identities[*match];
+            race_day_dirty_ = true;
+            race_day_report_.reset();
+            status_ = std::format(
+                "Relinked {} using its exact source fingerprint",
+                path_utf8(run.telemetry_files[source_index].filename()));
+            return;
+        }
+    }
+
+    pending_race_day_relink_ = std::move(pending);
+    ImGui::OpenPopup("Confirm telemetry source");
+}
+
+void NativeApp::draw_race_day_source_relink_popup() {
+    if (!pending_race_day_relink_) return;
+    if (!ImGui::BeginPopupModal(
+            "Confirm telemetry source", nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+
+    auto& pending = *pending_race_day_relink_;
+    const auto valid_source =
+        pending.run_index < race_day_.runs.size() &&
+        pending.source_index <
+            race_day_.runs[pending.run_index].telemetry_files.size();
+    if (!valid_source) {
+        ImGui::TextWrapped(
+            "The run changed before the source could be repaired.");
+        if (ImGui::Button("Close")) {
+            pending_race_day_relink_.reset();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+        return;
+    }
+
+    auto& run = race_day_.runs[pending.run_index];
+    const auto& expected =
+        run.telemetry_source_identities[pending.source_index];
+    ImGui::TextWrapped(
+        "The original file is missing: %s",
+        expected.canonical_filename.empty()
+            ? "unknown telemetry source"
+            : expected.canonical_filename.c_str());
+    switch (pending.result.status) {
+        case source_identity::MatchStatus::Probable:
+            ImGui::TextColored(
+                ui::color(ui::ColorToken::Warning),
+                "A likely match was found. Confirm it before replacing the saved path.");
+            break;
+        case source_identity::MatchStatus::Ambiguous:
+            ImGui::TextColored(
+                ui::color(ui::ColorToken::Warning),
+                "More than one file could match. Choose the recording you recognize.");
+            break;
+        case source_identity::MatchStatus::Missing:
+            ImGui::TextColored(
+                ui::color(ui::ColorToken::Warning),
+                "No file met the automatic match threshold. Choose manually only if you are sure.");
+            break;
+        case source_identity::MatchStatus::Exact:
+            ImGui::TextUnformatted(
+                "Confirm the selected exact match.");
+            break;
+    }
+    ImGui::Separator();
+
+    const auto choose = [&](std::string_view candidate_id) {
+        for (std::size_t index = 0;
+             index < pending.candidate_paths.size(); ++index) {
+            if (candidate_id != std::to_string(index)) continue;
+            run.telemetry_files[pending.source_index] =
+                pending.candidate_paths[index];
+            run.telemetry_source_identities[pending.source_index] =
+                pending.candidate_identities[index];
+            race_day_dirty_ = true;
+            race_day_report_.reset();
+            status_ = std::format(
+                "Relinked {} after confirmation",
+                path_utf8(pending.candidate_paths[index].filename()));
+            pending_race_day_relink_.reset();
+            ImGui::CloseCurrentPopup();
+            return;
+        }
+    };
+
+    for (const auto& suggestion : pending.result.suggestions) {
+        std::size_t candidate_index =
+            pending.candidate_paths.size();
+        for (std::size_t index = 0;
+             index < pending.candidate_paths.size(); ++index) {
+            if (suggestion.candidate_id == std::to_string(index)) {
+                candidate_index = index;
+                break;
+            }
+        }
+        if (candidate_index >= pending.candidate_paths.size()) continue;
+        ImGui::PushID(static_cast<int>(candidate_index));
+        const auto& path = pending.candidate_paths[candidate_index];
+        const auto candidate_name = path_utf8(path.filename());
+        ImGui::TextUnformatted(candidate_name.c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled(
+            "score %d | name %s | size %s | time %s | fingerprint %s",
+            suggestion.score,
+            suggestion.filename_match ? "match" : "-",
+            suggestion.size_match ? "match" : "-",
+            suggestion.modified_time_match ? "match" : "-",
+            suggestion.fingerprint_match ? "match" : "-");
+        ImGui::SameLine();
+        if (ImGui::Button("Use this file")) {
+            const auto id = suggestion.candidate_id;
+            choose(id);
+            ImGui::PopID();
+            ImGui::EndPopup();
+            return;
+        }
+        ImGui::PopID();
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button("Cancel")) {
+        pending_race_day_relink_.reset();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
 void NativeApp::analyze_race_day_runs() {
@@ -4424,6 +4943,197 @@ void NativeApp::analyze_race_day_runs() {
     status_ = std::format("Analyzing {} against {}", current.label, previous.label);
 }
 
+void NativeApp::draw_reports() {
+    const auto* viewport = ImGui::GetMainViewport();
+    const auto header_height = application_header_height(text_scale_);
+    const auto origin = viewport->WorkPos + ImVec2(0.0F, header_height);
+    const auto size = ImVec2(viewport->WorkSize.x,
+        std::max(1.0F, viewport->WorkSize.y - header_height));
+    ImGui::SetNextWindowPos(origin, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+    ImGui::SetNextWindowViewport(viewport->ID);
+    constexpr auto flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDocking |
+        ImGuiWindowFlags_NoSavedSettings;
+    if (!ImGui::Begin("Reports Workspace", nullptr, flags)) {
+        ImGui::End();
+        return;
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ui::color(ui::ColorToken::Playback));
+    ImGui::TextUnformatted("SESSION REPORT");
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::TextDisabled("Measured summary and export tools. No AI interpretation is required.");
+
+    if (!session_) {
+        ImGui::Separator();
+        ImGui::TextWrapped("Open telemetry to build a report from laps, sectors, and deterministic insights.");
+        if (ImGui::Button("Open telemetry...", ImVec2(180.0F, 36.0F))) {
+            begin_load(open_telemetry_files(window_));
+        }
+        ImGui::End();
+        return;
+    }
+
+    refresh_driver_analysis();
+    if (ImGui::Button("Export analysis JSON...")) export_driver_analysis();
+    ImGui::SameLine();
+    if (ImGui::Button("Export active lap CSV...")) export_active_lap();
+    ImGui::SameLine();
+    if (ImGui::Button("Save session archive...")) save_session();
+    ImGui::SameLine();
+    if (ImGui::Button("Save active lap archive...")) save_active_lap();
+
+    const LapInfo* best_lap = nullptr;
+    std::size_t complete_laps = 0;
+    for (const auto& lap : session_->laps) {
+        if (lap.phase != LapPhase::Complete) continue;
+        ++complete_laps;
+        if (!best_lap || lap.duration_us < best_lap->duration_us) best_lap = &lap;
+    }
+    const auto session_duration = session_->telemetry.empty()
+        ? Timestamp{}
+        : session_->telemetry.time_us.back() - session_->telemetry.time_us.front();
+
+    ImGui::SeparatorText("SESSION SUMMARY");
+    if (ImGui::BeginTable("report-summary", 4,
+            ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchSame)) {
+        const auto summary_cell = [](const char* label, const std::string& value) {
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", label);
+            ImGui::TextUnformatted(value.c_str());
+        };
+        ImGui::TableNextRow();
+        summary_cell("SESSION", session_->name.empty() ? std::string{"Unnamed session"} : session_->name);
+        summary_cell("RECORDED", recorded_time_label(&*session_));
+        summary_cell("TELEMETRY", std::format("{} samples | {}", session_->telemetry.size(), lap_time(session_duration)));
+        summary_cell("COMPLETE LAPS", std::format("{} of {}", complete_laps, session_->laps.size()));
+        ImGui::TableNextRow();
+        summary_cell("BEST COMPLETE LAP", best_lap ? lap_time(best_lap->duration_us) : std::string{"Not available"});
+        summary_cell("THEORETICAL BEST", session_->theoretical_best.duration_us > 0
+            ? lap_time(session_->theoretical_best.duration_us) : std::string{"Not available"});
+        summary_cell("SECTORS", std::format("{} calculated", session_->theoretical_best.sectors.size()));
+        const auto embedded_archive_telemetry =
+            session_->vbo_path.empty() && session_->csv_path.empty() &&
+            !session_->telemetry.empty();
+        summary_cell("SOURCES", embedded_archive_telemetry
+            ? std::format("Archive telemetry OK | Sanwa {}",
+                session_->radio.empty() ? "-" : "OK")
+            : std::format("VBO {} | RaceBox {} | Sanwa {}",
+                session_->vbo_path.empty() ? "-" : "OK",
+                session_->csv_path.empty() ? "-" : "OK",
+                session_->radio.empty() ? "-" : "OK"));
+        ImGui::EndTable();
+    }
+
+    const auto role_label = [](const LapInfo* lap) {
+        if (!lap) return std::string{"Off"};
+        return lap->race_lap > 0 ? std::format("R{}", lap->race_lap) : std::format("L{}", lap->raw_lap);
+    };
+    ImGui::SeparatorText("CURRENT COMPARISON");
+    ImGui::TextColored(ui::color(ui::ColorToken::Reference), "Reference %s", role_label(active_lap()).c_str());
+    ImGui::SameLine();
+    ImGui::TextColored(ui::color(ui::ColorToken::CompareA), "Compare A %s", role_label(compare_lap()).c_str());
+    ImGui::SameLine();
+    ImGui::TextColored(compare_b_enabled_ ? ui::color(ui::ColorToken::CompareB) : ui::color(ui::ColorToken::TextMuted),
+        "Compare B %s", role_label(compare_b_lap()).c_str());
+    ImGui::SameLine();
+    ImGui::TextColored(ui::color(ui::ColorToken::Playback), "Playback %s", role_label(playback_lap()).c_str());
+
+    const auto available = ImGui::GetContentRegionAvail();
+    const auto lap_width = std::max(420.0F, available.x * 0.56F);
+    ImGui::BeginChild("report-laps", ImVec2(lap_width, -1.0F), ImGuiChildFlags_Borders);
+    ImGui::SeparatorText("LAP TABLE");
+    if (ImGui::BeginTable("report-lap-table", 5,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Lap");
+        ImGui::TableSetupColumn("Phase");
+        ImGui::TableSetupColumn("Time");
+        ImGui::TableSetupColumn("Vs best");
+        ImGui::TableSetupColumn("Role");
+        ImGui::TableHeadersRow();
+        for (std::size_t index = 0; index < session_->laps.size(); ++index) {
+            const auto& lap = session_->laps[index];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("%s%d", lap.race_lap > 0 ? "R" : "L",
+                lap.race_lap > 0 ? lap.race_lap : lap.raw_lap);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(phase_name(lap.phase));
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(lap_time(lap.duration_us).c_str());
+            ImGui::TableNextColumn();
+            if (best_lap && lap.phase == LapPhase::Complete) {
+                ImGui::Text("%+.3f s",
+                    static_cast<double>(lap.duration_us - best_lap->duration_us) / static_cast<double>(kSecond));
+            } else {
+                ImGui::TextDisabled("-");
+            }
+            ImGui::TableNextColumn();
+            std::string roles;
+            if (active_lap_index_ == static_cast<int>(index)) roles = "Reference";
+            if (compare_lap_index_ == static_cast<int>(index)) roles += roles.empty() ? "A" : " / A";
+            if (compare_b_enabled_ && compare_b_lap_index_ == static_cast<int>(index)) {
+                roles += roles.empty() ? "B" : " / B";
+            }
+            if (playback_lap_index_ == static_cast<int>(index)) roles += roles.empty() ? "Playback" : " / Playback";
+            if (roles.empty()) ImGui::TextDisabled("-");
+            else ImGui::TextUnformatted(roles.c_str());
+        }
+        ImGui::EndTable();
+    }
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+    ImGui::BeginChild("report-findings", ImVec2(0.0F, -1.0F), ImGuiChildFlags_Borders);
+    std::size_t metric_count = 0;
+    std::size_t changed_metric_count = 0;
+    for (const auto& comparison : driver_analysis_.comparisons) {
+        if (!comparison) continue;
+        for (const auto& corner : comparison->corners) {
+            metric_count += corner.metrics.size();
+            changed_metric_count += static_cast<std::size_t>(std::count_if(
+                corner.metrics.begin(), corner.metrics.end(), [](const auto& metric) {
+                    return metric.value.has_value() && metric.triggered;
+                }));
+        }
+    }
+    ImGui::SeparatorText("DETERMINISTIC FINDINGS");
+    ImGui::Text("%zu insight%s", driver_analysis_.insights.size(),
+        driver_analysis_.insights.size() == 1 ? "" : "s");
+    ImGui::Text("%zu changed metric%s from %zu calculated",
+        changed_metric_count, changed_metric_count == 1 ? "" : "s", metric_count);
+    ImGui::TextDisabled("Formula %s", driver_analysis_.formula_version.c_str());
+    ImGui::Separator();
+    if (driver_analysis_.insights.empty()) {
+        ImGui::TextWrapped("No finding passed the enabled evidence and data-quality gates.");
+    } else {
+        for (std::size_t index = 0;
+             index < std::min<std::size_t>(driver_analysis_.insights.size(), 10); ++index) {
+            const auto& insight = driver_analysis_.insights[index];
+            ImGui::BulletText("%s", insight.title.c_str());
+            ImGui::Indent();
+            ImGui::TextDisabled("%s | %s", insight.corner_name.c_str(),
+                insight_outcome_label(insight.outcome));
+            ImGui::Unindent();
+        }
+        if (driver_analysis_.insights.size() > 10) {
+            ImGui::TextDisabled("%zu more finding%s available in Crew Chief > Insights",
+                driver_analysis_.insights.size() - 10,
+                driver_analysis_.insights.size() - 10 == 1 ? "" : "s");
+        }
+    }
+    ImGui::SeparatorText("THEORETICAL SECTORS");
+    for (const auto& sector : session_->theoretical_best.sectors) {
+        ImGui::Text("S%d  %s  (raw lap %d)", sector.sector,
+            lap_time(sector.duration_us).c_str(), sector.source_raw_lap);
+    }
+    ImGui::EndChild();
+    ImGui::End();
+}
+
 void NativeApp::draw_race_day() {
     using namespace std::chrono_literals;
     if (race_day_busy_ && race_day_future_.valid() &&
@@ -4466,9 +5176,9 @@ void NativeApp::draw_race_day() {
     }
 
     const auto* viewport = ImGui::GetMainViewport();
-    const auto origin = viewport->WorkPos + ImVec2(0.0F, application_header_height());
+    const auto origin = viewport->WorkPos + ImVec2(0.0F, application_header_height(text_scale_));
     const auto size = ImVec2(viewport->WorkSize.x,
-        std::max(1.0F, viewport->WorkSize.y - application_header_height()));
+        std::max(1.0F, viewport->WorkSize.y - application_header_height(text_scale_)));
     ImGui::SetNextWindowPos(origin, ImGuiCond_Always);
     ImGui::SetNextWindowSize(size, ImGuiCond_Always);
     ImGui::SetNextWindowViewport(viewport->ID);
@@ -4596,29 +5306,85 @@ void NativeApp::draw_race_day() {
         selected_race_day_run_ = std::clamp(
             selected_race_day_run_, 0, static_cast<int>(race_day_.runs.size()) - 1);
         auto& run = race_day_.runs[static_cast<std::size_t>(selected_race_day_run_)];
+        auto sources_ready = !run.telemetry_files.empty();
+        for (std::size_t source_index = 0;
+             source_index < run.telemetry_files.size(); ++source_index) {
+            sources_ready =
+                sources_ready &&
+                race_day::telemetry_source_state(run, source_index) ==
+                    race_day::TelemetrySourceState::Available;
+        }
         ImGui::PushID(selected_race_day_run_);
         ImGui::SeparatorText("SELECTED RUN");
         if (input_text_string("Run name", run.label)) race_day_dirty_ = true;
         if (ImGui::Button("Attach VBO / RaceBox / Sanwa...")) attach_race_day_telemetry();
         ImGui::SameLine();
-        ImGui::BeginDisabled(run.telemetry_files.empty());
+        ImGui::BeginDisabled(!sources_ready);
         if (ImGui::Button("Load in viewer")) {
-            const auto files = run.telemetry_files;
-            workspace_section_ = WorkspaceSection::Overview;
-            begin_load(files);
+            auto content_verified = true;
+            for (std::size_t source_index = 0;
+                 source_index < run.telemetry_files.size();
+                 ++source_index) {
+                content_verified =
+                    content_verified &&
+                    race_day::telemetry_source_state(
+                        run, source_index, true) ==
+                        race_day::TelemetrySourceState::Available;
+            }
+            if (content_verified) {
+                const auto files = run.telemetry_files;
+                workspace_section_ = WorkspaceSection::Session;
+                begin_load(files);
+            } else {
+                race_day_error_ =
+                    "An attached telemetry file no longer matches the saved recording. Review it before loading.";
+            }
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginDisabled(run.telemetry_files.empty());
         if (ImGui::Button("Clear attachments")) {
             run.telemetry_files.clear();
+            run.telemetry_source_identities.clear();
+            pending_race_day_relink_.reset();
             race_day_dirty_ = true;
             race_day_report_.reset();
         }
         ImGui::EndDisabled();
-        for (const auto& path : run.telemetry_files) {
-            ImGui::BulletText("%s", path.filename().string().c_str());
+        for (std::size_t source_index = 0;
+             source_index < run.telemetry_files.size(); ++source_index) {
+            const auto& path = run.telemetry_files[source_index];
+            const auto source_state =
+                race_day::telemetry_source_state(run, source_index);
+            ImGui::PushID(static_cast<int>(source_index));
+            if (source_state ==
+                race_day::TelemetrySourceState::Available) {
+                ImGui::BulletText(
+                    "%s  [available]",
+                    path_utf8(path.filename()).c_str());
+            } else if (source_state ==
+                       race_day::TelemetrySourceState::Changed) {
+                ImGui::TextColored(
+                    ui::color(ui::ColorToken::Warning),
+                    "Changed since attachment: %s",
+                    path_utf8(path.filename()).c_str());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Review file...")) {
+                    begin_race_day_source_relink(source_index);
+                }
+            } else {
+                ImGui::TextColored(
+                    ui::color(ui::ColorToken::Warning),
+                    "Missing: %s",
+                    path_utf8(path.filename()).c_str());
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Find moved file...")) {
+                    begin_race_day_source_relink(source_index);
+                }
+            }
+            ImGui::PopID();
         }
+        draw_race_day_source_relink_popup();
 
         if (ImGui::BeginTabBar("race-day-detail-tabs")) {
             if (ImGui::BeginTabItem("Pre-run check")) {
@@ -4753,13 +5519,32 @@ void NativeApp::draw_race_day() {
         "Question##race-day-question", race_day_question_, ImVec2(-1.0F, 92.0F))) {
         race_day_report_.reset();
     }
+    const auto run_sources_ready = [&](int run_index) {
+        if (run_index < 0 ||
+            run_index >= static_cast<int>(race_day_.runs.size())) {
+            return false;
+        }
+        const auto& candidate =
+            race_day_.runs[static_cast<std::size_t>(run_index)];
+        if (candidate.telemetry_files.empty()) return false;
+        for (std::size_t source_index = 0;
+             source_index < candidate.telemetry_files.size();
+             ++source_index) {
+            if (race_day::telemetry_source_state(
+                    candidate, source_index) !=
+                race_day::TelemetrySourceState::Available) {
+                return false;
+            }
+        }
+        return true;
+    };
     const auto can_analyze = race_day_.runs.size() >= 2 && !race_day_busy_ &&
         race_day_previous_run_ != race_day_current_run_ &&
         race_day_previous_run_ >= 0 && race_day_current_run_ >= 0 &&
         race_day_previous_run_ < static_cast<int>(race_day_.runs.size()) &&
         race_day_current_run_ < static_cast<int>(race_day_.runs.size()) &&
-        !race_day_.runs[static_cast<std::size_t>(race_day_previous_run_)].telemetry_files.empty() &&
-        !race_day_.runs[static_cast<std::size_t>(race_day_current_run_)].telemetry_files.empty();
+        run_sources_ready(race_day_previous_run_) &&
+        run_sources_ready(race_day_current_run_);
     ImGui::BeginDisabled(!can_analyze);
     if (ImGui::Button("Analyze previous vs current", ImVec2(-1.0F, 38.0F))) analyze_race_day_runs();
     ImGui::EndDisabled();
@@ -5046,6 +5831,7 @@ void NativeApp::draw_dev_notes() {
         const auto reference_index = annotation ? annotation->active_lap_index : active_lap_index_;
         const auto compare_a_index = annotation ? annotation->compare_lap_index : compare_lap_index_;
         const auto compare_b_index = annotation ? annotation->compare_b_lap_index : compare_b_lap_index_;
+        const auto context_compare_b_enabled = annotation ? annotation->compare_b_enabled : compare_b_enabled_;
         const auto playback_index = annotation ? annotation->playback_lap_index : playback_lap_index_;
         const auto context_view = annotation ? annotation->view_mode : view_mode_;
         const auto context_cursor = annotation ? annotation->cursor_us : cursor_us_;
@@ -5061,7 +5847,9 @@ void NativeApp::draw_dev_notes() {
         payload += std::format("View: {} | cursor: {:.3f} s\n", view_mode_name(context_view),
             static_cast<double>(context_cursor) / kSecond);
         payload += std::format("Reference: {}\nCompare A: {}\nCompare B: {}\nPlayback: {}\n",
-            lap_label(reference_index), lap_label(compare_a_index), lap_label(compare_b_index), lap_label(playback_index));
+            lap_label(reference_index), lap_label(compare_a_index),
+            context_compare_b_enabled ? lap_label(compare_b_index) : std::string{"Off"},
+            lap_label(playback_index));
         payload += "\nNotes:\n";
         payload += session_notes_.front() == '\0' ? "(no written note)" : session_notes_.data();
         if (annotation && annotation->note.front() != '\0') {
@@ -5113,9 +5901,11 @@ void NativeApp::draw_dev_notes() {
     if (selected != annotations_.end()) {
         ImGui::SeparatorText(std::format("LINKED PIN #{}", selected->id).c_str());
         ImGui::Text("%s | %s", selected->surface.c_str(), view_mode_name(selected->view_mode));
-        ImGui::Text("Telemetry %.3fs | ref %d | A %d | B %d | play %d",
+        ImGui::Text("Telemetry %.3fs | ref %d | A %d | B %s | play %d",
             static_cast<double>(selected->cursor_us) / kSecond, selected->active_lap_index,
-            selected->compare_lap_index, selected->compare_b_lap_index, selected->playback_lap_index);
+            selected->compare_lap_index,
+            selected->compare_b_enabled ? std::to_string(selected->compare_b_lap_index).c_str() : "Off",
+            selected->playback_lap_index);
         if (ImGui::Button("Go to pin")) go_to_annotation(*selected);
         ImGui::SameLine();
         if (ImGui::Button("Delete pin")) {
@@ -5127,10 +5917,17 @@ void NativeApp::draw_dev_notes() {
         ImGui::Separator();
         if (ImGui::Button("Export review JSON...")) export_annotations();
         ImGui::SameLine();
+        if (ImGui::Button("Import review JSON...")) import_annotations();
+        ImGui::SameLine();
         if (ImGui::Button("Clear all")) {
             annotations_.clear();
             selected_annotation_id_ = 0;
         }
+    } else {
+        ImGui::Separator();
+        ImGui::BeginDisabled(!session_);
+        if (ImGui::Button("Import review JSON...")) import_annotations();
+        ImGui::EndDisabled();
     }
 }
 
@@ -5152,7 +5949,9 @@ void NativeApp::export_annotations() {
                 {"telemetry_time_us", annotation.cursor_us}, {"telemetry_time_seconds", static_cast<double>(annotation.cursor_us) / kSecond},
                 {"view_mode", view_mode_name(annotation.view_mode)}, {"active_lap_index", annotation.active_lap_index},
                 {"active_lap", lap ? (lap->race_lap > 0 ? std::format("R{}", lap->race_lap) : std::format("L{}", lap->raw_lap)) : ""},
-                {"compare_lap_index", annotation.compare_lap_index}, {"compare_b_lap_index", annotation.compare_b_lap_index},
+                {"compare_lap_index", annotation.compare_lap_index},
+                {"compare_b_lap_index", annotation.compare_b_lap_index},
+                {"compare_b_enabled", annotation.compare_b_enabled},
                 {"playback_lap_index", annotation.playback_lap_index}, {"comment", std::string(annotation.note.data())}
             });
         }
@@ -5161,6 +5960,150 @@ void NativeApp::export_annotations() {
         file << output.dump(2);
         if (!file) throw std::runtime_error("Could not finish writing annotation review file");
         status_ = std::format("Exported {} annotations", annotations_.size());
+    } catch (const std::exception& exception) {
+        error_ = exception.what();
+    }
+}
+
+void NativeApp::import_annotations() {
+    if (!session_) {
+        error_ = "Open the matching telemetry session before importing an annotation review";
+        return;
+    }
+    const auto path = open_annotation_file(window_);
+    if (!path) return;
+    try {
+        std::error_code filesystem_error;
+        const auto byte_size =
+            std::filesystem::file_size(*path, filesystem_error);
+        if (filesystem_error || byte_size > 8ULL * 1024ULL * 1024ULL) {
+            throw std::runtime_error(
+                "Annotation review is missing or larger than 8 MB");
+        }
+        std::ifstream file(*path, std::ios::binary);
+        if (!file) {
+            throw std::runtime_error(
+                "Could not open annotation review");
+        }
+        const auto input = nlohmann::json::parse(file);
+        if (!input.is_object() ||
+            input.value("format", std::string{}) !=
+                "racebox-annotation-review" ||
+            input.value("version", 0) != 1) {
+            throw std::runtime_error(
+                "This is not a supported RaceBox annotation review");
+        }
+
+        const auto source_session =
+            input.value("session", std::string{});
+        if (!source_session.empty() &&
+            source_session != session_->name) {
+            throw std::runtime_error(std::format(
+                "This review belongs to session '{}'. Open that session before importing its pins.",
+                source_session));
+        }
+
+        const auto bounded_string = [](const nlohmann::json& value,
+                                       const char* key,
+                                       std::size_t maximum,
+                                       std::string fallback = {}) {
+            auto result = value.value(key, std::move(fallback));
+            if (result.size() > maximum) result.resize(maximum);
+            return result;
+        };
+        const auto imported_values =
+            input.value("annotations", nlohmann::json::array());
+        if (!imported_values.is_array()) {
+            throw std::runtime_error(
+                "Annotation review has an invalid pin list");
+        }
+        if (imported_values.empty()) {
+            throw std::runtime_error(
+                "Annotation review contains no usable pins");
+        }
+        if (imported_values.size() > 1'000) {
+            throw std::runtime_error(
+                "Annotation review contains more than 1,000 pins");
+        }
+        if (annotations_.size() + imported_values.size() > 2'000) {
+            throw std::runtime_error(
+                "Import would exceed the 2,000-pin session limit");
+        }
+
+        const auto first_imported_id = next_annotation_id_;
+        auto staged_next_id = next_annotation_id_;
+        std::vector<Annotation> staged;
+        staged.reserve(imported_values.size());
+        for (const auto& value : imported_values) {
+            if (!value.is_object()) {
+                throw std::runtime_error(
+                    "Annotation review contains an invalid pin");
+            }
+            Annotation annotation;
+            annotation.id = staged_next_id++;
+            annotation.surface = bounded_string(
+                value, "surface", 160, "Workspace");
+            annotation.anchor_window = bounded_string(
+                value, "anchor_window", 160);
+            annotation.plot_id = bounded_string(
+                value, "plot_id", 80);
+            annotation.plot_index =
+                value.value("plot_index", -3);
+            annotation.normalized_x = std::clamp(
+                value.value("normalized_x", 0.5F), 0.0F, 1.0F);
+            annotation.normalized_y = std::clamp(
+                value.value("normalized_y", 0.5F), 0.0F, 1.0F);
+            annotation.cursor_us =
+                value.value("telemetry_time_us", Timestamp{});
+            const auto view = value.value(
+                "view_mode", std::string{"Single Lap"});
+            annotation.view_mode =
+                view == "Compare" ? ViewMode::Compare
+                : view == "Continuous" ? ViewMode::Continuous
+                                         : ViewMode::SingleLap;
+            annotation.active_lap_index =
+                value.value("active_lap_index", 0);
+            annotation.compare_lap_index =
+                value.value("compare_lap_index", 1);
+            annotation.compare_b_lap_index =
+                value.value("compare_b_lap_index", 2);
+            annotation.compare_b_enabled =
+                value.value("compare_b_enabled", false);
+            annotation.playback_lap_index =
+                value.value("playback_lap_index", 0);
+            set_text_buffer(annotation.note, bounded_string(
+                value, "comment", annotation.note.size() - 1));
+
+            if (!session_->laps.empty()) {
+                const auto maximum =
+                    static_cast<int>(session_->laps.size()) - 1;
+                annotation.active_lap_index = std::clamp(
+                    annotation.active_lap_index, 0, maximum);
+                annotation.compare_lap_index = std::clamp(
+                    annotation.compare_lap_index, 0, maximum);
+                annotation.compare_b_lap_index = std::clamp(
+                    annotation.compare_b_lap_index, 0, maximum);
+                annotation.playback_lap_index = std::clamp(
+                    annotation.playback_lap_index, 0, maximum);
+                if (!session_->telemetry.empty()) {
+                    annotation.cursor_us = std::clamp(
+                        annotation.cursor_us,
+                        session_->telemetry.time_us.front(),
+                        session_->telemetry.time_us.back());
+                }
+            }
+            staged.push_back(std::move(annotation));
+        }
+        for (auto& annotation : staged) {
+            annotations_.push_back(std::move(annotation));
+        }
+        next_annotation_id_ = staged_next_id;
+        selected_annotation_id_ = first_imported_id;
+        show_annotation_pins_ = true;
+        status_ = std::format(
+            "Imported {} annotation pin{} from {}",
+            staged.size(), staged.size() == 1 ? "" : "s",
+            path_utf8(path->filename()));
     } catch (const std::exception& exception) {
         error_ = exception.what();
     }

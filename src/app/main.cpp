@@ -104,7 +104,7 @@ LONG WINAPI write_crash_dump(EXCEPTION_POINTERS* exception) {
     SYSTEMTIME time{};
     GetLocalTime(&time);
     wchar_t name[96]{};
-    swprintf_s(name, L"RaceBoxViewer-%04u%02u%02u-%02u%02u%02u.dmp",
+    swprintf_s(name, L"RaceBoxTelemetryViewer-%04u%02u%02u-%02u%02u%02u.dmp",
         time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond);
     const auto path = directory / name;
     HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -166,11 +166,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     }
     if (startup_files.empty()) startup_files = bundled_demo_files();
 
+    auto large_icon = LoadIconW(instance, MAKEINTRESOURCEW(101));
+    auto small_icon = LoadIconW(instance, MAKEINTRESOURCEW(101));
+    if (!large_icon) large_icon = LoadIconW(nullptr, IDI_APPLICATION);
+    if (!small_icon) small_icon = LoadIconW(nullptr, IDI_APPLICATION);
     WNDCLASSEXW window_class{sizeof(WNDCLASSEXW), CS_CLASSDC, window_proc, 0, 0, instance,
-        LoadIconW(instance, MAKEINTRESOURCEW(101)), nullptr, nullptr, nullptr,
-        L"RaceBoxViewerNativeWindow", LoadIconW(instance, MAKEINTRESOURCEW(101))};
+        large_icon, nullptr, nullptr, nullptr,
+        L"RaceBoxTelemetryViewerWindow", small_icon};
     RegisterClassExW(&window_class);
-    const auto window = CreateWindowW(window_class.lpszClassName, L"RaceBox Viewer Native",
+    const auto window = CreateWindowW(window_class.lpszClassName, L"RaceBox Telemetry Viewer 2",
         WS_OVERLAPPEDWINDOW, 80, 60, 1600, 950, nullptr, nullptr, instance, nullptr);
     if (!window) {
         UnregisterClassW(window_class.lpszClassName, instance);
@@ -181,7 +185,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     if (force_warp || !create_device(window, D3D_DRIVER_TYPE_HARDWARE)) {
         g_software_renderer = true;
         if (!create_device(window, D3D_DRIVER_TYPE_WARP)) {
-            MessageBoxW(window, L"DirectX 11 and the WARP fallback could not start.", L"RaceBox Viewer", MB_ICONERROR);
+            MessageBoxW(window, L"DirectX 11 and the WARP fallback could not start.",
+                        L"RaceBox Telemetry Viewer 2", MB_ICONERROR);
             DestroyWindow(window);
             UnregisterClassW(window_class.lpszClassName, instance);
             CoUninitialize();

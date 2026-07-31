@@ -9,8 +9,8 @@ BEGIN
   BEGIN
     BLOCK "040904b0"
     BEGIN
-      VALUE "FileDescription", "RaceBox Viewer Native\0"
-      VALUE "ProductName", "RaceBox Viewer Native\0"
+      VALUE "FileDescription", "RaceBox Telemetry Viewer 2\0"
+      VALUE "ProductName", "RaceBox Telemetry Viewer\0"
       VALUE "FileVersion", RACEBOX_VERSION_STRING
       VALUE "ProductVersion", RACEBOX_VERSION_STRING
     END

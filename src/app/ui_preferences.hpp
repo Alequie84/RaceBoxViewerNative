@@ -8,7 +8,7 @@
 
 namespace racebox::app {
 
-inline constexpr int kCurrentUiLayoutVersion = 3;
+inline constexpr int kCurrentUiLayoutVersion = 4;
 
 enum class TelemetryDensity {
     Compact,
@@ -16,10 +16,10 @@ enum class TelemetryDensity {
 };
 
 enum class UiWorkspace {
-    Overview,
-    Analysis,
+    Session,
     Compare,
-    Sectors,
+    CrewChief,
+    Reports,
     RaceDay,
 };
 
@@ -32,13 +32,15 @@ struct UtilityPanelPreferences {
 };
 
 struct WorkspacePreferences {
-    UiWorkspace active{UiWorkspace::Overview};
+    UiWorkspace active{UiWorkspace::Session};
     TelemetryDensity telemetry_density{TelemetryDensity::Compact};
+    bool compare_b_enabled{};
+    bool customize_layout{};
     UtilityPanelPreferences utility_panels;
 };
 
 // Defaults are deliberately safe for a fresh install: dark, metric, calibrated
-// map aids enabled, a compact Overview workspace, and optional utility windows
+// map aids enabled, a compact Session workspace, and optional utility windows
 // hidden until the user asks for them.
 struct UiPreferences {
     bool light_theme{};
@@ -50,6 +52,7 @@ struct UiPreferences {
     float map_grid_spacing_m{10.0F};
     bool separate_compare_maps{};
     bool analysis_aligned_map_traces{true};
+    float text_scale{1.0F};
     int layout_version{kCurrentUiLayoutVersion};
     std::vector<TelemetryPlotId> telemetry_plot_order{default_telemetry_plot_order()};
     WorkspacePreferences workspace;
@@ -81,8 +84,8 @@ bool save_ui_preferences_atomic(const std::filesystem::path& path, const UiPrefe
                                 std::string* error = nullptr) noexcept;
 
 // Before rebuilding an older dock layout, preserve layout.ini exactly once as
-// layout-pre-v3.ini. The original remains in place until DockBuilder succeeds.
-LayoutMigrationPreparation prepare_layout_v3_migration(const std::filesystem::path& settings_directory,
+// layout-pre-v4.ini. The original remains in place until DockBuilder succeeds.
+LayoutMigrationPreparation prepare_layout_v4_migration(const std::filesystem::path& settings_directory,
                                                         int source_layout_version) noexcept;
 
 }  // namespace racebox::app

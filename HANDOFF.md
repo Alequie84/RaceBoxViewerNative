@@ -1,6 +1,15 @@
-# RaceBox Viewer Native Handoff
+# RaceBox Telemetry Viewer 2 Handoff
 
 Last updated: 2026-07-21
+
+The protected `0.1.0.029` implementation is checkpointed on `main` and tagged
+`v0.1.0.029`. Version 2 is developed side-by-side on branch `v2`; the first
+release version is `2.0.0.001`. The golden telemetry engine and its raw-data
+rules remain authoritative.
+
+The current v2 architecture, guided workspaces, persistence migrations, and
+future macOS adapter boundary are described in
+[`docs/v2-architecture.md`](docs/v2-architecture.md).
 
 ## Start here
 
@@ -49,33 +58,44 @@ powershell -ExecutionPolicy Bypass -File .\scripts\toolbox\Build-Test-Native.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\toolbox\Start-NativeDemo.ps1
 ```
 
-Current native CTest targets:
+Current Windows CTest targets:
 
 1. `racebox_core_golden` - golden parsing/alignment, map anchors, persistence, corruption checks, and core invariants;
 2. `racebox_driver_analysis` - synthetic event, metric, rule, confidence, severity, positive-feedback, and line-correction fixtures, plus raw-lap-7 regression;
 3. `racebox_insight_evidence_addon` - driver-analysis-v2 outcome, repeatability, payback, guardrail, and golden-session integration gates;
 4. `racebox_dx11_warp` - DirectX 11 Microsoft WARP fallback;
 5. `racebox_one_million_samples` - one-million-sample memory bound;
-6. `racebox_plot_order` - stable graph-order normalization and moves with relative time hidden or shown.
-7. `racebox_ui_preferences` - dark defaults, workspace/density/panel persistence, malformed-file recovery, atomic saving, and one-time layout-v3 backup.
-8. `racebox_imu_analysis` - raw-channel availability, gyro-bias/yaw calibration, sustained airborne/landing indicators, exceptional-load and rapid-rotation gates, and empty compatibility channels.
-9. `racebox_crew_chief` - bounded lap and race-day private-gateway request/response contracts.
-10. `racebox_race_day` - event templates, single/triple mains, checklist/conditions/tire-run persistence, golden three-source loading, and canonical analytics CSV.
+6. `racebox_plot_order` - stable graph-order normalization and moves with relative time hidden or shown;
+7. `racebox_plot_decimation` - endpoint retention, point-budget enforcement, and multi-channel spike preservation;
+8. `racebox_application_state` - portable workspace, lap-role, playback, job, and notification state;
+9. `racebox_source_identity` - exact/probable/ambiguous/missing relink decisions and platform path-case rules;
+10. `racebox_ui_preferences` - guided workspace, optional Compare B, text size, layout lock, atomic saving, and one-time layout-v4 migration;
+11. `racebox_imu_analysis` - raw-channel availability, gyro-bias/yaw calibration, sustained airborne/landing indicators, exceptional-load and rapid-rotation gates, and empty compatibility channels;
+12. `racebox_crew_chief` - bounded lap and race-day private-gateway request/response contracts;
+13. `racebox_race_day` - event templates, single/triple mains, version-3 source identity, checklist/conditions/tire-run persistence, golden three-source loading, and canonical analytics CSV.
+
+The `portable-core-release` preset builds only the domain, application state,
+CLI, and seven portable tests. It is the dependency-boundary check for a later
+SDL3/Metal macOS shell; it does not claim that a Mac app bundle exists yet.
 
 Current validation is native-only. `Verify-Project.ps1` is a legacy combined workflow and must not be used while the browser remains frozen. After every C++ edit, build and test with `Build-Test-Native.ps1`, then use `Start-NativeDemo.ps1`; do not leave an older executable open for review.
 
 Outputs:
 
-- GUI: `build\release\RaceBoxViewer.exe`
+- GUI: `build\release\RaceBoxTelemetryViewer.exe`
 - validation CLI: `build\release\racebox_cli.exe`
-- portable folder: `package\RaceBoxViewer`
-- portable ZIP: `out\RaceBoxViewerNative-<VERSION>-win64.zip` (currently `.023`)
+- portable folder: `package\RaceBoxTelemetryViewer`
+- portable ZIP: `out\RaceBoxTelemetryViewer-<VERSION>-win64.zip`
 
-The executable accepts VBO, RaceBox CSV, and Sanwa CSV paths on its command line or through **File > Open telemetry**. Portable `.015` and later packages install all three golden files under `demo`, plus `Start RaceBox Demo.cmd`. When launched without file arguments, the packaged executable auto-loads that demo only if all three files exist; explicit user paths always take priority. Ordinary development builds have no adjacent `demo` folder and therefore still start empty unless the toolbox launcher supplies the three golden files.
+The executable accepts VBO, RaceBox CSV, and Sanwa CSV paths on its command line or through **File > Open telemetry**. Version 2 packages install all three golden files under `demo`, plus `Start RaceBox Demo.cmd`. When launched without file arguments, the packaged executable auto-loads that demo only if all three files exist; explicit user paths always take priority. Ordinary development builds have no adjacent `demo` folder and therefore still start empty unless the toolbox launcher supplies the three golden files.
 
 ## Architecture and source ownership
 
 - `include/racebox/session.hpp`: structure-of-arrays telemetry/radio model, map calibration, and versioned workspace-state carrier.
+- `include/racebox/domain.hpp`: platform-neutral public telemetry/analysis API.
+- `include/racebox/application/state.hpp` and `services.hpp`: portable app state and OS-service contracts.
+- `include/racebox/source_identity.hpp`: privacy-bounded source identity and deterministic relink decisions.
+- `include/racebox/plot_decimation.hpp`: bounded multi-channel peak-preserving plot indices.
 - `include/racebox/driver_analysis.hpp`: corner/event/metric/rule/confidence result contracts and formula version.
 - `include/racebox/insight_evidence.hpp`: UI-independent v2 outcome/reliability/recommendation contract consumed by the native analysis pipeline.
 - `include/racebox/telemetry_plot_order.hpp`: stable plot identifiers, validation, and order moves.
@@ -84,7 +104,7 @@ The executable accepts VBO, RaceBox CSV, and Sanwa CSV paths on its command line
 - `src/core/driver_analysis.cpp`: deterministic corner suggestion, event detectors, derived metrics, evidence gates, insights, and analysis-only line translation.
 - `src/core/insight_evidence.cpp`: v2 evidence classifier for retained gains, compensation, repeatability, and recommendation guardrails.
 - `include/racebox/imu_analysis.hpp` and `src/core/imu_analysis.cpp`: mounting-independent gyro calibration, derived vehicle yaw, vertical-load/landing, exceptional-load, and rapid-rotation indicators.
-- `src/core/persistence.cpp`: `.rbxsession`, `.rbxlap`, CSV export, map state, embedded background, and versioned workspace JSON.
+- `src/core/persistence.cpp`: backward-compatible `.rbxsession`/`.rbxlap`, atomic manifest-v2 archives, bounded workspace JSON, CSV export, map state, and embedded background.
 - `src/core/settings.cpp`: application preferences, rotating logs, and local paths.
 - `src/app/native_app.cpp`: docking, lap roles, playback, distance synchronization, plots, map interaction, analysis UI, notes, and annotations.
 - `src/app/texture_loader.cpp`: WIC decoding and DirectX texture upload.
@@ -168,7 +188,9 @@ Before saving `.rbxsession` or `.rbxlap`, the application serializes a versioned
 - Session Notes;
 - numbered annotations, stable plot IDs, lap context, cursor, and comments.
 
-The archive manifest also persists the physical start/finish endpoints, map lock, east/north displacement, reference coordinate/pixel, metres-per-pixel, rotation, opacity, and the embedded background image. Loading an archive restores the workspace. JSON review export remains a separate sharing format; standalone annotation JSON import is not implemented.
+The archive manifest also persists the physical start/finish endpoints, map lock, east/north displacement, reference coordinate/pixel, metres-per-pixel, rotation, opacity, and the embedded background image. Loading an archive restores the workspace. Archive entries have realistic memory limits, telemetry/radio columns and time order are checked, lap indices and markers are bounded, and ZIP resources close on every failure path. Annotation review JSON can now be exported and imported independently; it requires an open matching session and stages the complete batch before committing, so malformed later pins cannot leave a partial import.
+
+Race Day v3 stores UTF-8 relative source paths plus basename, size, modified time, and an algorithm-tagged content fingerprint. An existing file that changed at the same path is not accepted or silently blessed during save. Missing or changed sources must be exactly matched or explicitly confirmed through **Find moved file / Review file** before loading or analysis; identities and plaintext `.writing` files are cleaned up safely on failure.
 
 ### Reorderable telemetry plots
 
@@ -279,23 +301,23 @@ build\release\racebox_cli.exe golden\session.vbo golden\session.csv golden\sanwa
 | `.rbxsession`, `.rbxlap`, lap CSV, and annotation JSON export | Implemented |
 | Physical sector timing and theoretical-best sector sources | Implemented |
 | Theoretical-best coherent composite telemetry trace/map | Deferred |
-| Full Reports workspace and exact concept-image recreation | Deferred |
+| Guided Reports workspace with summary, lap table, findings, sectors, and exports | Implemented |
+| Exact pixel-for-pixel concept-image recreation | Deferred; native guided layout retained |
 
 ## Known gaps and next priorities
 
 1. A theoretical best currently combines sector times/source-lap identities, not one coherent drivable telemetry trace. Keep theoretical-composite and averaged-clean telemetry references deferred until their data contract is explicit.
-2. A full Reports workspace and pixel-for-pixel reproduction of the supplied concept are deferred. **Export analysis JSON** already emits the rules, metrics, corrections, confidence, navigation targets, and insight cards for a later reporting layer.
-3. Standalone annotation-review JSON import/reopen is not implemented; use a saved session/lap archive for persistence.
-4. Record final long-run performance evidence: hardware and WARP frame-time percentiles, repeated load/unload growth, and a two-hour repeat-playback soak.
-5. Continue small-screen and high-DPI layout review after functional changes.
+2. Exact pixel-for-pixel reproduction of the supplied concept remains deferred; v2 uses its guided native layout and working Reports workspace.
+3. Record final long-run performance evidence: hardware and WARP frame-time percentiles, repeated load/unload growth, and a two-hour repeat-playback soak.
+4. Continue small-screen and high-DPI layout review after functional changes, especially 150% text on narrow displays.
 
 ## Distribution and next-developer rules
 
-The supported artifact is `out\RaceBoxViewerNative-<VERSION>-win64.zip`. `VERSION` is the single source and uses a three-digit release sequence: `0.1.0.010`, `0.1.0.011`, `0.1.0.012`, and so on. Run `scripts\bump-version.ps1` once before each new user-facing release and retain prior numbered ZIPs. Record the new artifact's SHA256 after every package build:
+The v2 artifact is `out\RaceBoxTelemetryViewer-<VERSION>-win64.zip`. `VERSION` is the single source and uses a three-digit release sequence: `2.0.0.001`, `2.0.0.002`, and so on. Run `scripts\bump-version.ps1` once before each later user-facing release and retain prior numbered ZIPs. Record the new artifact's SHA256 after every package build:
 
 ```powershell
 $version = (Get-Content .\VERSION -Raw).Trim()
-Get-FileHash -Algorithm SHA256 ".\out\RaceBoxViewerNative-$version-win64.zip"
+Get-FileHash -Algorithm SHA256 ".\out\RaceBoxTelemetryViewer-$version-win64.zip"
 ```
 
 The package must remain offline, portable, and usable without an installer, administrator access, Node.js, Chromium, or an online map service.
@@ -361,6 +383,6 @@ analysis and ordinary Crew Chief chat. The live lane benchmark uses Sol-xhigh
 as the trusted setup-memory baseline and tests lower lanes against the same
 packet before allowing them to handle that task class.
 
-The always-visible native header displays `v<VERSION>` from the same generated version header used by the executable metadata and portable ZIP. It also exposes the persistent **THEME: DARK / THEME: LIGHT** switch beside the top workspace navigation, and the default Windows UI font is intentionally larger for readability. Keep the version tied to the root `VERSION` source; never hard-code a separate UI version string.
+The always-visible native header displays `v<VERSION>` from the same generated version header used by the executable metadata and portable ZIP. It exposes the persistent **THEME: DARK / THEME: LIGHT** switch beside the top workspace navigation at normal widths; at 130-150% text or narrow widths, Theme, Layout, Annotation, and renderer status collapse into **TOOLS** so every workspace remains reachable. Keep the version tied to the root `VERSION` source; never hard-code a separate UI version string.
 
 Before changing parser, timing, lap, radio, map, or analysis logic, read the golden and driver-analysis tests. Preserve the current C++ architecture, original telemetry, and both map-image backups. Treat browser files as read-only history. Update this handoff and the README whenever behavior changes.
