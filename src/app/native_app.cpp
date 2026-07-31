@@ -320,6 +320,7 @@ nlohmann::json race_day_run_context(const race_day::Day& day, const race_day::Ru
             {"ordinal", run.ordinal},
             {"main_group", std::string(1, run.main_group)},
             {"main_leg", run.main_leg},
+            {"recorded_at_utc", run.recorded_at_utc},
         }},
         {"notes", {
             {"pre_run", run.pre_run_notes},
@@ -376,7 +377,7 @@ void set_dock_tree_customizable(ImGuiDockNode* node, bool customizable) {
     set_dock_tree_customizable(node->ChildNodes[1], customizable);
 }
 
-std::string recorded_time_label(const Session* session) {
+std::string recorded_time_iso8601(const Session* session) {
     if (!session || session->telemetry.absolute_time_us.empty() || session->telemetry.absolute_time_us.front() <= 0) {
         return "Not recorded";
     }
@@ -386,8 +387,92 @@ std::string recorded_time_label(const Session* session) {
     FILETIME file_time{static_cast<DWORD>(filetime_ticks & 0xFFFFFFFFULL), static_cast<DWORD>(filetime_ticks >> 32U)};
     SYSTEMTIME system_time{};
     if (!FileTimeToSystemTime(&file_time, &system_time)) return "Not recorded";
-    return std::format("{:04}-{:02}-{:02} {:02}:{:02} UTC", system_time.wYear, system_time.wMonth,
-        system_time.wDay, system_time.wHour, system_time.wMinute);
+    return std::format(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        system_time.wYear, system_time.wMonth, system_time.wDay,
+        system_time.wHour, system_time.wMinute, system_time.wSecond);
+}
+
+std::string friendly_recorded_time_label(std::string_view recorded_at_utc) {
+    if (recorded_at_utc.empty() || recorded_at_utc == "Not recorded") {
+        return "Not recorded";
+    }
+    if (recorded_at_utc.size() >= 20 &&
+        recorded_at_utc[4] == '-' && recorded_at_utc[7] == '-' &&
+        recorded_at_utc[10] == 'T' && recorded_at_utc[13] == ':' &&
+        recorded_at_utc[16] == ':') {
+        return std::format(
+            "{}-{}-{} {}:{}:{} UTC",
+            recorded_at_utc.substr(0, 4), recorded_at_utc.substr(5, 2),
+            recorded_at_utc.substr(8, 2), recorded_at_utc.substr(11, 2),
+            recorded_at_utc.substr(14, 2), recorded_at_utc.substr(17, 2));
+    }
+    return std::string(recorded_at_utc);
+}
+
+std::string recorded_local_date(const Session* session) {
+    if (!session || session->telemetry.absolute_time_us.empty() ||
+        session->telemetry.absolute_time_us.front() <= 0) {
+        return local_date_label();
+    }
+    constexpr std::uint64_t unix_to_filetime_ticks =
+        116'444'736'000'000'000ULL;
+    const auto unix_microseconds = static_cast<std::uint64_t>(
+        session->telemetry.absolute_time_us.front());
+    const auto filetime_ticks =
+        unix_microseconds * 10ULL + unix_to_filetime_ticks;
+    const FILETIME utc_file_time{
+        static_cast<DWORD>(filetime_ticks & 0xFFFFFFFFULL),
+        static_cast<DWORD>(filetime_ticks >> 32U),
+    };
+    FILETIME local_file_time{};
+    SYSTEMTIME local_system_time{};
+    if (!FileTimeToLocalFileTime(&utc_file_time, &local_file_time) ||
+        !FileTimeToSystemTime(&local_file_time, &local_system_time)) {
+        return local_date_label();
+    }
+    return std::format(
+        "{:04}-{:02}-{:02}",
+        local_system_time.wYear,
+        local_system_time.wMonth,
+        local_system_time.wDay);
+}
+
+std::size_t invalidate_setup_knowledge_for_run(
+    race_day::Day& day, std::string_view run_id) {
+    const auto previous_size = day.setup_knowledge.size();
+    std::erase_if(
+        day.setup_knowledge,
+        [&](const race_day::SetupKnowledgeRecord& record) {
+            return record.previous_run_id == run_id ||
+                record.current_run_id == run_id;
+        });
+    return previous_size - day.setup_knowledge.size();
+}
+
+bool replace_telemetry_source_slot(
+    race_day::Run& run,
+    std::size_t source_index,
+    const std::filesystem::path& replacement,
+    const source_identity::SourceIdentity& identity,
+    std::string& error) {
+    if (source_index >= run.telemetry_files.size()) {
+        error = "The telemetry source changed before it could be repaired.";
+        return false;
+    }
+    auto staged = run;
+    race_day::refresh_telemetry_source_identities(staged);
+    staged.telemetry_files[source_index] = replacement;
+    staged.telemetry_source_identities[source_index] = identity;
+    const auto validation =
+        race_day::validate_telemetry_source_composition(staged);
+    if (!validation.ok) {
+        error = validation.error;
+        return false;
+    }
+    run = std::move(staged);
+    error.clear();
+    return true;
 }
 
 std::filesystem::path executable_directory() {
@@ -758,7 +843,11 @@ NativeApp::~NativeApp() {
     }
 }
 
-void NativeApp::open_files(const std::vector<std::filesystem::path>& files) { begin_load(files); }
+void NativeApp::open_files(const std::vector<std::filesystem::path>& files) {
+    session_import_requested_ = false;
+    session_import_files_.clear();
+    begin_load(files);
+}
 void NativeApp::enable_soak_mode() { soak_mode_ = true; }
 
 const char* NativeApp::phase_name(LapPhase phase) {
@@ -1224,8 +1313,21 @@ std::pair<std::size_t, std::size_t> NativeApp::active_range() const {
 
 void NativeApp::begin_load(const std::vector<std::filesystem::path>& files) {
     if (files.empty() || loading_) return;
-    if (files.size() == 1 && (files.front().extension() == L".rbxsession" || files.front().extension() == L".rbxlap")) {
+    active_load_files_.clear();
+    pending_vbo_.clear();
+    pending_racebox_csv_.clear();
+    pending_sanwa_csv_.clear();
+    auto single_extension = files.size() == 1
+        ? files.front().extension().wstring()
+        : std::wstring{};
+    std::transform(
+        single_extension.begin(), single_extension.end(),
+        single_extension.begin(), ::towlower);
+    if (files.size() == 1 &&
+        (single_extension == L".rbxsession" ||
+         single_extension == L".rbxlap")) {
         pending_vbo_.clear(); pending_racebox_csv_.clear(); pending_sanwa_csv_.clear();
+        active_load_files_ = files;
         loading_ = true;
         status_ = "Loading saved session...";
         const auto archive = files.front();
@@ -1249,15 +1351,30 @@ void NativeApp::begin_load(const std::vector<std::filesystem::path>& files) {
         else if (extension == L".gpx") selected_gpx = file;
     }
     if (!selected_gpx.empty()) {
-        pending_vbo_.clear(); pending_racebox_csv_.clear(); pending_sanwa_csv_.clear();
+        const auto selected_sanwa = pending_sanwa_csv_;
+        pending_vbo_.clear();
+        pending_racebox_csv_.clear();
+        active_load_files_ = {selected_gpx};
+        if (!selected_sanwa.empty()) {
+            active_load_files_.push_back(selected_sanwa);
+        }
         loading_ = true;
         error_.clear();
-        status_ = "Parsing GPX track on a worker thread...";
-        load_future_ = std::async(std::launch::async, [selected_gpx] {
+        status_ = selected_sanwa.empty()
+            ? "Parsing GPX track on a worker thread..."
+            : "Parsing GPX track and aligning Sanwa controls...";
+        load_future_ = std::async(std::launch::async, [selected_gpx, selected_sanwa] {
             LoadResult result;
             result.session.name = selected_gpx.stem().string();
             result.session.telemetry = parse_gpx(selected_gpx, result.diagnostics);
             if (result.session.telemetry.empty()) throw std::runtime_error("GPX contains no track points");
+            if (!selected_sanwa.empty()) {
+                result.session.sanwa_path = selected_sanwa;
+                result.session.radio =
+                    parse_sanwa_csv(selected_sanwa, result.diagnostics);
+                result.session.alignment =
+                    align_radio(result.session.telemetry, result.session.radio);
+            }
             result.session.laps.push_back({1, 0, 0, result.session.telemetry.size() - 1,
                 result.session.telemetry.time_us.back(), LapPhase::InLap});
             result.imu_analysis = imu::analyze(result.session.telemetry);
@@ -1267,20 +1384,25 @@ void NativeApp::begin_load(const std::vector<std::filesystem::path>& files) {
     }
     LoadRequest request{pending_vbo_, pending_racebox_csv_, pending_sanwa_csv_, {}};
     if (request.vbo.empty() && request.racebox_csv.empty()) {
+        active_load_files_.clear();
         error_.clear();
         status_ = request.sanwa_csv.empty() ? "No supported telemetry file was selected" :
-            "Sanwa file remembered. Open a VBO or RaceBox CSV to display the session.";
+            "Sanwa controls need a RaceBox CSV, VBO, or GPX recording in the same selection.";
         return;
     }
+    if (!request.vbo.empty()) active_load_files_.push_back(request.vbo);
+    if (!request.racebox_csv.empty()) active_load_files_.push_back(request.racebox_csv);
+    if (!request.sanwa_csv.empty()) active_load_files_.push_back(request.sanwa_csv);
     loading_ = true;
     error_.clear();
     if (!request.vbo.empty() && !request.racebox_csv.empty()) {
-        status_ = request.sanwa_csv.empty() ? "Loading RaceBox sources; Sanwa can be added later..." :
+        status_ = request.sanwa_csv.empty() ? "Loading RaceBox and VBO telemetry without radio controls..." :
             "Parsing and correlating all telemetry sources...";
         load_future_ = std::async(std::launch::async, [request] { return load_session(request); });
     } else {
-        status_ = request.vbo.empty() ? "Loading RaceBox CSV; VBO and Sanwa can be added later..." :
-            "Loading VBO; RaceBox CSV and Sanwa can be added later...";
+        status_ = request.vbo.empty()
+            ? "Loading RaceBox CSV telemetry..."
+            : "Loading VBO telemetry...";
         load_future_ = std::async(std::launch::async, [request] {
             LoadResult result;
             if (!request.racebox_csv.empty()) {
@@ -1310,6 +1432,125 @@ void NativeApp::begin_load(const std::vector<std::filesystem::path>& files) {
     }
 }
 
+void NativeApp::start_session_import(int preferred_run) {
+    if (loading_) {
+        session_import_error_ =
+            "Finish loading the current session before importing another run.";
+        status_ = session_import_error_;
+        return;
+    }
+    if (race_day_busy_ && preferred_run >= 0) {
+        session_import_error_ =
+            "Wait for the current run comparison to finish before changing its data.";
+        status_ = session_import_error_;
+        return;
+    }
+    session_import_error_.clear();
+    auto files = open_telemetry_files(window_);
+    if (files.empty()) return;
+    std::vector<race_day::TelemetrySourceKind> selected_kinds;
+    selected_kinds.reserve(files.size());
+    for (const auto& file : files) {
+        const auto kind =
+            race_day::telemetry_source_kind(file);
+        if (kind ==
+            race_day::TelemetrySourceKind::Unsupported) {
+            session_import_error_ = "Unsupported session file: " +
+                path_utf8(file.filename());
+            error_ = session_import_error_;
+            return;
+        }
+        if (std::find(
+                selected_kinds.begin(),
+                selected_kinds.end(), kind) !=
+            selected_kinds.end()) {
+            session_import_error_ = std::string("Select only one ") +
+                race_day::telemetry_source_kind_name(kind) +
+                " file for a run.";
+            error_ = session_import_error_;
+            return;
+        }
+        selected_kinds.push_back(kind);
+    }
+    const auto selected_has =
+        [&](race_day::TelemetrySourceKind kind) {
+            return std::find(
+                selected_kinds.begin(),
+                selected_kinds.end(), kind) !=
+                selected_kinds.end();
+        };
+    if (selected_has(
+            race_day::TelemetrySourceKind::NativeArchive) &&
+        files.size() != 1) {
+        session_import_error_ =
+            "A saved session archive must be selected by itself.";
+        error_ = session_import_error_;
+        return;
+    }
+    if (selected_has(race_day::TelemetrySourceKind::Gpx) &&
+        (selected_has(race_day::TelemetrySourceKind::Vbo) ||
+         selected_has(
+             race_day::TelemetrySourceKind::RaceBoxCsv))) {
+        session_import_error_ =
+            "GPX cannot be mixed with VBO or RaceBox CSV files.";
+        error_ = session_import_error_;
+        return;
+    }
+    const auto selection_has_primary =
+        selected_has(race_day::TelemetrySourceKind::Vbo) ||
+        selected_has(
+            race_day::TelemetrySourceKind::RaceBoxCsv) ||
+        selected_has(race_day::TelemetrySourceKind::Gpx) ||
+        selected_has(
+            race_day::TelemetrySourceKind::NativeArchive);
+    if (!selection_has_primary && preferred_run >= 0 &&
+        preferred_run <
+            static_cast<int>(race_day_.runs.size()) &&
+        race_day::has_primary_telemetry(
+            race_day_.runs[
+                static_cast<std::size_t>(preferred_run)])) {
+        auto& run = race_day_.runs[
+            static_cast<std::size_t>(preferred_run)];
+        const auto attached =
+            race_day::attach_or_replace_telemetry_sources(
+                run, files);
+        if (!attached.ok) {
+            session_import_error_ = attached.error;
+            error_ = session_import_error_;
+            return;
+        }
+        const auto invalidated =
+            invalidate_setup_knowledge_for_run(race_day_, run.id);
+        race_day_dirty_ = true;
+        race_day_report_.reset();
+        race_day_pending_knowledge_.reset();
+        selected_setup_knowledge_record_ = -1;
+        session_import_error_.clear();
+        status_ = std::format(
+            "Updated {} with {} new and {} replaced source(s){}",
+            run.label, attached.added, attached.replaced,
+            invalidated == 0
+                ? ""
+                : std::format(
+                      "; removed {} outdated comparison result(s)",
+                      invalidated));
+        return;
+    }
+    session_import_files_ = files;
+    session_import_requested_ = true;
+    session_import_preferred_run_ = preferred_run;
+    begin_load(files);
+    if (!loading_) {
+        session_import_requested_ = false;
+        session_import_preferred_run_ = -1;
+        session_import_files_.clear();
+        session_import_error_ =
+            "A run needs a RaceBox CSV, VBO, GPX, or session archive. "
+            "Select the Sanwa file together with one of those recordings.";
+        error_ = session_import_error_;
+    }
+}
+
 void NativeApp::poll_loader() {
     if (!loading_ || !load_future_.valid() || load_future_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
     loading_ = false;
@@ -1320,6 +1561,7 @@ void NativeApp::poll_loader() {
         });
         session_ = std::move(loaded.session);
         imu_analysis_ = std::move(loaded.imu_analysis);
+        current_session_source_files_ = active_load_files_;
         auto average_track = build_average_track_profile(*session_);
         average_track_latitude_ = std::move(average_track.latitude);
         average_track_longitude_ = std::move(average_track.longitude);
@@ -1404,9 +1646,43 @@ void NativeApp::poll_loader() {
         }
         status_ = std::format("Loaded {} GPS rows, {} radio samples, {} laps", session_->telemetry.size(), session_->radio.size(), session_->laps.size());
         if (warning != loaded.diagnostics.end()) error_ = *warning;
+        if (session_import_requested_) {
+            PendingSessionImport pending;
+            pending.files = current_session_source_files_;
+            pending.recorded_at_utc =
+                recorded_time_iso8601(&*session_);
+            pending.recorded_date =
+                recorded_local_date(&*session_);
+            if (session_import_preferred_run_ >= 0 &&
+                session_import_preferred_run_ <
+                    static_cast<int>(race_day_.runs.size())) {
+                const auto& preferred = race_day_.runs[
+                    static_cast<std::size_t>(session_import_preferred_run_)];
+                pending.kind = preferred.kind;
+                pending.kind_locked =
+                    preferred.kind == race_day::RunKind::Custom;
+                pending.destination_run = session_import_preferred_run_;
+                pending.run_label = preferred.label;
+            }
+            pending_session_import_ = std::move(pending);
+            session_import_error_.clear();
+            if (pending_session_import_->destination_run < 0) {
+                reset_session_import_destination();
+            }
+            session_import_requested_ = false;
+            session_import_preferred_run_ = -1;
+            session_import_files_.clear();
+            status_ =
+                "Session loaded. Confirm where it belongs in Race Day.";
+        }
         write_log(status_);
     } catch (const std::exception& exception) {
+        const auto import_failed = session_import_requested_;
+        session_import_requested_ = false;
+        session_import_preferred_run_ = -1;
+        session_import_files_.clear();
         error_ = exception.what();
+        if (import_failed) session_import_error_ = error_;
         status_ = "Load failed";
         write_log("Load failed: " + error_);
     }
@@ -1428,7 +1704,7 @@ bool NativeApp::render() {
         status_ = "Start/finish placement cancelled";
     }
     if (!annotation_mode_ && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O, false)) {
-        begin_load(open_telemetry_files(window_));
+        start_session_import();
     }
     frame_times_ms_.push_back(ImGui::GetIO().DeltaTime * 1000.0F);
     if (frame_times_ms_.size() > 600) frame_times_ms_.erase(frame_times_ms_.begin(), frame_times_ms_.begin() + 60);
@@ -1587,9 +1863,18 @@ void NativeApp::draw_app_header() {
         ImGui::TextColored(ImVec4(0.34F, 0.72F, 0.92F, 1.0F), "v%s", RACEBOX_VERSION_STRING);
         ImGui::Separator();
     if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Open telemetry...", "Ctrl+O")) begin_load(open_telemetry_files(window_));
+        if (ImGui::MenuItem("Import session...", "Ctrl+O")) start_session_import();
         ImGui::SeparatorText("Race day");
-        if (ImGui::MenuItem("New race day")) new_race_day();
+        if (ImGui::MenuItem("New race day")) {
+            if (race_day_dirty_) {
+                workspace_section_ = WorkspaceSection::RaceDay;
+                race_day_error_ =
+                    "Save the current Race Day, or use its New button "
+                    "to confirm replacing unsaved changes.";
+            } else {
+                new_race_day();
+            }
+        }
         if (ImGui::MenuItem("Open race day...")) open_race_day();
         if (ImGui::MenuItem("Save race day", nullptr, false, !race_day_.runs.empty())) save_race_day(false);
         if (ImGui::MenuItem("Save race day as...", nullptr, false, !race_day_.runs.empty())) save_race_day(true);
@@ -1613,7 +1898,7 @@ void NativeApp::draw_app_header() {
             load_background();
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Clear session and remembered sources", nullptr, false, session_.has_value() ||
+        if (ImGui::MenuItem("Clear current session and import state", nullptr, false, session_.has_value() ||
             !pending_vbo_.empty() || !pending_racebox_csv_.empty() || !pending_sanwa_csv_.empty())) {
             playing_ = false;
             session_.reset();
@@ -1625,11 +1910,27 @@ void NativeApp::draw_app_header() {
             next_annotation_id_ = 1;
             selected_annotation_id_ = 0;
             pending_vbo_.clear(); pending_racebox_csv_.clear(); pending_sanwa_csv_.clear();
+            active_load_files_.clear();
+            current_session_source_files_.clear();
+            session_import_files_.clear();
+            session_import_requested_ = false;
+            session_import_preferred_run_ = -1;
+            pending_session_import_.reset();
+            session_import_error_.clear();
             error_.clear();
-            status_ = "Open any VBO, RaceBox CSV, GPX, session archive, or Sanwa file.";
+            status_ = "Import a RaceBox, VBO, GPX, or session archive recording.";
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Exit")) exit_requested_ = true;
+        if (ImGui::MenuItem("Exit")) {
+            if (race_day_dirty_) {
+                workspace_section_ = WorkspaceSection::RaceDay;
+                race_day_error_ =
+                    "Save the Race Day before exiting so run notes "
+                    "and telemetry links are not lost.";
+            } else {
+                exit_requested_ = true;
+            }
+        }
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
@@ -1818,7 +2119,8 @@ void NativeApp::draw_app_header() {
         ImGui::TableNextColumn();
         context_field("SESSION", session_ ? session_->name.c_str() : "No session loaded");
         ImGui::TableNextColumn();
-        const auto recorded = recorded_time_label(session_ ? &*session_ : nullptr);
+        const auto recorded = friendly_recorded_time_label(
+            recorded_time_iso8601(session_ ? &*session_ : nullptr));
         context_field("RECORDED", recorded.c_str());
         ImGui::TableNextColumn();
         std::string sources = "No sources";
@@ -1857,6 +2159,7 @@ void NativeApp::draw_app_header() {
         }
         ImGui::EndTable();
     }
+    draw_session_import_popup();
     draw_global_notification();
     ImGui::End();
     ImGui::PopStyleVar(3);
@@ -4606,6 +4909,7 @@ void NativeApp::new_race_day() {
     race_day_.date = local_date_label();
     race_day_path_.clear();
     selected_race_day_run_ = 0;
+    race_day_detail_run_seen_ = -1;
     race_day_previous_run_ = 0;
     race_day_current_run_ = std::min(1, static_cast<int>(race_day_.runs.size()) - 1);
     race_day_report_.reset();
@@ -4620,6 +4924,13 @@ void NativeApp::new_race_day() {
 }
 
 void NativeApp::open_race_day() {
+    if (race_day_dirty_) {
+        workspace_section_ = WorkspaceSection::RaceDay;
+        race_day_error_ =
+            "Save the current Race Day before opening another one. "
+            "This prevents losing run notes or telemetry links.";
+        return;
+    }
     const auto path = open_race_day_file(window_);
     if (!path) return;
     race_day::Day loaded;
@@ -4632,6 +4943,7 @@ void NativeApp::open_race_day() {
     race_day_ = std::move(loaded);
     race_day_path_ = *path;
     selected_race_day_run_ = 0;
+    race_day_detail_run_seen_ = -1;
     race_day_previous_run_ = 0;
     race_day_current_run_ = std::min(1, static_cast<int>(race_day_.runs.size()) - 1);
     race_day_report_.reset();
@@ -4667,29 +4979,420 @@ void NativeApp::save_race_day(bool choose_path) {
         "Race day saved: {}", path_utf8(race_day_path_.filename()));
 }
 
-void NativeApp::attach_race_day_telemetry() {
-    if (race_day_.runs.empty()) return;
-    selected_race_day_run_ = std::clamp(
-        selected_race_day_run_, 0, static_cast<int>(race_day_.runs.size()) - 1);
-    auto files = open_telemetry_files(window_);
-    if (files.empty()) return;
-    auto& run = race_day_.runs[
-        static_cast<std::size_t>(selected_race_day_run_)];
-    auto& attached = run.telemetry_files;
-    for (const auto& path : files) {
-        if (attached.size() >= 8) break;
-        if (std::find(attached.begin(), attached.end(), path) == attached.end()) attached.push_back(path);
+void NativeApp::attach_race_day_telemetry(std::size_t run_index) {
+    if (run_index >= race_day_.runs.size()) return;
+    selected_race_day_run_ = static_cast<int>(run_index);
+    start_session_import(selected_race_day_run_);
+}
+
+void NativeApp::use_open_session_for_race_day_run(std::size_t run_index) {
+    if (run_index >= race_day_.runs.size()) return;
+    if (race_day_busy_) {
+        session_import_error_ =
+            "Wait for the current run comparison to finish before changing its data.";
+        return;
     }
-    race_day::refresh_telemetry_source_identities(run);
+    if (!session_ || current_session_source_files_.empty()) {
+        session_import_error_ =
+            "The current viewer session has no reusable source files. "
+            "Choose files for this run instead.";
+        error_ = session_import_error_;
+        return;
+    }
+    const auto& run = race_day_.runs[run_index];
+    PendingSessionImport pending;
+    pending.files = current_session_source_files_;
+    pending.recorded_at_utc = recorded_time_iso8601(&*session_);
+    pending.recorded_date = recorded_local_date(&*session_);
+    pending.kind = run.kind;
+    pending.kind_locked = run.kind == race_day::RunKind::Custom;
+    pending.destination_run = static_cast<int>(run_index);
+    pending.run_label = run.label;
+    pending_session_import_ = std::move(pending);
+    session_import_error_.clear();
+    status_ = "Current telemetry is ready to classify and add to Race Day.";
+}
+
+void NativeApp::reset_session_import_destination() {
+    if (!pending_session_import_) return;
+    auto& pending = *pending_session_import_;
+    pending.destination_run = -1;
+    for (std::size_t index = 0; index < race_day_.runs.size(); ++index) {
+        const auto& run = race_day_.runs[index];
+        if (run.kind == pending.kind && run.telemetry_files.empty()) {
+            pending.destination_run = static_cast<int>(index);
+            pending.run_label = run.label;
+            return;
+        }
+    }
+
+    int next_ordinal = 1;
+    for (const auto& run : race_day_.runs) {
+        if (run.kind == pending.kind) {
+            next_ordinal = std::max(next_ordinal, run.ordinal + 1);
+        }
+    }
+    switch (pending.kind) {
+        case race_day::RunKind::Practice:
+            pending.run_label =
+                "Practice " + std::to_string(next_ordinal);
+            break;
+        case race_day::RunKind::Qualifying:
+            pending.run_label = "Q" + std::to_string(next_ordinal);
+            break;
+        case race_day::RunKind::Main:
+            pending.run_label = "Race " + std::to_string(next_ordinal);
+            break;
+        case race_day::RunKind::Custom:
+            pending.run_label = "Run " + std::to_string(next_ordinal);
+            break;
+    }
+}
+
+void NativeApp::commit_session_import() {
+    if (!pending_session_import_ ||
+        pending_session_import_->files.empty()) {
+        return;
+    }
+    if (race_day_busy_) {
+        session_import_error_ =
+            "Wait for the current run comparison to finish before changing its data.";
+        return;
+    }
+
+    const auto pending = *pending_session_import_;
+    auto updated = race_day_;
+    const auto had_recorded_run = std::any_of(
+        updated.runs.begin(), updated.runs.end(),
+        [](const auto& run) {
+            return race_day::has_primary_telemetry(run);
+        });
+
+    std::size_t destination = updated.runs.size();
+    if (pending.destination_run >= 0 &&
+        pending.destination_run < static_cast<int>(updated.runs.size()) &&
+        updated.runs[static_cast<std::size_t>(
+            pending.destination_run)].kind == pending.kind) {
+        destination = static_cast<std::size_t>(
+            pending.destination_run);
+    } else {
+        switch (pending.kind) {
+            case race_day::RunKind::Practice:
+                race_day::add_practice(updated);
+                break;
+            case race_day::RunKind::Qualifying:
+                race_day::add_qualifying(updated);
+                break;
+            case race_day::RunKind::Main:
+                race_day::add_race(updated, pending.run_label);
+                break;
+            case race_day::RunKind::Custom:
+                race_day::add_custom(updated, pending.run_label);
+                break;
+        }
+        destination = updated.runs.size() - 1;
+    }
+
+    auto& run = updated.runs[destination];
+    if (!pending.run_label.empty()) run.label = pending.run_label;
+    run.recorded_at_utc =
+        pending.recorded_at_utc == "Not recorded"
+        ? std::string{}
+        : pending.recorded_at_utc;
+    const auto attached =
+        race_day::attach_or_replace_telemetry_sources(
+            run, pending.files);
+    if (!attached.ok) {
+        session_import_error_ = attached.error;
+        return;
+    }
+    const auto invalidated =
+        invalidate_setup_knowledge_for_run(updated, run.id);
+    if (!had_recorded_run || updated.date.empty()) {
+        updated.date = pending.recorded_date;
+    }
+
+    race_day_ = std::move(updated);
+    selected_race_day_run_ = static_cast<int>(destination);
+    race_day_current_run_ = selected_race_day_run_;
+    if (race_day_previous_run_ == race_day_current_run_ &&
+        race_day_.runs.size() > 1) {
+        race_day_previous_run_ =
+            std::max(0, race_day_current_run_ - 1);
+        if (race_day_previous_run_ == race_day_current_run_) {
+            race_day_previous_run_ = 1;
+        }
+    }
+    race_day_detail_run_seen_ = -1;
     race_day_dirty_ = true;
     race_day_report_.reset();
-    status_ = std::format("Attached {} telemetry source(s) to {}",
-        attached.size(), run.label);
+    race_day_pending_knowledge_.reset();
+    selected_setup_knowledge_record_ = -1;
+    session_import_error_.clear();
+    workspace_section_ = WorkspaceSection::RaceDay;
+    status_ = std::format(
+        "{} added to Race Day as {} on {} ({} new, {} replaced)",
+        session_ ? session_->name : std::string{"Session"},
+        race_day_.runs[destination].label,
+        pending.recorded_date,
+        attached.added, attached.replaced);
+    if (invalidated > 0) {
+        status_ += std::format(
+            "; removed {} outdated comparison result(s)",
+            invalidated);
+    }
+    pending_session_import_.reset();
+    ImGui::CloseCurrentPopup();
+}
+
+void NativeApp::draw_session_import_popup() {
+    if (!pending_session_import_) return;
+    auto& pending = *pending_session_import_;
+    if (pending.open_popup) {
+        ImGui::OpenPopup("Add imported session to Race Day");
+        pending.open_popup = false;
+    }
+    const auto* viewport = ImGui::GetMainViewport();
+    const auto maximum_size = ImVec2(
+        std::max(300.0F, viewport->WorkSize.x - 32.0F),
+        std::max(240.0F, viewport->WorkSize.y - 32.0F));
+    ImGui::SetNextWindowSizeConstraints(
+        ImVec2(std::min(390.0F, maximum_size.x), 0.0F),
+        maximum_size);
+    ImGui::SetNextWindowSize(
+        ImVec2(
+            std::min(
+                620.0F * std::clamp(text_scale_, 1.0F, 1.5F),
+                maximum_size.x),
+            0.0F),
+        ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal(
+            "Add imported session to Race Day", nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    const auto compact_import =
+        ImGui::GetContentRegionAvail().x <
+        430.0F * std::clamp(text_scale_, 1.0F, 1.5F);
+
+    ImGui::TextColored(
+        ui::color(ui::ColorToken::Playback),
+        "SESSION DATA IS LOADED");
+    ImGui::TextWrapped(
+        "Tell Race Day what kind of run this was. The recording "
+        "time is read from telemetry, this computer's local date is "
+        "used for Race Day, and telemetry remains available in the "
+        "Session workspace.");
+    ImGui::Separator();
+    ImGui::TextUnformatted("What session was this?");
+    const auto select_kind =
+        [&](const char* label, race_day::RunKind kind) {
+            const auto selected = pending.kind == kind;
+            if (ImGui::RadioButton(label, selected)) {
+                pending.kind = kind;
+                reset_session_import_destination();
+            }
+        };
+    if (pending.kind_locked) {
+        ImGui::TextColored(
+            ui::color(ui::ColorToken::Playback),
+            "Custom / test run");
+        ImGui::TextDisabled(
+            "This import will stay attached to the selected custom run.");
+    } else {
+        if (ImGui::BeginTable(
+                "session-kind-options",
+                compact_import ? 1 : 3,
+                ImGuiTableFlags_SizingStretchSame)) {
+            ImGui::TableNextColumn();
+            select_kind("Practice", race_day::RunKind::Practice);
+            ImGui::TableNextColumn();
+            select_kind("Qualifying", race_day::RunKind::Qualifying);
+            ImGui::TableNextColumn();
+            select_kind("Race", race_day::RunKind::Main);
+            ImGui::EndTable();
+        }
+    }
+
+    ImGui::Spacing();
+    const auto recorded_display =
+        friendly_recorded_time_label(pending.recorded_at_utc);
+    ImGui::Text("Recorded: %s", recorded_display.c_str());
+    if (pending.recorded_at_utc == "Not recorded") {
+        ImGui::TextColored(
+            ui::color(ui::ColorToken::Warning),
+            "This file has no absolute timestamp; Race Day will "
+            "use today's date.");
+    } else {
+        ImGui::TextDisabled(
+            "Race Day date will use %s.",
+            pending.recorded_date.c_str());
+    }
+
+    std::string destination_label =
+        pending.destination_run >= 0 &&
+            pending.destination_run <
+                static_cast<int>(race_day_.runs.size())
+        ? race_day_.runs[static_cast<std::size_t>(
+              pending.destination_run)].label
+        : "Create a new run";
+    if (ImGui::BeginCombo(
+            "Race Day run", destination_label.c_str())) {
+        for (std::size_t index = 0;
+             index < race_day_.runs.size(); ++index) {
+            const auto& run = race_day_.runs[index];
+            if (run.kind != pending.kind) continue;
+            const auto label = std::format(
+                "{} {}##session-slot-{}",
+                run.label,
+                run.telemetry_files.empty()
+                    ? "(empty)"
+                    : "(replace matching data)",
+                index);
+            const auto selected =
+                pending.destination_run ==
+                static_cast<int>(index);
+            if (ImGui::Selectable(label.c_str(), selected)) {
+                pending.destination_run =
+                    static_cast<int>(index);
+                pending.run_label = run.label;
+            }
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        const auto create_selected =
+            pending.destination_run < 0;
+        if (ImGui::Selectable(
+                "Create a new run##session-slot-new",
+                create_selected)) {
+            pending.destination_run = -1;
+            int next_ordinal = 1;
+            for (const auto& run : race_day_.runs) {
+                if (run.kind == pending.kind) {
+                    next_ordinal = std::max(
+                        next_ordinal, run.ordinal + 1);
+                }
+            }
+            switch (pending.kind) {
+                case race_day::RunKind::Practice:
+                    pending.run_label =
+                        "Practice " +
+                        std::to_string(next_ordinal);
+                    break;
+                case race_day::RunKind::Qualifying:
+                    pending.run_label =
+                        "Q" + std::to_string(next_ordinal);
+                    break;
+                case race_day::RunKind::Main:
+                    pending.run_label =
+                        "Race " +
+                        std::to_string(next_ordinal);
+                    break;
+                case race_day::RunKind::Custom:
+                    pending.run_label =
+                        "Run " +
+                        std::to_string(next_ordinal);
+                    break;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::TextUnformatted("Run name");
+    ImGui::SetNextItemWidth(-1.0F);
+    input_text_string("##session-run-name", pending.run_label);
+
+    if (pending.destination_run >= 0 &&
+        pending.destination_run <
+            static_cast<int>(race_day_.runs.size()) &&
+        !race_day_.runs[static_cast<std::size_t>(
+             pending.destination_run)].telemetry_files.empty()) {
+        ImGui::TextColored(
+            ui::color(ui::ColorToken::Warning),
+            "This run already has data. Matching source types "
+            "will be replaced; other sources are kept.");
+    }
+    const auto has_recorded_run = std::any_of(
+        race_day_.runs.begin(), race_day_.runs.end(),
+        [](const auto& run) {
+            return race_day::has_primary_telemetry(run);
+        });
+    if (has_recorded_run && !race_day_.date.empty() &&
+        race_day_.date != pending.recorded_date) {
+        ImGui::TextColored(
+            ui::color(ui::ColorToken::Warning),
+            "This recording is dated %s, while this Race Day is "
+            "dated %s. The existing event date will be kept.",
+            pending.recorded_date.c_str(),
+            race_day_.date.c_str());
+    }
+
+    ImGui::SeparatorText("FILES IN THIS SESSION");
+    for (const auto& path : pending.files) {
+        ImGui::Bullet();
+        ImGui::SameLine();
+        ImGui::TextWrapped(
+            "%s", path_utf8(path.filename()).c_str());
+    }
+    if (!session_import_error_.empty()) {
+        ImGui::TextColored(
+            ui::color(ui::ColorToken::Danger),
+            "%s", session_import_error_.c_str());
+    }
+    ImGui::Separator();
+    const auto add_action_width = std::max(
+        180.0F,
+        ImGui::CalcTextSize("ADD TO RACE DAY").x +
+            ImGui::GetStyle().FramePadding.x * 2.0F + 12.0F);
+    const auto view_action_width = std::max(
+        160.0F,
+        ImGui::CalcTextSize("View telemetry only").x +
+            ImGui::GetStyle().FramePadding.x * 2.0F + 12.0F);
+    const auto stack_import_actions =
+        compact_import ||
+        ImGui::GetContentRegionAvail().x <
+            add_action_width + view_action_width +
+                ImGui::GetStyle().ItemSpacing.x;
+    ImGui::BeginDisabled(
+        pending.files.empty() || pending.run_label.empty());
+    if (ImGui::Button(
+            "ADD TO RACE DAY",
+            ImVec2(
+                stack_import_actions ? -1.0F : add_action_width,
+                38.0F))) {
+        commit_session_import();
+        ImGui::EndDisabled();
+        if (!pending_session_import_) {
+            ImGui::EndPopup();
+            return;
+        }
+    } else {
+        ImGui::EndDisabled();
+    }
+    if (!stack_import_actions) ImGui::SameLine();
+    if (ImGui::Button(
+            "View telemetry only",
+            ImVec2(
+                stack_import_actions ? -1.0F : view_action_width,
+                38.0F))) {
+        pending_session_import_.reset();
+        session_import_error_.clear();
+        workspace_section_ = WorkspaceSection::Session;
+        status_ =
+            "Session kept in the viewer without adding it to Race Day.";
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+    ImGui::EndPopup();
 }
 
 void NativeApp::begin_race_day_source_relink(
     std::size_t source_index) {
     if (race_day_.runs.empty()) return;
+    if (race_day_busy_) {
+        race_day_error_ =
+            "Wait for the current run comparison to finish before repairing its data.";
+        return;
+    }
     const auto run_index = static_cast<std::size_t>(std::clamp(
         selected_race_day_run_, 0,
         static_cast<int>(race_day_.runs.size()) - 1));
@@ -4738,25 +5441,44 @@ void NativeApp::begin_race_day_source_relink(
         const auto match =
             candidate_index_for(pending.result.recommended_candidate_id);
         if (match) {
-            run.telemetry_files[source_index] =
-                pending.candidate_paths[*match];
-            run.telemetry_source_identities[source_index] =
-                pending.candidate_identities[*match];
+            std::string replacement_error;
+            if (!replace_telemetry_source_slot(
+                    run, source_index,
+                    pending.candidate_paths[*match],
+                    pending.candidate_identities[*match],
+                    replacement_error)) {
+                race_day_error_ = std::move(replacement_error);
+                return;
+            }
+            const auto invalidated =
+                invalidate_setup_knowledge_for_run(
+                    race_day_, run.id);
             race_day_dirty_ = true;
             race_day_report_.reset();
+            race_day_pending_knowledge_.reset();
+            selected_setup_knowledge_record_ = -1;
+            race_day_error_.clear();
             status_ = std::format(
-                "Relinked {} using its exact source fingerprint",
-                path_utf8(run.telemetry_files[source_index].filename()));
+                "Relinked {} using its exact source fingerprint{}",
+                path_utf8(run.telemetry_files[source_index].filename()),
+                invalidated == 0
+                    ? ""
+                    : std::format(
+                          "; removed {} outdated comparison result(s)",
+                          invalidated));
             return;
         }
     }
 
     pending_race_day_relink_ = std::move(pending);
-    ImGui::OpenPopup("Confirm telemetry source");
 }
 
 void NativeApp::draw_race_day_source_relink_popup() {
     if (!pending_race_day_relink_) return;
+    if (pending_race_day_relink_->open_popup) {
+        ImGui::OpenPopup("Confirm telemetry source");
+        pending_race_day_relink_->open_popup = false;
+    }
     if (!ImGui::BeginPopupModal(
             "Confirm telemetry source", nullptr,
             ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -4810,19 +5532,43 @@ void NativeApp::draw_race_day_source_relink_popup() {
     }
     ImGui::Separator();
 
-    const auto choose = [&](std::string_view candidate_id) {
+    const auto choose = [&](
+        std::string_view candidate_id,
+        bool fingerprint_match) {
+        if (!fingerprint_match) {
+            race_day_error_ =
+                "This file does not match the saved recording fingerprint. "
+                "Use Add / replace run data if it is a different recording.";
+            return;
+        }
         for (std::size_t index = 0;
              index < pending.candidate_paths.size(); ++index) {
             if (candidate_id != std::to_string(index)) continue;
-            run.telemetry_files[pending.source_index] =
-                pending.candidate_paths[index];
-            run.telemetry_source_identities[pending.source_index] =
-                pending.candidate_identities[index];
+            std::string replacement_error;
+            if (!replace_telemetry_source_slot(
+                    run, pending.source_index,
+                    pending.candidate_paths[index],
+                    pending.candidate_identities[index],
+                    replacement_error)) {
+                race_day_error_ = std::move(replacement_error);
+                return;
+            }
+            const auto invalidated =
+                invalidate_setup_knowledge_for_run(
+                    race_day_, run.id);
             race_day_dirty_ = true;
             race_day_report_.reset();
+            race_day_pending_knowledge_.reset();
+            selected_setup_knowledge_record_ = -1;
+            race_day_error_.clear();
             status_ = std::format(
-                "Relinked {} after confirmation",
-                path_utf8(pending.candidate_paths[index].filename()));
+                "Relinked {} after fingerprint confirmation{}",
+                path_utf8(pending.candidate_paths[index].filename()),
+                invalidated == 0
+                    ? ""
+                    : std::format(
+                          "; removed {} outdated comparison result(s)",
+                          invalidated));
             pending_race_day_relink_.reset();
             ImGui::CloseCurrentPopup();
             return;
@@ -4853,17 +5599,30 @@ void NativeApp::draw_race_day_source_relink_popup() {
             suggestion.modified_time_match ? "match" : "-",
             suggestion.fingerprint_match ? "match" : "-");
         ImGui::SameLine();
-        if (ImGui::Button("Use this file")) {
+        ImGui::BeginDisabled(!suggestion.fingerprint_match);
+        const auto use_candidate =
+            ImGui::Button("Use this file");
+        ImGui::EndDisabled();
+        if (use_candidate) {
             const auto id = suggestion.candidate_id;
-            choose(id);
+            choose(id, suggestion.fingerprint_match);
             ImGui::PopID();
             ImGui::EndPopup();
             return;
+        }
+        if (!suggestion.fingerprint_match) {
+            ImGui::TextDisabled(
+                "Different recording: use Add / replace run data.");
         }
         ImGui::PopID();
     }
 
     ImGui::Separator();
+    if (!race_day_error_.empty()) {
+        ImGui::TextColored(
+            ui::color(ui::ColorToken::Danger),
+            "%s", race_day_error_.c_str());
+    }
     if (ImGui::Button("Cancel")) {
         pending_race_day_relink_.reset();
         ImGui::CloseCurrentPopup();
@@ -4882,8 +5641,11 @@ void NativeApp::analyze_race_day_runs() {
     }
     const auto previous = race_day_.runs[static_cast<std::size_t>(race_day_previous_run_)];
     const auto current = race_day_.runs[static_cast<std::size_t>(race_day_current_run_)];
-    if (previous.telemetry_files.empty() || current.telemetry_files.empty()) {
-        race_day_error_ = "Attach telemetry to both the previous and current run first";
+    if (!race_day::has_primary_telemetry(previous) ||
+        !race_day::has_primary_telemetry(current)) {
+        race_day_error_ =
+            "Attach RaceBox, VBO, GPX, or session archive data "
+            "to both runs first";
         return;
     }
 
@@ -4968,9 +5730,11 @@ void NativeApp::draw_reports() {
 
     if (!session_) {
         ImGui::Separator();
-        ImGui::TextWrapped("Open telemetry to build a report from laps, sectors, and deterministic insights.");
-        if (ImGui::Button("Open telemetry...", ImVec2(180.0F, 36.0F))) {
-            begin_load(open_telemetry_files(window_));
+        ImGui::TextWrapped(
+            "Import a session to build a report from laps, sectors, and deterministic insights. "
+            "After loading, choose whether it was Practice, Qualifying, or Race.");
+        if (ImGui::Button("Import session...", ImVec2(190.0F, 38.0F))) {
+            start_session_import();
         }
         ImGui::End();
         return;
@@ -5006,7 +5770,10 @@ void NativeApp::draw_reports() {
         };
         ImGui::TableNextRow();
         summary_cell("SESSION", session_->name.empty() ? std::string{"Unnamed session"} : session_->name);
-        summary_cell("RECORDED", recorded_time_label(&*session_));
+        summary_cell(
+            "RECORDED",
+            friendly_recorded_time_label(
+                recorded_time_iso8601(&*session_)));
         summary_cell("TELEMETRY", std::format("{} samples | {}", session_->telemetry.size(), lap_time(session_duration)));
         summary_cell("COMPLETE LAPS", std::format("{} of {}", complete_laps, session_->laps.size()));
         ImGui::TableNextRow();
@@ -5190,23 +5957,63 @@ void NativeApp::draw_race_day() {
         return;
     }
 
+    const auto compact_race_day =
+        size.x < 1200.0F * std::clamp(text_scale_, 1.0F, 1.5F);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30F, 0.78F, 0.95F, 1.0F));
     ImGui::TextUnformatted("RACE DAY BOOK");
     ImGui::PopStyleColor();
-    ImGui::SameLine();
-    ImGui::TextDisabled("Attach each run now; telemetry is loaded only when opened or analyzed.");
-    ImGui::SameLine();
-    if (race_day_dirty_) ImGui::TextColored(ImVec4(0.95F, 0.68F, 0.18F, 1.0F), "UNSAVED");
+    if (race_day_dirty_) {
+        ImGui::SameLine();
+        ImGui::TextColored(
+            ImVec4(0.95F, 0.68F, 0.18F, 1.0F), "UNSAVED");
+    }
+    if (!compact_race_day) ImGui::SameLine();
+    ImGui::TextWrapped(
+        "Import each recording once, classify it, and keep telemetry, "
+        "setup notes, conditions, and results together.");
 
-    ImGui::SetNextItemWidth(230.0F);
-    if (input_text_string("Event##race-day-event", race_day_.event_name)) race_day_dirty_ = true;
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(210.0F);
-    if (input_text_string("Track##race-day-track", race_day_.track_name)) race_day_dirty_ = true;
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(120.0F);
-    if (input_text_string("Date##race-day-date", race_day_.date)) race_day_dirty_ = true;
-    ImGui::SameLine();
+    if (compact_race_day) {
+        ImGui::TextDisabled("EVENT");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1.0F);
+        if (input_text_string(
+                "##race-day-event", race_day_.event_name)) {
+            race_day_dirty_ = true;
+        }
+        ImGui::TextDisabled("TRACK");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1.0F);
+        if (input_text_string(
+                "##race-day-track", race_day_.track_name)) {
+            race_day_dirty_ = true;
+        }
+        ImGui::TextDisabled("DATE");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1.0F);
+        if (input_text_string(
+                "##race-day-date", race_day_.date)) {
+            race_day_dirty_ = true;
+        }
+    } else {
+        ImGui::SetNextItemWidth(230.0F);
+        if (input_text_string(
+                "Event##race-day-event", race_day_.event_name)) {
+            race_day_dirty_ = true;
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(210.0F);
+        if (input_text_string(
+                "Track##race-day-track", race_day_.track_name)) {
+            race_day_dirty_ = true;
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0F);
+        if (input_text_string(
+                "Date##race-day-date", race_day_.date)) {
+            race_day_dirty_ = true;
+        }
+        ImGui::SameLine();
+    }
     if (ImGui::Button("New")) ImGui::OpenPopup("Replace race day?");
     ImGui::SameLine();
     if (ImGui::Button("Open...")) open_race_day();
@@ -5229,18 +6036,51 @@ void NativeApp::draw_race_day() {
     }
 
     ImGui::Separator();
+    ImGui::PushStyleColor(
+        ImGuiCol_Button, ImVec4(0.68F, 0.06F, 0.14F, 0.95F));
+    ImGui::PushStyleColor(
+        ImGuiCol_ButtonHovered, ImVec4(0.82F, 0.08F, 0.18F, 1.0F));
+    if (ImGui::Button(
+            "IMPORT SESSION DATA...", ImVec2(245.0F, 42.0F))) {
+        start_session_import();
+    }
+    ImGui::PopStyleColor(2);
+    if (!compact_race_day) ImGui::SameLine();
+    ImGui::TextWrapped(
+        "Select the RaceBox/VBO and Sanwa files together. "
+        "After loading, choose Practice, Qualifying, or Race; "
+        "the recording date is detected automatically.");
+
+    ImGui::Separator();
     const auto available = ImGui::GetContentRegionAvail();
     const auto left_width = std::clamp(available.x * 0.22F, 210.0F, 280.0F);
     const auto center_width = std::clamp(available.x * 0.43F, 360.0F, 620.0F);
 
-    ImGui::BeginChild("race-day-runs", ImVec2(left_width, -1.0F), ImGuiChildFlags_Borders);
+    const auto workspace_tabs_open =
+        !compact_race_day ||
+        ImGui::BeginTabBar(
+            "race-day-workspace-tabs",
+            ImGuiTabBarFlags_FittingPolicyScroll);
+    if (workspace_tabs_open) {
+    const auto runs_open =
+        !compact_race_day || ImGui::BeginTabItem("Runs");
+    if (runs_open) {
+    ImGui::BeginChild(
+        "race-day-runs",
+        ImVec2(compact_race_day ? 0.0F : left_width, -1.0F),
+        ImGuiChildFlags_Borders);
     ImGui::SeparatorText("RUNS");
     for (std::size_t index = 0; index < race_day_.runs.size(); ++index) {
         auto& run = race_day_.runs[index];
         ImGui::PushID(static_cast<int>(index));
         const auto selected = selected_race_day_run_ == static_cast<int>(index);
         const auto label = std::format("{}##run", run.label);
-        if (ImGui::Selectable(label.c_str(), selected, ImGuiSelectableFlags_None, ImVec2(-1.0F, 34.0F))) {
+        if (ImGui::Selectable(
+                label.c_str(), selected,
+                ImGuiSelectableFlags_None,
+                ImVec2(
+                    ImGui::GetContentRegionAvail().x,
+                    34.0F))) {
             selected_race_day_run_ = static_cast<int>(index);
             race_day_current_run_ = selected_race_day_run_;
             if (race_day_previous_run_ == race_day_current_run_) {
@@ -5251,11 +6091,44 @@ void NativeApp::draw_race_day() {
             }
         }
         if (run.telemetry_files.empty()) {
-            ImGui::TextDisabled("%s | no telemetry", race_day::kind_name(run.kind));
+            ImGui::TextDisabled(
+                "%s | EMPTY", race_day::kind_name(run.kind));
         } else {
-            ImGui::TextColored(ImVec4(0.28F, 0.80F, 0.45F, 1.0F), "%s | %zu source%s",
-                race_day::kind_name(run.kind), run.telemetry_files.size(),
-                run.telemetry_files.size() == 1 ? "" : "s");
+            auto files_available = true;
+            for (std::size_t source_index = 0;
+                 source_index < run.telemetry_files.size();
+                 ++source_index) {
+                files_available =
+                    files_available &&
+                    race_day::telemetry_source_state(
+                        run, source_index) ==
+                        race_day::TelemetrySourceState::Available;
+            }
+            const auto has_primary =
+                race_day::has_primary_telemetry(run);
+            const auto composition =
+                race_day::validate_telemetry_source_composition(
+                    run, true);
+            const auto state = !composition.ok
+                ? "NEEDS REPAIR"
+                : !files_available
+                ? "NEEDS FILE"
+                : has_primary ? "DATA READY" : "CONTROLS ONLY";
+            const auto color =
+                composition.ok && files_available && has_primary
+                ? ImVec4(0.28F, 0.80F, 0.45F, 1.0F)
+                : ImVec4(0.95F, 0.68F, 0.18F, 1.0F);
+            ImGui::TextColored(
+                color, "%s | %s",
+                race_day::kind_name(run.kind), state);
+        }
+        if (ImGui::SmallButton(
+                run.telemetry_files.empty()
+                    ? "Add data..."
+                    : "Add / replace data...")) {
+            selected_race_day_run_ = static_cast<int>(index);
+            race_day_current_run_ = selected_race_day_run_;
+            attach_race_day_telemetry(index);
         }
         ImGui::PopID();
     }
@@ -5297,16 +6170,35 @@ void NativeApp::draw_race_day() {
         race_day_dirty_ = true;
     }
     ImGui::EndChild();
+    if (compact_race_day) ImGui::EndTabItem();
+    }
 
-    ImGui::SameLine();
-    ImGui::BeginChild("race-day-details", ImVec2(center_width, -1.0F), ImGuiChildFlags_Borders);
+    if (!compact_race_day) ImGui::SameLine();
+    const auto force_details =
+        race_day_detail_run_seen_ != selected_race_day_run_ ||
+        pending_race_day_relink_.has_value();
+    const auto details_open =
+        !compact_race_day ||
+        ImGui::BeginTabItem(
+            "Selected Run", nullptr,
+            force_details
+                ? ImGuiTabItemFlags_SetSelected
+                : ImGuiTabItemFlags_None);
+    if (details_open) {
+    ImGui::BeginChild(
+        "race-day-details",
+        ImVec2(compact_race_day ? 0.0F : center_width, -1.0F),
+        ImGuiChildFlags_Borders);
     if (race_day_.runs.empty()) {
         ImGui::TextDisabled("Add a run to begin.");
     } else {
         selected_race_day_run_ = std::clamp(
             selected_race_day_run_, 0, static_cast<int>(race_day_.runs.size()) - 1);
         auto& run = race_day_.runs[static_cast<std::size_t>(selected_race_day_run_)];
-        auto sources_ready = !run.telemetry_files.empty();
+        const auto source_composition =
+            race_day::validate_telemetry_source_composition(
+                run, true);
+        auto sources_ready = source_composition.ok;
         for (std::size_t source_index = 0;
              source_index < run.telemetry_files.size(); ++source_index) {
             sources_ready =
@@ -5314,86 +6206,282 @@ void NativeApp::draw_race_day() {
                 race_day::telemetry_source_state(run, source_index) ==
                     race_day::TelemetrySourceState::Available;
         }
+        const auto has_vbo = std::any_of(
+            run.telemetry_files.begin(), run.telemetry_files.end(),
+            [](const auto& path) {
+                return race_day::telemetry_source_kind(path) ==
+                    race_day::TelemetrySourceKind::Vbo;
+            });
+        const auto has_archive = std::any_of(
+            run.telemetry_files.begin(), run.telemetry_files.end(),
+            [](const auto& path) {
+                return race_day::telemetry_source_kind(path) ==
+                    race_day::TelemetrySourceKind::NativeArchive;
+            });
+        const auto has_racebox =
+            race_day::has_racebox_csv(run);
+        const auto has_sanwa =
+            race_day::has_sanwa_csv(run);
+        const auto full_comparison_inputs =
+            sources_ready &&
+            has_vbo && has_racebox && has_sanwa;
+        const auto select_data_tab =
+            race_day_detail_run_seen_ != selected_race_day_run_;
+        race_day_detail_run_seen_ = selected_race_day_run_;
         ImGui::PushID(selected_race_day_run_);
         ImGui::SeparatorText("SELECTED RUN");
         if (input_text_string("Run name", run.label)) race_day_dirty_ = true;
-        if (ImGui::Button("Attach VBO / RaceBox / Sanwa...")) attach_race_day_telemetry();
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!sources_ready);
-        if (ImGui::Button("Load in viewer")) {
-            auto content_verified = true;
-            for (std::size_t source_index = 0;
-                 source_index < run.telemetry_files.size();
-                 ++source_index) {
-                content_verified =
-                    content_verified &&
-                    race_day::telemetry_source_state(
-                        run, source_index, true) ==
-                        race_day::TelemetrySourceState::Available;
-            }
-            if (content_verified) {
-                const auto files = run.telemetry_files;
-                workspace_section_ = WorkspaceSection::Session;
-                begin_load(files);
-            } else {
-                race_day_error_ =
-                    "An attached telemetry file no longer matches the saved recording. Review it before loading.";
-            }
+        const auto recorded_display =
+            friendly_recorded_time_label(run.recorded_at_utc);
+        ImGui::TextDisabled("%s", race_day::kind_name(run.kind));
+        if (!run.recorded_at_utc.empty()) {
+            ImGui::TextWrapped(
+                "Recorded %s", recorded_display.c_str());
         }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::BeginDisabled(run.telemetry_files.empty());
-        if (ImGui::Button("Clear attachments")) {
-            run.telemetry_files.clear();
-            run.telemetry_source_identities.clear();
-            pending_race_day_relink_.reset();
-            race_day_dirty_ = true;
-            race_day_report_.reset();
-        }
-        ImGui::EndDisabled();
-        for (std::size_t source_index = 0;
-             source_index < run.telemetry_files.size(); ++source_index) {
-            const auto& path = run.telemetry_files[source_index];
-            const auto source_state =
-                race_day::telemetry_source_state(run, source_index);
-            ImGui::PushID(static_cast<int>(source_index));
-            if (source_state ==
-                race_day::TelemetrySourceState::Available) {
-                ImGui::BulletText(
-                    "%s  [available]",
-                    path_utf8(path.filename()).c_str());
-            } else if (source_state ==
-                       race_day::TelemetrySourceState::Changed) {
-                ImGui::TextColored(
-                    ui::color(ui::ColorToken::Warning),
-                    "Changed since attachment: %s",
-                    path_utf8(path.filename()).c_str());
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Review file...")) {
-                    begin_race_day_source_relink(source_index);
-                }
-            } else {
-                ImGui::TextColored(
-                    ui::color(ui::ColorToken::Warning),
-                    "Missing: %s",
-                    path_utf8(path.filename()).c_str());
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Find moved file...")) {
-                    begin_race_day_source_relink(source_index);
-                }
-            }
-            ImGui::PopID();
-        }
-        draw_race_day_source_relink_popup();
 
         if (ImGui::BeginTabBar("race-day-detail-tabs")) {
-            if (ImGui::BeginTabItem("Pre-run check")) {
+            const auto data_flags = select_data_tab
+                ? ImGuiTabItemFlags_SetSelected
+                : ImGuiTabItemFlags_None;
+            if (ImGui::BeginTabItem(
+                    "Run Data", nullptr, data_flags)) {
+                ImGui::TextWrapped(
+                    "Add the recordings for this run. Select the "
+                    "RaceBox/VBO file and Sanwa file together when "
+                    "possible; the importer will ask whether this was "
+                    "Practice, Qualifying, or Race and fill the date.");
+                ImGui::PushStyleColor(
+                    ImGuiCol_Button,
+                    ImVec4(0.68F, 0.06F, 0.14F, 0.95F));
+                ImGui::BeginDisabled(race_day_busy_);
+                if (ImGui::Button(
+                        run.telemetry_files.empty()
+                            ? "ADD RECORDING TO THIS RUN..."
+                            : "ADD OR REPLACE RUN DATA...",
+                        ImVec2(-1.0F, 42.0F))) {
+                    attach_race_day_telemetry(
+                        static_cast<std::size_t>(
+                            selected_race_day_run_));
+                }
+                ImGui::EndDisabled();
+                ImGui::PopStyleColor();
+                ImGui::BeginDisabled(
+                    race_day_busy_ ||
+                    !session_ ||
+                    current_session_source_files_.empty());
+                if (ImGui::Button(
+                        "USE TELEMETRY CURRENTLY OPEN",
+                        ImVec2(-1.0F, 34.0F))) {
+                    use_open_session_for_race_day_run(
+                        static_cast<std::size_t>(
+                            selected_race_day_run_));
+                }
+                ImGui::EndDisabled();
+
+                ImGui::SeparatorText("READINESS");
+                ImGui::TextColored(
+                    sources_ready
+                        ? ui::color(ui::ColorToken::Positive)
+                        : ui::color(ui::ColorToken::Warning),
+                    "%s",
+                    sources_ready
+                        ? "Ready to view laps"
+                        : "Needs RaceBox, VBO, GPX, or a session archive");
+                if (!source_composition.ok &&
+                    !source_composition.error.empty()) {
+                    ImGui::TextWrapped(
+                        "Repair needed: %s",
+                        source_composition.error.c_str());
+                }
+                ImGui::TextColored(
+                    full_comparison_inputs
+                        ? ui::color(ui::ColorToken::Positive)
+                        : ui::color(ui::ColorToken::Warning),
+                    "%s",
+                    full_comparison_inputs
+                        ? "Full setup comparison inputs are present"
+                        : has_archive
+                            ? "Session archive attached; open it to "
+                              "confirm its input and motion channels"
+                            : "Limited comparison: VBO + RaceBox CSV + "
+                              "Sanwa gives the strongest input/output evidence");
+
+                ImGui::SeparatorText("ATTACHED SOURCES");
+                if (run.telemetry_files.empty()) {
+                    ImGui::TextDisabled(
+                        "No recording is attached to this run yet.");
+                }
+                std::optional<std::size_t> remove_source;
+                for (std::size_t source_index = 0;
+                     source_index < run.telemetry_files.size();
+                     ++source_index) {
+                    const auto& path =
+                        run.telemetry_files[source_index];
+                    const auto source_state =
+                        race_day::telemetry_source_state(
+                            run, source_index);
+                    const auto kind =
+                        race_day::telemetry_source_kind(path);
+                    ImGui::PushID(
+                        static_cast<int>(source_index));
+                    const auto state_label =
+                        source_state ==
+                            race_day::TelemetrySourceState::Available
+                        ? "READY"
+                        : source_state ==
+                                  race_day::TelemetrySourceState::Changed
+                            ? "CHANGED"
+                            : "MISSING";
+                    ImGui::TextColored(
+                        source_state ==
+                                race_day::TelemetrySourceState::Available
+                            ? ui::color(ui::ColorToken::Positive)
+                            : ui::color(ui::ColorToken::Warning),
+                        "%s | %s",
+                        race_day::telemetry_source_kind_name(kind),
+                        state_label);
+                    ImGui::TextWrapped(
+                        "%s",
+                        path_utf8(path.filename()).c_str());
+                    ImGui::BeginDisabled(race_day_busy_);
+                    if (source_state !=
+                        race_day::TelemetrySourceState::Available) {
+                        if (ImGui::SmallButton(
+                                source_state ==
+                                        race_day::TelemetrySourceState::Changed
+                                    ? "Review / replace file..."
+                                    : "Find moved file...")) {
+                            begin_race_day_source_relink(
+                                source_index);
+                        }
+                        ImGui::SameLine();
+                    }
+                    if (ImGui::SmallButton(
+                            "Remove this source")) {
+                        remove_source = source_index;
+                    }
+                    ImGui::EndDisabled();
+                    ImGui::Separator();
+                    ImGui::PopID();
+                }
+                if (!has_archive) {
+                    const auto missing_source =
+                        [&](bool present, const char* label,
+                            const char* description) {
+                            if (present) return;
+                            ImGui::TextColored(
+                                ui::color(ui::ColorToken::Warning),
+                                "%s | NOT ATTACHED", label);
+                            ImGui::TextDisabled(
+                                "%s", description);
+                            ImGui::Separator();
+                        };
+                    missing_source(
+                        has_vbo, "VBO",
+                        "GPS, chassis G, gyro, and altitude");
+                    missing_source(
+                        has_racebox, "RaceBox CSV",
+                        "Lap timing and speed");
+                    missing_source(
+                        has_sanwa, "Sanwa CSV",
+                        "Throttle, brake, and steering");
+                }
+                if (remove_source) {
+                    if (race_day::remove_telemetry_source(
+                            run, *remove_source)) {
+                        const auto invalidated =
+                            invalidate_setup_knowledge_for_run(
+                                race_day_, run.id);
+                        pending_race_day_relink_.reset();
+                        race_day_dirty_ = true;
+                        race_day_report_.reset();
+                        race_day_pending_knowledge_.reset();
+                        selected_setup_knowledge_record_ = -1;
+                        status_ = invalidated == 0
+                            ? "Removed the telemetry source"
+                            : std::format(
+                                  "Removed the telemetry source and "
+                                  "{} outdated comparison result(s)",
+                                  invalidated);
+                    }
+                }
+
+                ImGui::BeginDisabled(!sources_ready);
+                if (ImGui::Button(
+                        "OPEN THIS RUN IN TELEMETRY VIEWER",
+                        ImVec2(-1.0F, 38.0F))) {
+                    auto content_verified = true;
+                    for (std::size_t source_index = 0;
+                         source_index < run.telemetry_files.size();
+                         ++source_index) {
+                        content_verified =
+                            content_verified &&
+                            race_day::telemetry_source_state(
+                                run, source_index, true) ==
+                                race_day::TelemetrySourceState::Available;
+                    }
+                    if (content_verified) {
+                        const auto files = run.telemetry_files;
+                        workspace_section_ =
+                            WorkspaceSection::Session;
+                        begin_load(files);
+                    } else {
+                        race_day_error_ =
+                            "An attached telemetry file no longer "
+                            "matches the saved recording. Review it "
+                            "before loading.";
+                    }
+                }
+                ImGui::EndDisabled();
+                ImGui::BeginDisabled(
+                    run.telemetry_files.empty() ||
+                    race_day_busy_);
+                if (ImGui::SmallButton(
+                        "Remove all run data")) {
+                    ImGui::OpenPopup(
+                        "Remove all data from this run?");
+                }
+                ImGui::EndDisabled();
+                if (ImGui::BeginPopupModal(
+                        "Remove all data from this run?", nullptr,
+                        ImGuiWindowFlags_AlwaysAutoResize)) {
+                    ImGui::TextWrapped(
+                        "Remove every telemetry link from %s? "
+                        "The source files on disk will not be deleted.",
+                        run.label.c_str());
+                    if (ImGui::Button("Remove run data")) {
+                        const auto invalidated =
+                            invalidate_setup_knowledge_for_run(
+                                race_day_, run.id);
+                        race_day::clear_telemetry_sources(run);
+                        pending_race_day_relink_.reset();
+                        race_day_dirty_ = true;
+                        race_day_report_.reset();
+                        race_day_pending_knowledge_.reset();
+                        selected_setup_knowledge_record_ = -1;
+                        status_ = invalidated == 0
+                            ? "Removed all data from the selected run"
+                            : std::format(
+                                  "Removed all run data and {} outdated "
+                                  "comparison result(s)",
+                                  invalidated);
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel")) {
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::EndPopup();
+                }
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Before Run")) {
                 ImGui::TextWrapped(
                     "Record what the car is starting with. This is the context the Crew Chief needs before comparing runs.");
                 if (input_text_multiline_string(
-                    "Planned setup changes##setup", run.setup_changes, ImVec2(-1.0F, 86.0F))) race_day_dirty_ = true;
+                    "What did you change on the car?##setup", run.setup_changes, ImVec2(-1.0F, 86.0F))) race_day_dirty_ = true;
                 if (input_text_multiline_string(
-                    "Pre-run notes##pre", run.pre_run_notes, ImVec2(-1.0F, 76.0F))) race_day_dirty_ = true;
+                    "Anything to remember before the run?##pre", run.pre_run_notes, ImVec2(-1.0F, 76.0F))) race_day_dirty_ = true;
                 ImGui::SeparatorText("CHECKLIST");
                 for (auto& item : run.checklist) {
                     ImGui::PushID(item.id.c_str());
@@ -5462,20 +6550,26 @@ void NativeApp::draw_race_day() {
                 optional_double("Battery voltage", run.conditions.battery_voltage, "V", 0.1);
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Post-run feel")) {
+            if (ImGui::BeginTabItem("After Run")) {
                 ImGui::TextWrapped(
                     "Write what changed from the driver's seat: rotation, steering load, forward bite, braking, bumps, consistency, or tire feel.");
                 if (input_text_multiline_string(
-                    "Post-run notes##post", run.post_run_notes, ImVec2(-1.0F, 240.0F))) race_day_dirty_ = true;
+                    "How did the car feel?##post", run.post_run_notes, ImVec2(-1.0F, 240.0F))) race_day_dirty_ = true;
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
         }
+        draw_race_day_source_relink_popup();
         ImGui::PopID();
     }
     ImGui::EndChild();
+    if (compact_race_day) ImGui::EndTabItem();
+    }
 
-    ImGui::SameLine();
+    if (!compact_race_day) ImGui::SameLine();
+    const auto analysis_open =
+        !compact_race_day || ImGui::BeginTabItem("Compare Runs");
+    if (analysis_open) {
     ImGui::BeginChild("race-day-analysis", ImVec2(0.0F, -1.0F), ImGuiChildFlags_Borders);
     ImGui::SeparatorText("PREVIOUS RUN -> CURRENT RUN");
     ImGui::TextWrapped(
@@ -5505,6 +6599,13 @@ void NativeApp::draw_race_day() {
             race_day_current_run_, 0, static_cast<int>(race_day_.runs.size()) - 1))];
         ImGui::TextDisabled("Previous: %zu source(s) | Current: %zu source(s)",
             previous.telemetry_files.size(), current.telemetry_files.size());
+        if (!race_day::has_sanwa_csv(previous) ||
+            !race_day::has_sanwa_csv(current)) {
+            ImGui::TextColored(
+                ui::color(ui::ColorToken::Warning),
+                "Limited comparison: both runs need Sanwa data to "
+                "compare steering, throttle, and brake input.");
+        }
         if (current.setup_changes.empty()) {
             ImGui::TextColored(ImVec4(0.95F, 0.68F, 0.18F, 1.0F),
                 "Current run has no setup-change note yet.");
@@ -5526,7 +6627,10 @@ void NativeApp::draw_race_day() {
         }
         const auto& candidate =
             race_day_.runs[static_cast<std::size_t>(run_index)];
-        if (candidate.telemetry_files.empty()) return false;
+        if (!race_day::validate_telemetry_source_composition(
+                candidate, true).ok) {
+            return false;
+        }
         for (std::size_t source_index = 0;
              source_index < candidate.telemetry_files.size();
              ++source_index) {
@@ -5548,6 +6652,25 @@ void NativeApp::draw_race_day() {
     ImGui::BeginDisabled(!can_analyze);
     if (ImGui::Button("Analyze previous vs current", ImVec2(-1.0F, 38.0F))) analyze_race_day_runs();
     ImGui::EndDisabled();
+    if (!can_analyze) {
+        if (race_day_previous_run_ == race_day_current_run_) {
+            ImGui::TextColored(
+                ui::color(ui::ColorToken::Warning),
+                "Choose two different runs.");
+        } else if (!run_sources_ready(
+                       race_day_previous_run_)) {
+            ImGui::TextColored(
+                ui::color(ui::ColorToken::Warning),
+                "The previous run needs an available RaceBox, "
+                "VBO, GPX, or session archive.");
+        } else if (!run_sources_ready(
+                       race_day_current_run_)) {
+            ImGui::TextColored(
+                ui::color(ui::ColorToken::Warning),
+                "The current run needs an available RaceBox, "
+                "VBO, GPX, or session archive.");
+        }
+    }
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30F, 0.78F, 0.95F, 1.0F));
     ImGui::TextWrapped(
         "Privacy: this button sends generated aligned telemetry CSV plus these two runs' notes and conditions "
@@ -5801,6 +6924,10 @@ void NativeApp::draw_race_day() {
         }
     }
     ImGui::EndChild();
+    if (compact_race_day) ImGui::EndTabItem();
+    }
+    if (compact_race_day) ImGui::EndTabBar();
+    }
     ImGui::End();
 }
 

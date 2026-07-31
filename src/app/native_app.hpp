@@ -91,6 +91,18 @@ private:
         std::vector<std::filesystem::path> candidate_paths;
         std::vector<source_identity::SourceIdentity> candidate_identities;
         source_identity::MatchResult result;
+        bool open_popup{true};
+    };
+
+    struct PendingSessionImport {
+        std::vector<std::filesystem::path> files;
+        std::string recorded_at_utc;
+        std::string recorded_date;
+        std::string run_label;
+        race_day::RunKind kind{race_day::RunKind::Practice};
+        int destination_run{-1};
+        bool kind_locked{};
+        bool open_popup{true};
     };
 
     void draw_app_header();
@@ -109,12 +121,14 @@ private:
     void draw_annotations();
     void draw_crew_chief();
     void draw_race_day();
+    void draw_session_import_popup();
     void draw_reports();
     void draw_dev_notes();
     void draw_events_tab();
     void draw_sectors_tab();
     void poll_loader();
     void begin_load(const std::vector<std::filesystem::path>& files);
+    void start_session_import(int preferred_run = -1);
     void save_session();
     void save_active_lap();
     void export_active_lap();
@@ -126,7 +140,10 @@ private:
     void new_race_day();
     void open_race_day();
     void save_race_day(bool choose_path);
-    void attach_race_day_telemetry();
+    void attach_race_day_telemetry(std::size_t run_index);
+    void use_open_session_for_race_day_run(std::size_t run_index);
+    void commit_session_import();
+    void reset_session_import_destination();
     void begin_race_day_source_relink(std::size_t source_index);
     void draw_race_day_source_relink_popup();
     void analyze_race_day_runs();
@@ -166,6 +183,13 @@ private:
     std::filesystem::path pending_vbo_;
     std::filesystem::path pending_racebox_csv_;
     std::filesystem::path pending_sanwa_csv_;
+    std::vector<std::filesystem::path> active_load_files_;
+    std::vector<std::filesystem::path> current_session_source_files_;
+    std::vector<std::filesystem::path> session_import_files_;
+    bool session_import_requested_{};
+    int session_import_preferred_run_{-1};
+    std::optional<PendingSessionImport> pending_session_import_;
+    std::string session_import_error_;
     std::optional<Session> session_;
     std::string status_{"Open any VBO, RaceBox CSV, GPX, session archive, or Sanwa file."};
     std::string error_;
@@ -238,6 +262,7 @@ private:
     int race_day_current_run_{1};
     int race_day_main_group_{};
     int race_day_main_legs_{};
+    int race_day_detail_run_seen_{-1};
     bool race_day_include_q4_{};
     bool race_day_triple_a_{};
     bool race_day_dirty_{};

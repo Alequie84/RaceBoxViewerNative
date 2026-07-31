@@ -36,6 +36,14 @@ powershell -ExecutionPolicy Bypass -File C:\CodexProjects\RaceBoxViewerNative\sc
 
 The root `VERSION` file is the single release-version source. Version 2 starts at `2.0.0.001` and keeps a three-digit release suffix (`2.0.0.002`, `2.0.0.003`, ...); `scripts\bump-version.ps1` advances it, and packaging retains earlier numbered ZIPs.
 
+Interactive **File > Import session** is intentionally different from the
+toolbox launcher. It asks whether a loaded recording was Practice, Qualifying,
+or Race and adds it to Race Day with the detected UTC time and local event
+date. Each selection is self-contained and cannot reuse a file from the
+previously opened run. The toolbox passes
+the golden files on the command line, which remains non-interactive so startup
+and automated review are never blocked by the classification prompt.
+
 Existing specialized scripts remain authoritative:
 
 - `scripts/package.ps1`: install and create the racer-facing portable ZIP.

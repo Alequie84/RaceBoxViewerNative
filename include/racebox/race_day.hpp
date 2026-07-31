@@ -56,6 +56,9 @@ struct Run {
     int ordinal{};
     char main_group{'A'};
     int main_leg{};
+    // Optional ISO-8601 UTC recording time entered or derived by the caller.
+    // Kept as bounded text so older Race Day files remain compatible.
+    std::string recorded_at_utc;
     std::vector<std::filesystem::path> telemetry_files;
     // Parallel to telemetry_files. Version-3 Race Day files retain only the
     // basename, byte size, timestamp, and optional caller-provided fingerprint
@@ -206,9 +209,62 @@ struct Day {
 Run& add_practice(Day& day);
 Run& add_qualifying(Day& day);
 std::vector<std::size_t> add_main_group(Day& day, char group, int legs);
+// Adds a generic Race/Main entry that is not tied to an A/B/C/D main leg.
+// Its stable ID is unique across every run in the day.
+Run& add_race(Day& day, std::string label = {});
 Run& add_custom(Day& day, std::string label);
 
 [[nodiscard]] const char* kind_name(RunKind kind) noexcept;
+
+enum class TelemetrySourceKind {
+    Vbo,
+    RaceBoxCsv,
+    SanwaCsv,
+    Gpx,
+    NativeArchive,
+    Unsupported,
+};
+
+[[nodiscard]] TelemetrySourceKind telemetry_source_kind(
+    const std::filesystem::path& path);
+[[nodiscard]] const char* telemetry_source_kind_name(
+    TelemetrySourceKind kind) noexcept;
+
+struct AttachSourcesResult {
+    bool ok{};
+    std::size_t added{};
+    std::size_t replaced{};
+    std::string error;
+};
+
+struct TelemetrySourceValidation {
+    bool ok{};
+    bool has_primary{};
+    std::string error;
+};
+
+// Validates logical source roles without parsing telemetry. It rejects legacy
+// combinations that a loader would otherwise have to resolve silently.
+[[nodiscard]] TelemetrySourceValidation
+validate_telemetry_source_composition(
+    const Run& run,
+    bool require_primary = false);
+
+// Validates the complete selection before changing the run. A selected source
+// replaces an existing source of the same logical kind and receives a fresh
+// persisted identity. Native archives are exclusive; GPX cannot be mixed with
+// VBO/RaceBox CSV primary telemetry.
+[[nodiscard]] AttachSourcesResult attach_or_replace_telemetry_sources(
+    Run& run,
+    std::span<const std::filesystem::path> paths);
+
+// These operations keep telemetry_files and telemetry_source_identities
+// index-parallel even for older in-memory callers that did not supply
+// identities.
+[[nodiscard]] bool remove_telemetry_source(
+    Run& run, std::size_t source_index);
+void clear_telemetry_sources(Run& run) noexcept;
+
 [[nodiscard]] bool has_racebox_csv(const Run& run);
 [[nodiscard]] bool has_sanwa_csv(const Run& run);
 [[nodiscard]] bool has_primary_telemetry(const Run& run);

@@ -9,8 +9,11 @@ calibration, IMU analysis, or deterministic insight formulas.
 The Windows release is `RaceBoxTelemetryViewer.exe`. Its guided shell exposes
 five driver-facing workspaces:
 
-1. **Race Day** — event/run planning, pre-run checklist, setup and conditions,
-   post-run notes, tire history, and previous/current setup analysis.
+1. **Race Day** — isolated unified session import and Practice/Qualifying/Race
+   classification, canonical UTC recording time plus its local event date,
+   responsive Runs/Selected Run/Compare Runs navigation, per-run source management,
+   pre-run checklist, setup and conditions, post-run notes, tire history, and
+   previous/current setup analysis.
 2. **Session** — the normal map, playback, lap list, telemetry, events, sectors,
    notes, and annotations.
 3. **Compare** — Reference plus Compare A, with optional Compare B and an
@@ -88,6 +91,10 @@ work should implement adapters behind the existing contracts instead of adding
 - Race Day version 3 stores privacy-bounded source identities beside local
   relative paths. The identity contains basename, size, timestamp, and an
   optional algorithm-tagged fingerprint—never telemetry contents.
+- A run also stores its detected UTC recording time. Interactive session import
+  classifies the loaded recording and assigns it to a Race Day slot; source
+  updates are validated and staged atomically so duplicate types, mixed
+  archives, or a failed replacement cannot partially alter the event book.
 - Source repair distinguishes **Exact**, **Probable**, **Ambiguous**, and
   **Missing**. Only one unique exact fingerprint may relink automatically;
   probable or ambiguous choices require the driver to confirm.

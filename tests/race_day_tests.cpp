@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -173,8 +174,382 @@ int main() {
                 "Single B Main was not created");
         require(racebox::race_day::add_main_group(day, 'B', 1).empty(),
                 "Duplicate main group was not rejected");
+        const auto first_generic_race_id =
+            racebox::race_day::add_race(day).id;
+        const auto second_generic_race_id =
+            racebox::race_day::add_race(day).id;
+        require(first_generic_race_id != second_generic_race_id,
+                "Repeated generic races received duplicate IDs");
+        const auto first_generic_race = std::find_if(
+            day.runs.begin(), day.runs.end(),
+            [&](const auto& run) {
+                return run.id == first_generic_race_id;
+            });
+        const auto second_generic_race = std::find_if(
+            day.runs.begin(), day.runs.end(),
+            [&](const auto& run) {
+                return run.id == second_generic_race_id;
+            });
+        require(first_generic_race != day.runs.end() &&
+                    second_generic_race != day.runs.end() &&
+                    first_generic_race->kind ==
+                        racebox::race_day::RunKind::Main &&
+                    second_generic_race->kind ==
+                        racebox::race_day::RunKind::Main &&
+                    first_generic_race->main_leg == 0 &&
+                    second_generic_race->main_leg == 0,
+                "Generic race entries did not retain valid Main metadata");
+
+        const auto temporary_root = std::filesystem::temp_directory_path();
+        const auto managed_vbo_a =
+            temporary_root / L"racebox-managed-source-a.vbo";
+        const auto managed_vbo_b =
+            temporary_root / L"racebox-managed-source-b.vbo";
+        const auto managed_racebox_csv =
+            temporary_root / L"racebox-managed-source.csv";
+        const auto managed_sanwa_csv =
+            temporary_root / L"racebox-managed-sanwa.csv";
+        const auto managed_gpx =
+            temporary_root / L"racebox-managed-source.gpx";
+        const auto managed_archive =
+            temporary_root / L"racebox-managed-source.rbxsession";
+        const auto managed_unsupported =
+            temporary_root / L"racebox-managed-source.txt";
+        const auto managed_missing =
+            temporary_root / L"racebox-managed-missing.vbo";
+        const auto write_fixture = [](const std::filesystem::path& path,
+                                      std::string_view contents) {
+            std::ofstream output(path, std::ios::binary | std::ios::trunc);
+            output << contents;
+            if (!output) throw std::runtime_error(
+                "Could not write managed-source fixture");
+        };
+        write_fixture(managed_vbo_a, "vbo recording A");
+        write_fixture(managed_vbo_b, "different vbo recording B");
+        write_fixture(
+            managed_racebox_csv,
+            "Timestamp,Lap,Speed,GForceX,GForceY\n");
+        write_fixture(
+            managed_sanwa_csv,
+            "REC TIME,ST(%),TH(%),RPM\n");
+        write_fixture(managed_gpx, "<gpx></gpx>");
+        write_fixture(managed_archive, "native archive fixture");
+        write_fixture(managed_unsupported, "unsupported fixture");
+        std::error_code fixture_cleanup_error;
+        std::filesystem::remove(
+            managed_missing, fixture_cleanup_error);
+
+        using racebox::race_day::TelemetrySourceKind;
+        require(racebox::race_day::telemetry_source_kind(managed_vbo_a) ==
+                    TelemetrySourceKind::Vbo,
+                "VBO source classification failed");
+        require(racebox::race_day::telemetry_source_kind(
+                    managed_racebox_csv) ==
+                    TelemetrySourceKind::RaceBoxCsv,
+                "RaceBox CSV source classification failed");
+        require(racebox::race_day::telemetry_source_kind(
+                    managed_sanwa_csv) ==
+                    TelemetrySourceKind::SanwaCsv,
+                "Sanwa CSV source classification failed");
+        require(racebox::race_day::telemetry_source_kind(managed_gpx) ==
+                    TelemetrySourceKind::Gpx,
+                "GPX source classification failed");
+        require(racebox::race_day::telemetry_source_kind(managed_archive) ==
+                    TelemetrySourceKind::NativeArchive,
+                "Native archive source classification failed");
+        require(racebox::race_day::telemetry_source_kind(
+                    managed_unsupported) ==
+                    TelemetrySourceKind::Unsupported,
+                "Unsupported source classification failed");
+
+        racebox::race_day::Run sanwa_only;
+        std::vector<std::filesystem::path> selected_sources{
+            managed_sanwa_csv};
+        auto attachment =
+            racebox::race_day::attach_or_replace_telemetry_sources(
+                sanwa_only, selected_sources);
+        require(attachment.ok && attachment.added == 1 &&
+                    attachment.replaced == 0,
+                "Sanwa attachment failed");
+        require(!racebox::race_day::has_primary_telemetry(sanwa_only),
+                "Sanwa-only run was incorrectly treated as primary telemetry");
+        const auto optional_sanwa_composition =
+            racebox::race_day::validate_telemetry_source_composition(
+                sanwa_only);
+        const auto required_sanwa_composition =
+            racebox::race_day::validate_telemetry_source_composition(
+                sanwa_only, true);
+        require(optional_sanwa_composition.ok &&
+                    !optional_sanwa_composition.has_primary &&
+                    !required_sanwa_composition.ok,
+                "Source composition did not distinguish optional controls from required primary telemetry");
+
+        racebox::race_day::Run managed_run;
+        selected_sources = {
+            managed_vbo_a, managed_racebox_csv, managed_sanwa_csv};
+        attachment =
+            racebox::race_day::attach_or_replace_telemetry_sources(
+                managed_run, selected_sources);
+        require(attachment.ok && attachment.added == 3 &&
+                    attachment.replaced == 0,
+                "Initial multi-source attachment failed");
+        require(managed_run.telemetry_files.size() == 3 &&
+                    managed_run.telemetry_source_identities.size() == 3,
+                "Attached path/identity vectors are not parallel");
+        require(racebox::race_day::has_primary_telemetry(managed_run) &&
+                    racebox::race_day::has_racebox_csv(managed_run) &&
+                    racebox::race_day::has_sanwa_csv(managed_run),
+                "Attached telemetry roles were not detected");
+        const auto complete_composition =
+            racebox::race_day::validate_telemetry_source_composition(
+                managed_run, true);
+        require(complete_composition.ok &&
+                    complete_composition.has_primary,
+                "Valid VBO/RaceBox/Sanwa composition was rejected");
+        const auto initial_vbo = std::find_if(
+            managed_run.telemetry_files.begin(),
+            managed_run.telemetry_files.end(),
+            [](const auto& path) {
+                return racebox::race_day::telemetry_source_kind(path) ==
+                    TelemetrySourceKind::Vbo;
+            });
+        const auto initial_sanwa = std::find_if(
+            managed_run.telemetry_files.begin(),
+            managed_run.telemetry_files.end(),
+            [](const auto& path) {
+                return racebox::race_day::telemetry_source_kind(path) ==
+                    TelemetrySourceKind::SanwaCsv;
+            });
+        require(initial_vbo != managed_run.telemetry_files.end() &&
+                    initial_sanwa != managed_run.telemetry_files.end(),
+                "Initial managed sources could not be located");
+        const auto initial_vbo_index = static_cast<std::size_t>(
+            std::distance(managed_run.telemetry_files.begin(), initial_vbo));
+        const auto initial_sanwa_index = static_cast<std::size_t>(
+            std::distance(managed_run.telemetry_files.begin(), initial_sanwa));
+        const auto old_vbo_fingerprint =
+            managed_run.telemetry_source_identities[initial_vbo_index]
+                .content_fingerprint;
+        const auto old_sanwa_fingerprint =
+            managed_run.telemetry_source_identities[initial_sanwa_index]
+                .content_fingerprint;
+
+        selected_sources = {managed_vbo_b};
+        attachment =
+            racebox::race_day::attach_or_replace_telemetry_sources(
+                managed_run, selected_sources);
+        require(attachment.ok && attachment.added == 0 &&
+                    attachment.replaced == 1,
+                "Same-kind VBO replacement was not reported");
+        const auto replacement_vbo = std::find_if(
+            managed_run.telemetry_files.begin(),
+            managed_run.telemetry_files.end(),
+            [](const auto& path) {
+                return racebox::race_day::telemetry_source_kind(path) ==
+                    TelemetrySourceKind::Vbo;
+            });
+        require(replacement_vbo != managed_run.telemetry_files.end() &&
+                    *replacement_vbo == managed_vbo_b,
+                "Replacement VBO path was not installed");
+        const auto replacement_vbo_index = static_cast<std::size_t>(
+            std::distance(
+                managed_run.telemetry_files.begin(), replacement_vbo));
+        require(
+            managed_run.telemetry_source_identities[replacement_vbo_index]
+                    .content_fingerprint != old_vbo_fingerprint,
+            "Replacement VBO retained the old source fingerprint");
+        const auto replacement_sanwa = std::find_if(
+            managed_run.telemetry_files.begin(),
+            managed_run.telemetry_files.end(),
+            [](const auto& path) {
+                return racebox::race_day::telemetry_source_kind(path) ==
+                    TelemetrySourceKind::SanwaCsv;
+            });
+        require(replacement_sanwa != managed_run.telemetry_files.end(),
+                "Replacing VBO removed the Sanwa source");
+        const auto replacement_sanwa_index = static_cast<std::size_t>(
+            std::distance(
+                managed_run.telemetry_files.begin(), replacement_sanwa));
+        require(
+            managed_run.telemetry_source_identities[replacement_sanwa_index]
+                    .content_fingerprint == old_sanwa_fingerprint,
+            "Replacing VBO changed an unrelated Sanwa identity");
+
+        const auto racebox_source = std::find_if(
+            managed_run.telemetry_files.begin(),
+            managed_run.telemetry_files.end(),
+            [](const auto& path) {
+                return racebox::race_day::telemetry_source_kind(path) ==
+                    TelemetrySourceKind::RaceBoxCsv;
+            });
+        require(racebox_source != managed_run.telemetry_files.end(),
+                "RaceBox source could not be located for removal");
+        const auto racebox_source_index = static_cast<std::size_t>(
+            std::distance(
+                managed_run.telemetry_files.begin(), racebox_source));
+        require(racebox::race_day::remove_telemetry_source(
+                    managed_run, racebox_source_index),
+                "Removing one telemetry source failed");
+        require(!racebox::race_day::has_racebox_csv(managed_run) &&
+                    managed_run.telemetry_files.size() ==
+                        managed_run.telemetry_source_identities.size(),
+                "Removing one source broke source identity pairing");
+        const auto before_invalid_remove = managed_run.telemetry_files;
+        require(!racebox::race_day::remove_telemetry_source(
+                    managed_run, 999),
+                "Out-of-range source removal unexpectedly succeeded");
+        require(managed_run.telemetry_files == before_invalid_remove,
+                "Out-of-range removal changed the run");
+
+        const auto before_atomic_rejection = managed_run.telemetry_files;
+        selected_sources = {managed_gpx, managed_missing};
+        attachment =
+            racebox::race_day::attach_or_replace_telemetry_sources(
+                managed_run, selected_sources);
+        require(!attachment.ok &&
+                    managed_run.telemetry_files == before_atomic_rejection,
+                "Missing source partially changed the run");
+        selected_sources = {managed_gpx, managed_unsupported};
+        attachment =
+            racebox::race_day::attach_or_replace_telemetry_sources(
+                managed_run, selected_sources);
+        require(!attachment.ok &&
+                    managed_run.telemetry_files == before_atomic_rejection,
+                "Unsupported selection partially changed the run");
+        selected_sources = {managed_vbo_a, managed_vbo_b};
+        attachment =
+            racebox::race_day::attach_or_replace_telemetry_sources(
+                managed_run, selected_sources);
+        require(!attachment.ok &&
+                    managed_run.telemetry_files == before_atomic_rejection,
+                "Duplicate logical source kinds were not rejected atomically");
+        selected_sources = {managed_gpx, managed_vbo_a};
+        attachment =
+            racebox::race_day::attach_or_replace_telemetry_sources(
+                managed_run, selected_sources);
+        require(!attachment.ok &&
+                    managed_run.telemetry_files == before_atomic_rejection,
+                "GPX/VBO mixing was not rejected atomically");
+        selected_sources = {managed_archive, managed_sanwa_csv};
+        attachment =
+            racebox::race_day::attach_or_replace_telemetry_sources(
+                managed_run, selected_sources);
+        require(!attachment.ok &&
+                    managed_run.telemetry_files == before_atomic_rejection,
+                "Archive/raw mixing was not rejected atomically");
+
+        racebox::race_day::Run duplicate_composition;
+        duplicate_composition.telemetry_files = {
+            managed_vbo_a, managed_vbo_b};
+        require(!racebox::race_day::
+                    validate_telemetry_source_composition(
+                        duplicate_composition, true).ok,
+                "Duplicate source kinds passed composition validation");
+        racebox::race_day::Run archive_mixed_composition;
+        archive_mixed_composition.telemetry_files = {
+            managed_archive, managed_sanwa_csv};
+        require(!racebox::race_day::
+                    validate_telemetry_source_composition(
+                        archive_mixed_composition, true).ok,
+                "Archive/raw sources passed composition validation");
+        racebox::race_day::Run gpx_mixed_composition;
+        gpx_mixed_composition.telemetry_files = {
+            managed_gpx, managed_vbo_a};
+        require(!racebox::race_day::
+                    validate_telemetry_source_composition(
+                        gpx_mixed_composition, true).ok,
+                "GPX/VBO sources passed composition validation");
+        auto invalid_loader_rejected = false;
+        try {
+            (void)racebox::race_day::load_run_telemetry(
+                gpx_mixed_composition);
+        } catch (const std::runtime_error&) {
+            invalid_loader_rejected = true;
+        }
+        require(invalid_loader_rejected,
+                "Race Day loader did not reject an invalid source composition");
+
+        selected_sources = {managed_archive};
+        attachment =
+            racebox::race_day::attach_or_replace_telemetry_sources(
+                managed_run, selected_sources);
+        require(attachment.ok && attachment.replaced == 1 &&
+                    managed_run.telemetry_files.size() == 1 &&
+                    racebox::race_day::telemetry_source_kind(
+                        managed_run.telemetry_files.front()) ==
+                         TelemetrySourceKind::NativeArchive,
+                "Incoming native archive did not replace raw sources");
+        const auto archive_only_sources =
+            managed_run.telemetry_files;
+        selected_sources = {managed_sanwa_csv};
+        attachment =
+            racebox::race_day::attach_or_replace_telemetry_sources(
+                managed_run, selected_sources);
+        require(!attachment.ok &&
+                    managed_run.telemetry_files ==
+                        archive_only_sources &&
+                    racebox::race_day::has_primary_telemetry(
+                        managed_run),
+                "Supplemental-only input erased the native archive");
+        selected_sources = {managed_vbo_a, managed_sanwa_csv};
+        attachment =
+            racebox::race_day::attach_or_replace_telemetry_sources(
+                managed_run, selected_sources);
+        require(attachment.ok && attachment.replaced == 1 &&
+                    attachment.added == 1 &&
+                    managed_run.telemetry_files.size() == 2 &&
+                    racebox::race_day::has_primary_telemetry(managed_run) &&
+                    racebox::race_day::has_sanwa_csv(managed_run),
+                "Incoming raw sources did not replace the native archive");
+        selected_sources = {managed_gpx};
+        attachment =
+            racebox::race_day::attach_or_replace_telemetry_sources(
+                managed_run, selected_sources);
+        require(attachment.ok &&
+                    std::none_of(
+                        managed_run.telemetry_files.begin(),
+                        managed_run.telemetry_files.end(),
+                        [](const auto& path) {
+                            const auto kind =
+                                racebox::race_day::telemetry_source_kind(
+                                    path);
+                            return kind == TelemetrySourceKind::Vbo ||
+                                kind ==
+                                    TelemetrySourceKind::RaceBoxCsv;
+                        }) &&
+                    racebox::race_day::has_sanwa_csv(managed_run),
+                "Incoming GPX did not replace incompatible primary sources");
+        selected_sources = {managed_vbo_a};
+        attachment =
+            racebox::race_day::attach_or_replace_telemetry_sources(
+                managed_run, selected_sources);
+        require(attachment.ok &&
+                    std::none_of(
+                        managed_run.telemetry_files.begin(),
+                        managed_run.telemetry_files.end(),
+                        [](const auto& path) {
+                            return racebox::race_day::telemetry_source_kind(
+                                       path) ==
+                                TelemetrySourceKind::Gpx;
+                        }),
+                "Incoming VBO did not replace the GPX source");
+        managed_run.recorded_at_utc =
+            "2026-07-11T21:54:00.040Z";
+        racebox::race_day::clear_telemetry_sources(managed_run);
+        require(managed_run.telemetry_files.empty() &&
+                    managed_run.telemetry_source_identities.empty() &&
+                    managed_run.recorded_at_utc.empty(),
+                "Clearing telemetry sources did not clear recording metadata");
+        sanwa_only.recorded_at_utc =
+            "2026-07-11T21:54:00.040Z";
+        require(racebox::race_day::remove_telemetry_source(
+                    sanwa_only, 0) &&
+                    sanwa_only.telemetry_files.empty() &&
+                    sanwa_only.recorded_at_utc.empty(),
+                "Removing the final source retained a stale recording timestamp");
 
         auto& current = day.runs[1];
+        current.recorded_at_utc = "2026-07-11T21:54:00.040Z";
         current.conditions.tire_set_id = "Set 3";
         current.conditions.tire_runs_before = 4;
         current.conditions.sauce_compound = "Yellow";
@@ -274,11 +649,29 @@ int main() {
         require(racebox::race_day::load(path, restored, error), error.c_str());
         std::error_code ignored;
         require(restored.runs.size() == day.runs.size(), "Race-day run count did not round trip");
+        const auto restored_first_race = std::find_if(
+            restored.runs.begin(), restored.runs.end(),
+            [&](const auto& run) {
+                return run.id == first_generic_race_id;
+            });
+        const auto restored_second_race = std::find_if(
+            restored.runs.begin(), restored.runs.end(),
+            [&](const auto& run) {
+                return run.id == second_generic_race_id;
+            });
+        require(restored_first_race != restored.runs.end() &&
+                    restored_second_race != restored.runs.end() &&
+                    restored_first_race->main_leg == 0 &&
+                    restored_second_race->main_leg == 0,
+                "Repeated generic races did not survive save/load");
         require(restored.runs[1].conditions.tire_runs_before == 4, "Tire run count did not persist");
         require(restored.runs[1].conditions.tire_warmer_temperature_c == 60.0,
                 "Tire warmer temperature did not persist");
         require(restored.runs[1].checklist.front().checked, "Checklist state did not persist");
         require(restored.runs[1].setup_changes == current.setup_changes, "Setup changes did not persist");
+        require(restored.runs[1].recorded_at_utc ==
+                    current.recorded_at_utc,
+                "Run recording timestamp did not persist");
         require(restored.runs[1].telemetry_source_identities.size() == 1,
                 "Race Day v3 source identity did not persist");
         const auto expected_filename_u8 =
@@ -323,6 +716,9 @@ int main() {
             saved >> legacy;
             legacy["version"] = 1;
             legacy.erase("setup_knowledge");
+            for (auto& legacy_run : legacy["runs"]) {
+                legacy_run.erase("recorded_at_utc");
+            }
             std::ofstream output(legacy_path, std::ios::binary | std::ios::trunc);
             output << legacy.dump(2);
         }
@@ -331,9 +727,18 @@ int main() {
                 "Version-1 race-day files lost backward compatibility");
         require(legacy_restored.setup_knowledge.empty(),
                 "Version-1 race-day file unexpectedly created setup knowledge");
+        require(legacy_restored.runs[1].recorded_at_utc.empty(),
+                "Version-1 race-day file invented a recording timestamp");
         std::filesystem::remove(path, ignored);
         std::filesystem::remove(legacy_path, ignored);
         std::filesystem::remove(identity_source, ignored);
+        std::filesystem::remove(managed_vbo_a, ignored);
+        std::filesystem::remove(managed_vbo_b, ignored);
+        std::filesystem::remove(managed_racebox_csv, ignored);
+        std::filesystem::remove(managed_sanwa_csv, ignored);
+        std::filesystem::remove(managed_gpx, ignored);
+        std::filesystem::remove(managed_archive, ignored);
+        std::filesystem::remove(managed_unsupported, ignored);
 
         const auto session = synthetic_session();
         const auto imu = racebox::imu::analyze(session.telemetry);

@@ -1007,6 +1007,25 @@ std::vector<std::size_t> add_main_group(Day& day, char group, int legs) {
     return added;
 }
 
+Run& add_race(Day& day, std::string label) {
+    auto ordinal = next_ordinal(day, RunKind::Main);
+    auto id = run_id("race", ordinal);
+    while (std::any_of(
+        day.runs.begin(), day.runs.end(),
+        [&](const Run& run) { return run.id == id; })) {
+        ++ordinal;
+        id = run_id("race", ordinal);
+    }
+    if (label.empty()) label = "Race " + std::to_string(ordinal);
+    auto run = make_run(
+        std::move(id), bounded(std::move(label), 120),
+        RunKind::Main, ordinal);
+    run.main_group = 'A';
+    run.main_leg = 0;
+    day.runs.push_back(std::move(run));
+    return day.runs.back();
+}
+
 Run& add_custom(Day& day, std::string label) {
     const auto ordinal = next_ordinal(day, RunKind::Custom);
     if (label.empty()) label = "Run " + std::to_string(ordinal);
@@ -1025,23 +1044,305 @@ const char* kind_name(RunKind kind) noexcept {
     return "Custom";
 }
 
+TelemetrySourceKind telemetry_source_kind(
+    const std::filesystem::path& path) {
+    const auto extension = lower_extension(path);
+    if (extension == L".vbo") return TelemetrySourceKind::Vbo;
+    if (extension == L".csv") {
+        return contains_sanwa_header(path)
+            ? TelemetrySourceKind::SanwaCsv
+            : TelemetrySourceKind::RaceBoxCsv;
+    }
+    if (extension == L".gpx") return TelemetrySourceKind::Gpx;
+    if (extension == L".rbxsession" || extension == L".rbxlap") {
+        return TelemetrySourceKind::NativeArchive;
+    }
+    return TelemetrySourceKind::Unsupported;
+}
+
+const char* telemetry_source_kind_name(
+    TelemetrySourceKind kind) noexcept {
+    switch (kind) {
+        case TelemetrySourceKind::Vbo: return "VBO";
+        case TelemetrySourceKind::RaceBoxCsv: return "RaceBox CSV";
+        case TelemetrySourceKind::SanwaCsv: return "Sanwa CSV";
+        case TelemetrySourceKind::Gpx: return "GPX";
+        case TelemetrySourceKind::NativeArchive: return "native archive";
+        case TelemetrySourceKind::Unsupported: return "unsupported";
+    }
+    return "unsupported";
+}
+
+TelemetrySourceValidation validate_telemetry_source_composition(
+    const Run& run,
+    bool require_primary) {
+    TelemetrySourceValidation result;
+    std::vector<TelemetrySourceKind> kinds;
+    kinds.reserve(run.telemetry_files.size());
+    for (const auto& path : run.telemetry_files) {
+        const auto kind = telemetry_source_kind(path);
+        if (kind == TelemetrySourceKind::Unsupported) {
+            result.error = "Run contains an unsupported telemetry source: " +
+                path_to_utf8(path.filename());
+            return result;
+        }
+        if (std::find(kinds.begin(), kinds.end(), kind) != kinds.end()) {
+            result.error = std::string("Run contains more than one ") +
+                telemetry_source_kind_name(kind) + " source";
+            return result;
+        }
+        kinds.push_back(kind);
+        result.has_primary = result.has_primary ||
+            kind == TelemetrySourceKind::Vbo ||
+            kind == TelemetrySourceKind::RaceBoxCsv ||
+            kind == TelemetrySourceKind::Gpx ||
+            kind == TelemetrySourceKind::NativeArchive;
+    }
+
+    const auto has = [&](TelemetrySourceKind kind) {
+        return std::find(kinds.begin(), kinds.end(), kind) != kinds.end();
+    };
+    if (has(TelemetrySourceKind::NativeArchive) && kinds.size() != 1) {
+        result.error =
+            "A native session archive cannot be mixed with other telemetry sources";
+        return result;
+    }
+    if (has(TelemetrySourceKind::Gpx) &&
+        (has(TelemetrySourceKind::Vbo) ||
+         has(TelemetrySourceKind::RaceBoxCsv))) {
+        result.error =
+            "GPX cannot be mixed with VBO or RaceBox CSV telemetry";
+        return result;
+    }
+    if (require_primary && !result.has_primary) {
+        result.error =
+            "Run needs a VBO, RaceBox CSV, GPX, or native session archive";
+        return result;
+    }
+    result.ok = true;
+    return result;
+}
+
+AttachSourcesResult attach_or_replace_telemetry_sources(
+    Run& run,
+    std::span<const std::filesystem::path> paths) {
+    AttachSourcesResult result;
+    if (paths.empty()) {
+        result.ok = true;
+        return result;
+    }
+    if (paths.size() > 8) {
+        result.error = "A run can contain at most 8 telemetry sources";
+        return result;
+    }
+
+    struct IncomingSource {
+        std::filesystem::path path;
+        TelemetrySourceKind kind{TelemetrySourceKind::Unsupported};
+        source_identity::SourceIdentity identity;
+    };
+    std::vector<IncomingSource> incoming;
+    incoming.reserve(paths.size());
+    std::vector<TelemetrySourceKind> selected_kinds;
+    selected_kinds.reserve(paths.size());
+    for (const auto& path : paths) {
+        std::error_code file_error;
+        if (path.empty() ||
+            !std::filesystem::is_regular_file(path, file_error) ||
+            file_error) {
+            result.error = "Selected telemetry source is missing or is not a file";
+            return result;
+        }
+        const auto kind = telemetry_source_kind(path);
+        if (kind == TelemetrySourceKind::Unsupported) {
+            result.error = "Unsupported telemetry source: " +
+                path_to_utf8(path.filename());
+            return result;
+        }
+        if (std::find(selected_kinds.begin(), selected_kinds.end(), kind) !=
+            selected_kinds.end()) {
+            result.error = std::string("Select only one ") +
+                telemetry_source_kind_name(kind) + " source at a time";
+            return result;
+        }
+        selected_kinds.push_back(kind);
+        incoming.push_back({path, kind, identity_for_path(path)});
+    }
+
+    const auto selected_has = [&](TelemetrySourceKind kind) {
+        return std::find(selected_kinds.begin(), selected_kinds.end(), kind) !=
+            selected_kinds.end();
+    };
+    const auto selected_archive =
+        selected_has(TelemetrySourceKind::NativeArchive);
+    if (selected_archive && incoming.size() != 1) {
+        result.error =
+            "A native session archive must be the only selected source";
+        return result;
+    }
+    const auto selected_gpx = selected_has(TelemetrySourceKind::Gpx);
+    const auto selected_vbo_or_racebox =
+        selected_has(TelemetrySourceKind::Vbo) ||
+        selected_has(TelemetrySourceKind::RaceBoxCsv);
+    if (selected_gpx && selected_vbo_or_racebox) {
+        result.error =
+            "GPX cannot be mixed with VBO or RaceBox CSV telemetry";
+        return result;
+    }
+    const auto existing_archive = std::any_of(
+        run.telemetry_files.begin(), run.telemetry_files.end(),
+        [](const auto& path) {
+            return telemetry_source_kind(path) ==
+                TelemetrySourceKind::NativeArchive;
+        });
+    if (existing_archive && !selected_archive &&
+        !selected_gpx && !selected_vbo_or_racebox) {
+        result.error =
+            "A native session archive is self-contained. Select new "
+            "primary telemetry together with supplemental files to "
+            "replace it.";
+        return result;
+    }
+
+    Run staged = run;
+    refresh_telemetry_source_identities(staged);
+
+    if (selected_archive) {
+        result.replaced = staged.telemetry_files.empty() ? 0 : 1;
+        result.added = staged.telemetry_files.empty() ? 1 : 0;
+        staged.telemetry_files = {incoming.front().path};
+        staged.telemetry_source_identities = {
+            std::move(incoming.front().identity)};
+    } else {
+        auto transition_replaced_source = false;
+        const auto erase_matching = [&](const auto& predicate) {
+            for (std::size_t index = staged.telemetry_files.size();
+                 index-- > 0;) {
+                if (!predicate(
+                        telemetry_source_kind(
+                            staged.telemetry_files[index]))) {
+                    continue;
+                }
+                staged.telemetry_files.erase(
+                    staged.telemetry_files.begin() +
+                    static_cast<std::ptrdiff_t>(index));
+                staged.telemetry_source_identities.erase(
+                    staged.telemetry_source_identities.begin() +
+                    static_cast<std::ptrdiff_t>(index));
+                transition_replaced_source = true;
+            }
+        };
+
+        // Raw files deliberately replace an existing all-in-one archive.
+        erase_matching([](TelemetrySourceKind kind) {
+            return kind == TelemetrySourceKind::NativeArchive;
+        });
+        if (selected_gpx) {
+            erase_matching([](TelemetrySourceKind kind) {
+                return kind == TelemetrySourceKind::Vbo ||
+                    kind == TelemetrySourceKind::RaceBoxCsv;
+            });
+        } else if (selected_vbo_or_racebox) {
+            erase_matching([](TelemetrySourceKind kind) {
+                return kind == TelemetrySourceKind::Gpx;
+            });
+        }
+
+        for (auto& selected : incoming) {
+            auto replaced_same_kind = false;
+            for (std::size_t index = staged.telemetry_files.size();
+                 index-- > 0;) {
+                if (telemetry_source_kind(staged.telemetry_files[index]) !=
+                    selected.kind) {
+                    continue;
+                }
+                staged.telemetry_files.erase(
+                    staged.telemetry_files.begin() +
+                    static_cast<std::ptrdiff_t>(index));
+                staged.telemetry_source_identities.erase(
+                    staged.telemetry_source_identities.begin() +
+                    static_cast<std::ptrdiff_t>(index));
+                replaced_same_kind = true;
+            }
+            if (replaced_same_kind || transition_replaced_source) {
+                ++result.replaced;
+                transition_replaced_source = false;
+            } else {
+                ++result.added;
+            }
+            staged.telemetry_files.push_back(std::move(selected.path));
+            staged.telemetry_source_identities.push_back(
+                std::move(selected.identity));
+        }
+    }
+
+    if (staged.telemetry_files.size() > 8) {
+        result.added = 0;
+        result.replaced = 0;
+        result.error = "A run can contain at most 8 telemetry sources";
+        return result;
+    }
+    const auto composition =
+        validate_telemetry_source_composition(staged);
+    if (!composition.ok) {
+        result.added = 0;
+        result.replaced = 0;
+        result.error = composition.error;
+        return result;
+    }
+
+    run.telemetry_files = std::move(staged.telemetry_files);
+    run.telemetry_source_identities =
+        std::move(staged.telemetry_source_identities);
+    result.ok = true;
+    return result;
+}
+
+bool remove_telemetry_source(
+    Run& run, std::size_t source_index) {
+    if (source_index >= run.telemetry_files.size()) return false;
+    Run staged = run;
+    refresh_telemetry_source_identities(staged);
+    staged.telemetry_files.erase(
+        staged.telemetry_files.begin() +
+        static_cast<std::ptrdiff_t>(source_index));
+    staged.telemetry_source_identities.erase(
+        staged.telemetry_source_identities.begin() +
+        static_cast<std::ptrdiff_t>(source_index));
+    run.telemetry_files = std::move(staged.telemetry_files);
+    run.telemetry_source_identities =
+        std::move(staged.telemetry_source_identities);
+    if (run.telemetry_files.empty()) run.recorded_at_utc.clear();
+    return true;
+}
+
+void clear_telemetry_sources(Run& run) noexcept {
+    run.telemetry_files.clear();
+    run.telemetry_source_identities.clear();
+    run.recorded_at_utc.clear();
+}
+
 bool has_racebox_csv(const Run& run) {
     return std::any_of(run.telemetry_files.begin(), run.telemetry_files.end(), [](const auto& path) {
-        return lower_extension(path) == L".csv" && !contains_sanwa_header(path);
+        return telemetry_source_kind(path) ==
+            TelemetrySourceKind::RaceBoxCsv;
     });
 }
 
 bool has_sanwa_csv(const Run& run) {
     return std::any_of(run.telemetry_files.begin(), run.telemetry_files.end(), [](const auto& path) {
-        return lower_extension(path) == L".csv" && contains_sanwa_header(path);
+        return telemetry_source_kind(path) ==
+            TelemetrySourceKind::SanwaCsv;
     });
 }
 
 bool has_primary_telemetry(const Run& run) {
     return std::any_of(run.telemetry_files.begin(), run.telemetry_files.end(), [](const auto& path) {
-        const auto extension = lower_extension(path);
-        return extension == L".vbo" || extension == L".gpx" || extension == L".rbxsession" ||
-               extension == L".rbxlap" || (extension == L".csv" && !contains_sanwa_header(path));
+        const auto kind = telemetry_source_kind(path);
+        return kind == TelemetrySourceKind::Vbo ||
+            kind == TelemetrySourceKind::RaceBoxCsv ||
+            kind == TelemetrySourceKind::Gpx ||
+            kind == TelemetrySourceKind::NativeArchive;
     });
 }
 
@@ -1130,6 +1431,7 @@ bool save(const Day& day, const std::filesystem::path& destination, std::string&
                 {"ordinal", run.ordinal},
                 {"main_group", std::string(1, run.main_group)},
                 {"main_leg", run.main_leg},
+                {"recorded_at_utc", bounded(run.recorded_at_utc, 40)},
                 {"telemetry_files", json::array()},
                 {"telemetry_sources", json::array()},
                 {"pre_run_notes", bounded(run.pre_run_notes, 16'000)},
@@ -1301,6 +1603,8 @@ bool load(const std::filesystem::path& source, Day& day, std::string& error) noe
             const auto group = value.value("main_group", std::string{"A"});
             run.main_group = group.empty() ? 'A' : static_cast<char>(std::toupper(static_cast<unsigned char>(group.front())));
             run.main_leg = std::clamp(value.value("main_leg", 0), 0, 3);
+            run.recorded_at_utc = bounded(
+                value.value("recorded_at_utc", std::string{}), 40);
             run.pre_run_notes = bounded(value.value("pre_run_notes", std::string{}), 16'000);
             run.setup_changes = bounded(value.value("setup_changes", std::string{}), 16'000);
             run.post_run_notes = bounded(value.value("post_run_notes", std::string{}), 16'000);
@@ -1543,6 +1847,9 @@ nlohmann::json build_prior_setup_results(
 
 LoadResult load_run_telemetry(const Run& run) {
     if (run.telemetry_files.empty()) throw std::runtime_error("No telemetry files are attached to this run");
+    const auto composition =
+        validate_telemetry_source_composition(run, true);
+    if (!composition.ok) throw std::runtime_error(composition.error);
     for (std::size_t index = 0; index < run.telemetry_files.size();
          ++index) {
         switch (telemetry_source_state(run, index, true)) {

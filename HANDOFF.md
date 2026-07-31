@@ -87,7 +87,7 @@ Outputs:
 - portable folder: `package\RaceBoxTelemetryViewer`
 - portable ZIP: `out\RaceBoxTelemetryViewer-<VERSION>-win64.zip`
 
-The executable accepts VBO, RaceBox CSV, and Sanwa CSV paths on its command line or through **File > Open telemetry**. Version 2 packages install all three golden files under `demo`, plus `Start RaceBox Demo.cmd`. When launched without file arguments, the packaged executable auto-loads that demo only if all three files exist; explicit user paths always take priority. Ordinary development builds have no adjacent `demo` folder and therefore still start empty unless the toolbox launcher supplies the three golden files.
+The executable accepts VBO, RaceBox CSV, and Sanwa CSV paths on its command line or through **File > Import session**. The interactive importer loads only the newly selected files, asks whether the recording was Practice, Qualifying, or Race, preserves its canonical UTC timestamp, derives the event's local calendar date from that recording, and offers the next empty matching Race Day slot or an existing slot. Command-line loading remains non-interactive for development/demo launchers. Version 2 packages install all three golden files under `demo`, plus `Start RaceBox Demo.cmd`. When launched without file arguments, the packaged executable auto-loads that demo only if all three files exist; explicit user paths always take priority. Ordinary development builds have no adjacent `demo` folder and therefore still start empty unless the toolbox launcher supplies the three golden files.
 
 ## Architecture and source ownership
 
@@ -190,7 +190,7 @@ Before saving `.rbxsession` or `.rbxlap`, the application serializes a versioned
 
 The archive manifest also persists the physical start/finish endpoints, map lock, east/north displacement, reference coordinate/pixel, metres-per-pixel, rotation, opacity, and the embedded background image. Loading an archive restores the workspace. Archive entries have realistic memory limits, telemetry/radio columns and time order are checked, lap indices and markers are bounded, and ZIP resources close on every failure path. Annotation review JSON can now be exported and imported independently; it requires an open matching session and stages the complete batch before committing, so malformed later pins cannot leave a partial import.
 
-Race Day v3 stores UTF-8 relative source paths plus basename, size, modified time, and an algorithm-tagged content fingerprint. An existing file that changed at the same path is not accepted or silently blessed during save. Missing or changed sources must be exactly matched or explicitly confirmed through **Find moved file / Review file** before loading or analysis; identities and plaintext `.writing` files are cleaned up safely on failure.
+Race Day v3 stores each run's detected UTC recording time plus UTF-8 relative source paths, basename, size, modified time, and an algorithm-tagged content fingerprint. The **Run Data** tab exposes named status rows and add/replace/remove/repair actions. Source changes are staged atomically, duplicate logical source types are rejected, native archives stay exclusive, and replacing one input captures a fresh identity without disturbing unrelated inputs. A Sanwa-only run is correctly labelled as controls-only and cannot be opened or analyzed until primary RaceBox/VBO/GPX/archive telemetry is present. An existing file that changed at the same path is not accepted or silently blessed during save. Missing or changed sources must be exactly matched or explicitly confirmed through **Find moved file / Review file** before loading or analysis; identities and plaintext `.writing` files are cleaned up safely on failure.
 
 ### Reorderable telemetry plots
 
@@ -350,8 +350,12 @@ without retaining all telemetry in memory. It supports P1-Pn, Q1-Qn (including
 Q4 trophy-race use), single/triple A/B/C/D mains, and custom runs. Each run
 stores a fillable pre-run checklist, planned changes, post-run driver feel,
 ambient/track temperature, tire set/compound/prior-run count, sauce/warmer
-preparation, battery context, and attached telemetry references. The selected
-run can be loaded into the normal viewer.
+preparation, battery context, detected recording time, and attached telemetry
+references. **Import Session Data** unifies normal telemetry loading with this
+event book: after parsing, it asks Practice/Qualifying/Race and assigns the
+recording to the next matching empty slot or a selected slot. The selected
+run's **Run Data** tab can also reuse the telemetry currently open or load that
+run back into the normal viewer.
 
 Race-day **Analyze previous vs current** is an explicit higher-disclosure action:
 the app loads both runs on a worker, produces two bounded
