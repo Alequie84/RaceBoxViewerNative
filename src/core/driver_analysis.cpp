@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <format>
 #include <iomanip>
 #include <limits>
 #include <numeric>
@@ -566,18 +567,30 @@ std::string formatted_value(double value, std::string_view unit) {
     return stream.str();
 }
 
-std::string insight_title(MetricKind kind, bool positive) {
+std::string plain_metric_change(MetricKind kind, double value) {
+    const auto magnitude = std::abs(value);
     switch (kind) {
-    case MetricKind::BrakePointDelta: return "Brake timing differs";
-    case MetricKind::TurnInDelta: return "Turn-in timing differs";
-    case MetricKind::ApexTimingDelta: return "Apex timing differs";
-    case MetricKind::MinimumSpeedDelta: return positive ? "Higher minimum corner speed" : "Minimum corner speed loss";
-    case MetricKind::ExitSpeedDelta: return positive ? "Stronger exit" : "Exit speed loss";
-    case MetricKind::ThrottlePickupDelta: return positive ? "Earlier throttle pickup" : "Throttle hesitation";
-    case MetricKind::EntryLineDeviation: return "Entry line wider";
-    case MetricKind::RelativeTimeChange: return positive ? "Reduced corner time loss" : "Corner time loss";
+    case MetricKind::BrakePointDelta:
+        return std::format("Braked {:.3f} s {} (brake point)", magnitude, value >= 0.0 ? "later" : "earlier");
+    case MetricKind::TurnInDelta:
+        return std::format("Started steering {:.3f} s {} (turn-in)", magnitude, value >= 0.0 ? "later" : "earlier");
+    case MetricKind::ApexTimingDelta:
+        return std::format("Reached the middle of the corner {:.3f} s {} (apex)", magnitude,
+            value >= 0.0 ? "later" : "earlier");
+    case MetricKind::MinimumSpeedDelta:
+        return std::format("Slowest corner speed was {:.1f} km/h {}", magnitude, value >= 0.0 ? "higher" : "lower");
+    case MetricKind::ExitSpeedDelta:
+        return std::format("Exited the corner {:.1f} km/h {}", magnitude, value >= 0.0 ? "faster" : "slower");
+    case MetricKind::ThrottlePickupDelta:
+        return std::format("Got back on throttle {:.3f} s {} (throttle pickup)", magnitude,
+            value >= 0.0 ? "later" : "sooner");
+    case MetricKind::EntryLineDeviation:
+        return std::format("Entered the corner {:.2f} m {} (entry line)", magnitude,
+            value >= 0.0 ? "farther outside" : "farther inside");
+    case MetricKind::RelativeTimeChange:
+        return std::format("Took {:.3f} s {} through the corner", magnitude, value >= 0.0 ? "longer" : "less");
     }
-    return "Driver metric changed";
+    return "Driving input changed";
 }
 
 std::optional<Insight> make_insight(
@@ -593,7 +606,7 @@ std::optional<Insight> make_insight(
     Insight insight;
     insight.id = std::string(slot_id) + "-lap-" + std::to_string(raw_lap) + "-" + corner.id + "-" +
                  std::string(descriptor->stable_id);
-    insight.title = insight_title(metric.kind, metric.positive);
+    insight.title = plain_metric_change(metric.kind, *metric.value);
     insight.detail = corner.name + ": " + descriptor->name.data() + " " + formatted_value(*metric.value, descriptor->unit) +
                      " vs reference (threshold " + formatted_value(metric.threshold, descriptor->unit) + ")";
     insight.corner_id = corner.id;
@@ -766,7 +779,8 @@ std::optional<ComparisonAnalysis> analyze_comparison(
     const std::vector<CornerEvents>& reference_corner_events,
     int complete_lap_repeatability,
     const AnalysisRules& rules,
-    AnalysisResult& aggregate) {
+    AnalysisResult& aggregate,
+    bool emit_insights = true) {
     if (!comparison_lap) return std::nullopt;
     if (comparison_lap->raw_lap == reference.lap->raw_lap && comparison_lap->begin_index == reference.lap->begin_index) {
         aggregate.diagnostics.emplace_back("A comparison slot duplicated the reference lap and was ignored");
@@ -808,14 +822,302 @@ std::optional<ComparisonAnalysis> analyze_comparison(
         auto metrics = calculate_corner_metrics(reference, comparison, frame, corners[index], reference_corner_events[index],
                                                 comparison_corner_events[index], result.line_translation, result.confidence, rules);
         const auto time_effect = metric_value(metrics, MetricKind::RelativeTimeChange).value_or(0.0);
-        for (const auto& metric : metrics.metrics) {
-            if (auto insight = make_insight(metric, corners[index], slot, comparison_lap->raw_lap, time_effect)) {
-                aggregate.insights.push_back(std::move(*insight));
+        if (emit_insights) {
+            for (const auto& metric : metrics.metrics) {
+                if (auto insight = make_insight(metric, corners[index], slot, comparison_lap->raw_lap, time_effect)) {
+                    aggregate.insights.push_back(std::move(*insight));
+                }
             }
         }
         result.corners.push_back(std::move(metrics));
     }
     return result;
+}
+
+struct ComparableLapAnalysis {
+    const LapInfo* lap{};
+    ComparisonAnalysis analysis;
+};
+
+struct PhaseEffects {
+    double prior_phase_effect_s{};
+    double local_effect_s{};
+    double retained_effect_s{};
+};
+
+double elapsed_delta_at_progress(const LapView& reference, const LapView& comparison, double progress) {
+    const auto reference_elapsed = timestamp_at_progress(reference, progress) -
+        reference.session->telemetry.time_us[reference.lap->begin_index];
+    const auto comparison_elapsed = timestamp_at_progress(comparison, progress) -
+        comparison.session->telemetry.time_us[comparison.lap->begin_index];
+    return static_cast<double>(comparison_elapsed - reference_elapsed) / kMicrosecondsPerSecond;
+}
+
+double next_driver_decision_progress(std::span<const CornerZone> corners, std::size_t corner_index) {
+    const auto& corner = corners[corner_index];
+    for (std::size_t index = corner_index + 1; index < corners.size(); ++index) {
+        if (corners[index].start_progress > corner.end_progress + 1e-6) return corners[index].start_progress;
+    }
+    return 1.0;
+}
+
+PhaseEffects phase_effects(
+    const LapView& reference,
+    const LapView& comparison,
+    const CornerZone& corner,
+    double action_progress,
+    double retained_progress) {
+    action_progress = std::clamp(action_progress, corner.start_progress, corner.end_progress);
+    retained_progress = std::clamp(std::max(retained_progress, corner.end_progress), corner.end_progress, 1.0);
+    const auto start_delta = elapsed_delta_at_progress(reference, comparison, corner.start_progress);
+    const auto action_delta = elapsed_delta_at_progress(reference, comparison, action_progress);
+    const auto end_delta = elapsed_delta_at_progress(reference, comparison, corner.end_progress);
+    const auto retained_delta = elapsed_delta_at_progress(reference, comparison, retained_progress);
+    return {action_delta - start_delta, end_delta - action_delta, retained_delta - start_delta};
+}
+
+bool has_telemetry_gap(const Session& session, const LapView& view) {
+    const auto maximum_step = std::max<Timestamp>(250'000, view.median_step_us * 3);
+    for (auto index = view.lap->begin_index + 1; index <= view.lap->end_index; ++index) {
+        const auto step = session.telemetry.time_us[index] - session.telemetry.time_us[index - 1];
+        if (step <= 0 || step > maximum_step) return true;
+    }
+    return false;
+}
+
+double robust_median(std::vector<double> values) {
+    values.erase(std::remove_if(values.begin(), values.end(), [](double value) { return !std::isfinite(value); }), values.end());
+    if (values.empty()) return 0.0;
+    std::sort(values.begin(), values.end());
+    const auto middle = values.size() / 2;
+    return values.size() % 2 == 0 ? (values[middle - 1] + values[middle]) * 0.5 : values[middle];
+}
+
+double robust_sigma(std::span<const double> values) {
+    if (values.size() < 2) return 0.0;
+    const auto center = robust_median(std::vector<double>(values.begin(), values.end()));
+    std::vector<double> deviations;
+    deviations.reserve(values.size());
+    for (const auto value : values) deviations.push_back(std::abs(value - center));
+    return robust_median(std::move(deviations)) * 1.4826;
+}
+
+const CornerMetrics* find_corner_metrics(const ComparisonAnalysis& analysis, std::string_view corner_id) {
+    const auto iterator = std::find_if(analysis.corners.begin(), analysis.corners.end(), [&](const CornerMetrics& corner) {
+        return corner.corner_id == corner_id;
+    });
+    return iterator == analysis.corners.end() ? nullptr : &*iterator;
+}
+
+const DerivedMetric* find_metric(const CornerMetrics& corner, MetricKind kind) {
+    const auto iterator = std::find_if(corner.metrics.begin(), corner.metrics.end(), [&](const DerivedMetric& metric) {
+        return metric.kind == kind;
+    });
+    return iterator == corner.metrics.end() ? nullptr : &*iterator;
+}
+
+bool same_metric_direction(double selected, double candidate) noexcept {
+    if (selected == 0.0 || candidate == 0.0) return selected == candidate;
+    return std::signbit(selected) == std::signbit(candidate);
+}
+
+bool is_line_metric(MetricKind kind) noexcept {
+    return kind == MetricKind::ApexTimingDelta || kind == MetricKind::EntryLineDeviation;
+}
+
+std::string evidence_title(const insight_evidence::Result& evidence) {
+    switch (evidence.outcome) {
+    case insight_evidence::Outcome::DataLimited: return "Not enough data to judge";
+    case insight_evidence::Outcome::Inconclusive: return "No clear time difference";
+    case insight_evidence::Outcome::NetLoss: return "This approach lost time";
+    case insight_evidence::Outcome::Compensation: return "Recovered time, but remained behind";
+    case insight_evidence::Outcome::RetainedGain:
+        if (evidence.recommendation == insight_evidence::Recommendation::RecommendTechnique) {
+            return "Repeatable improvement";
+        }
+        if (evidence.recommendation == insight_evidence::Recommendation::Validate) {
+            return "Promising improvement - test again";
+        }
+        return "Possible improvement - needs more laps";
+    case insight_evidence::Outcome::TradeoffGain:
+        if (evidence.recommendation == insight_evidence::Recommendation::RecommendSequence) {
+            return "Repeatable whole-corner improvement";
+        }
+        if (evidence.recommendation == insight_evidence::Recommendation::Validate) {
+            return "Whole-corner improvement - test again";
+        }
+        return "Possible whole-corner improvement";
+    }
+    return "Driving change detected";
+}
+
+std::string evidence_detail(
+    const Insight& insight,
+    const insight_evidence::Result& evidence) {
+    std::ostringstream stream;
+    stream << plain_metric_change(insight.metric, insight.measured_value) << " compared with the reference lap. ";
+    stream << std::fixed << std::setprecision(3);
+    switch (evidence.outcome) {
+    case insight_evidence::Outcome::DataLimited:
+        stream << "The recording quality is not good enough to suggest a driving change yet.";
+        break;
+    case insight_evidence::Outcome::Inconclusive:
+        stream << "At the next braking or steering decision, the difference was smaller than the normal "
+               << evidence.time_noise_floor_s << " s timing variation.";
+        break;
+    case insight_evidence::Outcome::NetLoss:
+        stream << "By the next braking or steering decision, this approach was "
+               << std::max(0.0, -evidence.retained_gain_s) << " s slower overall. Do not copy it as an improvement.";
+        break;
+    case insight_evidence::Outcome::Compensation:
+        stream << "This recovered part of the time lost earlier, but the lap was not ahead by the next braking or steering decision.";
+        break;
+    case insight_evidence::Outcome::RetainedGain:
+        stream << "The lap was still " << evidence.retained_gain_s
+               << " s ahead at the next braking or steering decision.";
+        break;
+    case insight_evidence::Outcome::TradeoffGain:
+        stream << "The complete corner approach was still " << evidence.retained_gain_s
+               << " s ahead afterward. Copy the whole sequence rather than one isolated input.";
+        break;
+    }
+    return stream.str();
+}
+
+void apply_recommendation_evidence(
+    const Session& session,
+    const LapView& reference,
+    std::span<const CornerZone> corners,
+    const AnalysisRules& rules,
+    const std::vector<ComparableLapAnalysis>& comparable_analyses,
+    AnalysisResult& result) {
+    std::size_t compensation_count = 0;
+    std::size_t retained_count = 0;
+    std::size_t recommendation_count = 0;
+
+    for (auto& insight : result.insights) {
+        const auto selected_lap = std::find_if(session.laps.begin(), session.laps.end(), [&](const LapInfo& lap) {
+            return lap.raw_lap == insight.comparison_raw_lap;
+        });
+        const auto selected_view_value = selected_lap == session.laps.end()
+            ? std::optional<LapView>{}
+            : make_lap_view(session, *selected_lap);
+        const auto corner_iterator = std::find_if(corners.begin(), corners.end(), [&](const CornerZone& corner) {
+            return corner.id == insight.corner_id;
+        });
+        if (!selected_view_value || corner_iterator == corners.end()) continue;
+        const auto corner_index = static_cast<std::size_t>(std::distance(corners.begin(), corner_iterator));
+        const auto retained_progress = next_driver_decision_progress(corners, corner_index);
+        const auto action_progress = insight.metric == MetricKind::RelativeTimeChange
+            ? corner_iterator->start_progress
+            : insight.navigation.reference_progress;
+        const auto selected_effects = phase_effects(
+            reference, *selected_view_value, *corner_iterator, action_progress, retained_progress);
+
+        std::vector<double> retained_effects;
+        retained_effects.reserve(comparable_analyses.size());
+        for (const auto& candidate : comparable_analyses) {
+            if (!candidate.lap || candidate.lap->phase != LapPhase::Complete ||
+                candidate.analysis.confidence.overall < rules.evidence.minimum_data_confidence ||
+                (is_line_metric(insight.metric) && !candidate.analysis.confidence.line_metrics_enabled)) {
+                continue;
+            }
+            const auto* candidate_corner = find_corner_metrics(candidate.analysis, insight.corner_id);
+            const auto* candidate_metric = candidate_corner ? find_metric(*candidate_corner, insight.metric) : nullptr;
+            if (!candidate_metric || !candidate_metric->value || !candidate_metric->triggered ||
+                !same_metric_direction(insight.measured_value, *candidate_metric->value)) {
+                continue;
+            }
+            const auto candidate_view = make_lap_view(session, *candidate.lap);
+            if (!candidate_view || has_telemetry_gap(session, *candidate_view)) continue;
+            const auto candidate_action = insight.metric == MetricKind::RelativeTimeChange
+                ? corner_iterator->start_progress
+                : candidate_metric->navigation.reference_progress;
+            retained_effects.push_back(phase_effects(
+                reference, *candidate_view, *corner_iterator, candidate_action, retained_progress).retained_effect_s);
+        }
+
+        const auto repeatability_sigma = robust_sigma(
+            std::span<const double>(retained_effects.data(), retained_effects.size()));
+        const auto sample_period_s = static_cast<double>(selected_view_value->median_step_us) / kMicrosecondsPerSecond;
+        const auto noise_floor = std::max({rules.evidence.minimum_time_floor_s,
+            rules.evidence.sample_period_multiplier * sample_period_s,
+            rules.evidence.repeatability_sigma_multiplier * repeatability_sigma});
+        const auto supporting_laps = static_cast<std::size_t>(std::count_if(
+            retained_effects.begin(), retained_effects.end(), [&](double effect) { return effect <= -noise_floor; }));
+
+        insight_evidence::CandidateEvidence candidate;
+        candidate.sample_period_s = sample_period_s;
+        candidate.timing_repeatability_sigma_s = repeatability_sigma;
+        candidate.data_confidence = insight.confidence;
+        candidate.technique_change_detected = true;
+        candidate.favorable_local_metric = insight.positive;
+        candidate.prior_phase_effect_s = selected_effects.prior_phase_effect_s;
+        candidate.local_effect_s = selected_effects.local_effect_s;
+        candidate.retained_effect_s = selected_effects.retained_effect_s;
+        candidate.comparable_laps = retained_effects.size();
+        candidate.supporting_laps = supporting_laps;
+        if (retained_effects.size() >= 2) {
+            const auto center = robust_median(retained_effects);
+            const auto half_width = 1.96 * repeatability_sigma /
+                std::sqrt(static_cast<double>(retained_effects.size()));
+            candidate.median_retained_effect_s = center;
+            candidate.retained_interval_low_s = center - half_width;
+            candidate.retained_interval_high_s = center + half_width;
+        }
+        candidate.complete_lap = selected_lap->phase == LapPhase::Complete;
+        candidate.telemetry_gap = has_telemetry_gap(session, *selected_view_value);
+        const std::vector<DetectedEvent>* selected_events = nullptr;
+        if (insight.comparison == ComparisonSlot::CompareA && result.comparisons[0]) {
+            selected_events = &result.comparisons[0]->events;
+        } else if (insight.comparison == ComparisonSlot::CompareB && result.comparisons[1]) {
+            selected_events = &result.comparisons[1]->events;
+        }
+        candidate.extra_steering_correction = selected_events && std::any_of(
+            selected_events->begin(), selected_events->end(), [&](const DetectedEvent& event) {
+                return event.corner_id == insight.corner_id && event.type == EventType::SteeringCorrection;
+            });
+        candidate.line_metric = is_line_metric(insight.metric);
+        candidate.line_conclusion_enabled = !candidate.line_metric ||
+            (insight.comparison == ComparisonSlot::CompareA && result.comparisons[0] &&
+                result.comparisons[0]->confidence.line_metrics_enabled) ||
+            (insight.comparison == ComparisonSlot::CompareB && result.comparisons[1] &&
+                result.comparisons[1]->confidence.line_metrics_enabled);
+
+        const auto evidence = insight_evidence::evaluate(candidate, rules.evidence);
+        insight.outcome = evidence.outcome;
+        insight.reliability = evidence.reliability;
+        insight.recommendation = evidence.recommendation;
+        insight.prior_phase_effect_s = candidate.prior_phase_effect_s;
+        insight.local_effect_s = candidate.local_effect_s;
+        insight.retained_effect_s = candidate.retained_effect_s;
+        insight.time_noise_floor_s = evidence.time_noise_floor_s;
+        insight.retained_gain_s = evidence.retained_gain_s;
+        insight.downstream_payback_fraction = evidence.downstream_payback_fraction;
+        insight.comparable_laps = candidate.comparable_laps;
+        insight.supporting_laps = candidate.supporting_laps;
+        insight.median_retained_effect_s = candidate.median_retained_effect_s;
+        insight.retained_interval_low_s = candidate.retained_interval_low_s;
+        insight.retained_interval_high_s = candidate.retained_interval_high_s;
+        insight.evidence_reasons = evidence.reasons;
+        if (descriptor_for(insight.rule)) {
+            insight.title = evidence_title(evidence);
+            insight.detail = evidence_detail(insight, evidence);
+        }
+
+        if (evidence.outcome == insight_evidence::Outcome::Compensation) ++compensation_count;
+        if (evidence.outcome == insight_evidence::Outcome::RetainedGain ||
+            evidence.outcome == insight_evidence::Outcome::TradeoffGain) {
+            ++retained_count;
+        }
+        if (evidence.recommendation == insight_evidence::Recommendation::RecommendTechnique ||
+            evidence.recommendation == insight_evidence::Recommendation::RecommendSequence) {
+            ++recommendation_count;
+        }
+    }
+    result.diagnostics.push_back(std::format(
+        "Evidence v2: {} recovery/compensation, {} retained-gain observations, {} repeatable recommendations",
+        compensation_count, retained_count, recommendation_count));
 }
 
 }  // namespace
@@ -980,6 +1282,22 @@ AnalysisResult analyze_driver_performance(
                                                result.corners, reference_corner_events, complete_lap_repeatability, rules, result);
     result.comparisons[1] = analyze_comparison(session, reference, compare_b, ComparisonSlot::CompareB, frame,
                                                result.corners, reference_corner_events, complete_lap_repeatability, rules, result);
+
+    // Build a session-wide evidence population without emitting duplicate cards.
+    // A selected lap can expose a candidate technique, but only repeatable outcomes
+    // from complete, comparable laps are allowed to promote it to a recommendation.
+    std::vector<ComparableLapAnalysis> comparable_analyses;
+    comparable_analyses.reserve(session.laps.size());
+    for (const auto& lap : session.laps) {
+        if (lap.phase != LapPhase::Complete || lap.raw_lap == reference_lap.raw_lap) continue;
+        AnalysisResult aggregate;
+        auto analysis = analyze_comparison(session, reference, &lap, ComparisonSlot::CompareA, frame,
+                                           result.corners, reference_corner_events,
+                                           complete_lap_repeatability, rules, aggregate, false);
+        if (analysis) comparable_analyses.push_back({&lap, std::move(*analysis)});
+    }
+    apply_recommendation_evidence(session, reference, result.corners, rules, comparable_analyses, result);
+
     std::sort(result.insights.begin(), result.insights.end(), [](const Insight& left, const Insight& right) {
         if (left.navigation.reference_progress != right.navigation.reference_progress) {
             return left.navigation.reference_progress < right.navigation.reference_progress;
@@ -988,6 +1306,16 @@ AnalysisResult analyze_driver_performance(
         return left.id < right.id;
     });
     return result;
+}
+
+TranslatedCoordinate apply_line_translation(double latitude, double longitude,
+                                             const LineTranslation& translation) noexcept {
+    constexpr double degrees_to_radians = 3.14159265358979323846 / 180.0;
+    const auto longitude_metres = 111'320.0 * std::cos(latitude * degrees_to_radians);
+    return {
+        latitude + translation.north_m / 110'540.0,
+        std::abs(longitude_metres) > 1.0 ? longitude + translation.east_m / longitude_metres : longitude,
+    };
 }
 
 }  // namespace racebox::driver_analysis

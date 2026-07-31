@@ -23,6 +23,10 @@ struct TelemetrySeries {
     std::vector<float> altitude_m;
     std::vector<float> longitudinal_g;
     std::vector<float> lateral_g;
+    std::vector<float> vertical_g;
+    std::vector<float> gyro_x_dps;
+    std::vector<float> gyro_y_dps;
+    std::vector<float> gyro_z_dps;
     std::vector<std::uint8_t> satellites;
     std::vector<std::int32_t> raw_lap;
 

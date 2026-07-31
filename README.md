@@ -8,9 +8,11 @@ Developer continuation notes and the browser-reference comparison are in [HANDOF
 
 RaceBox Telemetry Viewer was developed through a hands-on human/AI collaboration. The project owner supplied RC racing and mechanical expertise, real telemetry, visible troubleshooting observations, product decisions, and acceptance criteria. **OpenAI Codex powered by GPT-5.6** inspected the original React/Vite prototype, planned the native architecture, implemented and refactored the C++20 application, diagnosed synchronization and map-calibration problems, and produced the automated tests, packaging tools, developer handoff, and release documentation.
 
-GPT-5.6 was used as an engineering reasoning partner rather than as a replacement for domain judgment. Each change followed a repeatable loop: inspect the running application, compare behavior with the recorded data, convert the owner's feedback into measurable rules, edit the smallest responsible part of the code, run the seven native test targets, rebuild, and visually verify the new executable with the real RaceBox/VBO/Sanwa session. Higher-reasoning Codex runs were especially useful for the browser-to-native migration, multi-clock telemetry alignment, distance-normalized three-lap comparison, analysis-only GPS correction, resize-safe map projection, and deterministic insight evidence design.
+GPT-5.6 was used as an engineering reasoning partner rather than as a replacement for domain judgment. Each change followed a repeatable loop: inspect the running application, compare behavior with the recorded data, convert the owner's feedback into measurable rules, edit the smallest responsible part of the code, run the eight native test targets, rebuild, and visually verify the new executable with the real RaceBox/VBO/Sanwa session. Higher-reasoning Codex runs were especially useful for the browser-to-native migration, multi-clock telemetry alignment, distance-normalized three-lap comparison, analysis-only GPS correction, resize-safe map projection, deterministic insight evidence design, and mounting-independent IMU calibration.
 
-The released application does not call a language model at runtime and never uploads telemetry automatically. Codex and GPT-5.6 were used to build and validate the product; the driver's visible insight cards are generated locally from disclosed formulas, thresholds, confidence gates, and measured telemetry.
+The released application's viewer and deterministic Insights run locally and never upload telemetry automatically. Its optional Crew Chief calls the user's private Tailscale gateway only after **Ask Crew Chief** or **Analyze previous vs current** is clicked. Codex and GPT-5.6 were used to build and validate the product; the driver's visible insight cards remain local and are generated from disclosed formulas, thresholds, confidence gates, and measured telemetry.
+
+The always-visible application header shows the exact packaged release number from the root `VERSION` file, making it easy to confirm that the open executable matches the latest numbered ZIP. The native UI uses a larger readable default Windows font, and the top header includes a visible **THEME: DARK / THEME: LIGHT** switch beside the workspace navigation.
 
 ## Run
 
@@ -35,7 +37,7 @@ The relative-time graph plots **Compare A minus Reference** and **Compare B minu
 
 ## Deterministic driver analysis
 
-`driver-analysis-v1` suggests editable corners from reference-path curvature, steering peaks, and speed troughs. Minor candidates below five percent of the strongest bend are rejected instead of filling the maximum count. Suggestions are automatically named and drawn in travel order as `T1`, `T2`, and so on; the verified Richmond layout resolves to nine significant turns. **Map settings > Auto-detect and number turns** reruns detection, and turn-label visibility is remembered. Each corner stores start, turn-in, apex, exit, and end boundaries. The engine deterministically detects sustained braking, brake release, turn-in, apex, first throttle, full throttle, and steering-correction events, then calculates:
+`driver-analysis-v2` suggests editable corners from reference-path curvature, steering peaks, and speed troughs. Minor candidates below five percent of the strongest bend are rejected instead of filling the maximum count. Suggestions are automatically named and drawn in travel order as `T1`, `T2`, and so on; the verified Richmond layout resolves to nine significant turns. **Map settings > Auto-detect and number turns** reruns detection, and turn-label visibility is remembered. Each corner stores start, turn-in, apex, exit, and end boundaries. The engine deterministically detects sustained braking, brake release, turn-in, apex, first throttle, full throttle, and steering-correction events, then calculates:
 
 - brake-point, turn-in, and apex timing deltas;
 - minimum and exit-speed differences;
@@ -43,23 +45,48 @@ The relative-time graph plots **Compare A minus Reference** and **Compare B minu
 - entry-line outward deviation;
 - relative-time change through each corner.
 
-Rules are enabled and edited individually, include units and disclosed formulas, and can be reset individually or globally. Confidence uses GPS correction, satellite quality, sampling resolution, event ambiguity, and repeatability. Results below 40 are suppressed, 40-59 are labelled weak signals, and 60 or higher are actionable. Severity combines threshold exceedance with measured zone-time effect. The same evidence gates generate positive feedback for measurable gains.
+Rules are enabled and edited individually, include units and disclosed formulas, and can be reset individually or globally. Confidence uses GPS correction, satellite quality, sampling resolution, event ambiguity, and repeatability. Results below 40 are suppressed and 40-59 remain weak signals; confidence alone never makes a recommendation. Severity combines threshold exceedance with measured zone-time effect.
 
-Line analysis may remove one disclosed whole-lap east/north translation from a comparison calculation. This never changes the recorded or displayed GPS. Correction above 0.75 m reduces confidence, above 1.5 m reduces it strongly, and above 3 m disables line conclusions. Golden race lap R6 is raw lap 7; its roughly 1.8 m temporary drift is corrected only inside line metrics so it does not create a false wide-line claim. The application does not claim wheelspin without wheel-speed data; G/yaw findings are only possible-instability indicators.
+For every triggered candidate, v2 checks cumulative Delta-T before the action, through the corner, and at the next driver decision. It classifies the result separately as data limited, inconclusive, net loss, recovery/compensation, retained gain, or trade-off gain. A dynamic timing floor uses the larger of 0.05 s, two sample periods, and 1.5 times the session repeatability sigma. Matching complete laps are quality-screened, then a robust median, support rate, and interval determine whether the relationship is unproven, likely, or reliable. Only a reliable retained result with the guardrails satisfied becomes a technique or complete-sequence recommendation. A favorable-looking recovery after an earlier mistake is never called a gain.
+
+Line analysis may remove one disclosed whole-lap east/north translation from a comparison calculation. **Analysis-aligned comparison traces** applies the same translation to the visible comparison polyline, playback/inspection dots, and sector markers, while the raw recording and archives remain unchanged. Map labels disclose the applied metres, and **Map settings** can switch back to raw GPS instantly. Correction above 0.75 m reduces confidence, above 1.5 m reduces it strongly, and above 3 m disables both line conclusions and visible alignment. Golden race lap R6 is raw lap 7; its roughly 1.7 m temporary drift is visibly aligned and corrected inside line metrics so it does not create a false wide-line claim. The application does not claim wheelspin without wheel-speed data; G/yaw findings are only possible-instability indicators.
+
+## IMU motion analysis
+
+RaceBox VBO and CSV imports retain vertical acceleration and all three gyroscope axes; these channels also survive session/lap archives and lap CSV export. The first continuous two-second block at or below 1.5 km/h is treated as the car's on-track stationary zero. Its longitudinal, lateral, vertical, and gyro medians are subtracted in the derived graphs, live readings, G-G plot, yaw calibration, and IMU detectors. The source recording, archives, and exports remain untouched. If no qualifying stationary block exists, the app discloses that acceleration remains uncalibrated instead of inventing a zero.
+
+The **IMU** tab graphs these zero-calibrated vertical-G and X/Y/Z gyro readings at the recording's actual output rate. Sensor axes are deliberately not called roll, pitch, or yaw because the logger can be mounted at an arbitrary angle.
+
+A separate vehicle-yaw estimate learns the mounted axis mixture from gyro motion versus GPS heading rate. It is shown only with at least 100 matched moving samples and correlation of 0.60 or better; the bundled recording calibrates at approximately `r=0.962` over 9,000 samples. Stationary samples provide gyro bias when available, with a disclosed whole-session fallback otherwise.
+
+Deterministic indicators flag sustained low vertical load (possible airborne), a following vertical impulse (possible landing), exceptional combined loads above 3.5 g, and calibrated rotation above 220 degrees/second. Labels remain cautious because these signals cannot alone prove a crash, jump, or loss of control. Selecting **Go** opens the containing lap at the event. This layer never rewrites GPS; inertial position fusion remains disabled until device mounting and clock uncertainty are validated.
 
 ## Analysis workspace
 
-The Telemetry window has three tabs:
+The Telemetry window has four tabs:
 
 - **Telemetry**: relative time, speed, lateral G, longitudinal G, throttle/brake, and steering;
+- **IMU**: vertical acceleration, raw gyro axes, gated vehicle-yaw estimate, and navigable motion indicators;
 - **Events**: detected events by role, lap, corner, time, distance, and progress; selecting one synchronizes playback;
 - **Sectors**: physical-sector/theoretical-best timing plus corner and phase metrics.
 
-The Insights window has three tabs:
+The Insights window has four tabs:
 
-- **Insights**: deterministic cards with corner, comparison, confidence, impact, triggering rule, estimated time effect, and a derived-metrics table. Selecting a card moves to the event and highlights its corner; **Export analysis JSON** writes the disclosed rules, metrics, corrections, confidence, navigation targets, and insights;
-- **Rules / Formula**: rule toggles, thresholds, units, formulas, resets, event detector settings, and editable corner phase boundaries;
+- **Insights**: deterministic cards written in plain English first, with standard motorsport terms such as brake point, turn-in, apex, entry line, and throttle pickup included in parentheses. Each card separately explains the result, repeatability, driver advice, retained/local/prior timing, normal variation, repeated-lap support, recording quality, and evidence reasons. Selecting a card moves to the event and highlights its corner; **Export analysis JSON** writes the complete v2 evidence record;
+- **Rules / Formula**: metric rules, event detector settings, editable recommendation gates, formulas, resets, and corner phase boundaries;
+- **Crew Chief**: an optional private chat layer for setup-change A/B testing. The user records exactly what changed and chooses Reference as before plus Compare A or B as after. RaceBox calculates and sends only a bounded evidence packet containing lap time, speed, zero-calibrated chassis G, yaw, steering, throttle/brake, corner metrics, timing retention/payback, GPS quality, and repeatability. When a Race Day book is open, the app locally retrieves up to eight relevant saved setup results so a handling question can be compared with real earlier outcomes. The private OpenClaw pipeline turns those verified values into plain crew-chief wording, explicitly separates association from causation, and proposes a controlled next test. It cannot browse, read files, run tools, or see telemetry paths, screenshots, archives, OAuth credentials, or API keys;
+- **Race Day**: a separate event book for Practice, Q1-Q4, single/triple A/B/C/D mains, and custom runs. Each run retains lightweight file references plus a fillable pre-run checklist, planned changes, driver post-run notes, temperatures, tire set/compound/run count, sauce/warmer preparation, and battery context. Only the selected run is loaded into the viewer. **Analyze previous vs current** sends two generated aligned analytics CSV documents and the entered run context to the private Tailscale gateway; original paths/files are not sent, and the raw CSV is not placed in the language-model prompt. A completed analysis automatically creates or updates a bounded **Setup Knowledge** record containing the exact change, driver result, conditions, deterministic evidence, confidence, cautions, Crew Chief conclusion, and next test. Up to 200 records persist inside the version-2 `.rbxday` file;
+- **Setup-change dynamics analytics**: `racebox-setup-analytics-v3` verifies the same track shape after one disclosed translation, compares top-three complete-lap outcome, and calculates input/output-matched lateral response, steering needed for the same lateral load, full-throttle acceleration, per-straight top speed, straight-entry speed, acceleration attribution, cautious braking-response anomalies, overdriving/tire-scrub risk, tilt-corrected chassis-roll amount, and tilt-corrected roll-rate. It separates a faster straight caused by better corner exit or line from one caused by stronger acceleration, and flags extra steering effort without matching cornering return as possible scrub rather than a guaranteed driver mistake. Roll-rate is measured in uncapped deg/sec so repeated high values do not hit a software score ceiling; physically clipped sensors are treated as range-limited instead of trusted peaks. The preloaded OpenClaw vehicle-dynamics skill forbids direct tire-load, tire-temperature, shock-travel, roll-center, or confirmed-lock claims without the needed sensors. Exact formulas and gates are in [`docs/race-day-crew-chief.md`](docs/race-day-crew-chief.md);
 - **Dev Notes**: a persistent **Notes for Codex** writing area and numbered location links.
+
+The default Crew Chief address is the user's Tailscale-only
+`http://100.73.60.87:18804/v1/crew-chief/chat` service. Override it with
+`RACEBOX_CREW_CHIEF_URL`; deployments that enable a second client bearer token
+can provide `RACEBOX_CREW_CHIEF_TOKEN`. When Tailscale or the private service is
+unavailable, the app shows a connection message while every local telemetry,
+graph, event, sector, IMU, and deterministic Insight feature continues to work.
+The dedicated server route is `openclaw/racebox-crew-chief`, backed by
+`openai/gpt-5.6-sol` with `ultra` thinking and all tools disabled.
 
 Notes for Codex can hold setup details, tires, springs, damage, traffic, weather, deliberate test changes, requests, or questions. Select a numbered pin when the note refers to an exact UI or telemetry location, then use **Copy note for Codex** and paste the packaged note into the Codex task. The copied text includes the selected pin, surface, telemetry time, lap roles, and view mode; the native app never uploads or sends it automatically. `.rbxsession` and `.rbxlap` archives preserve lap roles, reference mode, view mode, rules, formula version, corner names and boundaries, start/finish line, notes, annotations, and map calibration. Numbered review JSON export remains available.
 
@@ -103,7 +130,7 @@ cmake --build --preset release
 ctest --preset release
 ```
 
-CTest currently runs seven targets: golden/core and archive tests, driver-analysis-v1 fixtures, the isolated pre-integration driver-analysis-v2 evidence add-on, DirectX 11 WARP, one-million-sample memory, telemetry plot order, and UI-preference/layout migration. The v2 add-on is not connected to the visible app yet; its verification contract is documented in `docs/driver-analysis-v2-evidence-addon.md`.
+CTest currently runs ten targets: golden/core and archive tests, IMU calibration/event fixtures, integrated driver-analysis-v2 fixtures, the outcome/reliability/recommendation classifier and golden-session integration harness, the Crew Chief evidence/response contract, Race Day model/persistence/golden CSV/setup-knowledge integration, DirectX 11 WARP, one-million-sample memory, telemetry plot order, and UI-preference/layout migration. The deterministic insight evidence contract is documented in `docs/driver-analysis-v2-evidence-addon.md`; lap evidence uses `racebox-crew-chief-evidence-v1`, while Race Day setup-memory requests use `racebox-race-day-request-v3`.
 
 The repeatable full check and portable package commands are:
 

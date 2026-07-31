@@ -19,6 +19,10 @@ int main() {
         session.telemetry.altitude_m.push_back(3.0F);
         session.telemetry.longitudinal_g.push_back(0.0F);
         session.telemetry.lateral_g.push_back(0.0F);
+        session.telemetry.vertical_g.push_back(1.0F);
+        session.telemetry.gyro_x_dps.push_back(0.0F);
+        session.telemetry.gyro_y_dps.push_back(0.0F);
+        session.telemetry.gyro_z_dps.push_back(0.0F);
         session.telemetry.satellites.push_back(18);
         session.telemetry.raw_lap.push_back(static_cast<std::int32_t>(index / 400));
     }

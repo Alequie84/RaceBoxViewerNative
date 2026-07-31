@@ -92,6 +92,10 @@ Session synthetic_session() {
             session.telemetry.altitude_m.push_back(2.0F);
             session.telemetry.longitudinal_g.push_back(0.0F);
             session.telemetry.lateral_g.push_back(0.0F);
+            session.telemetry.vertical_g.push_back(1.0F);
+            session.telemetry.gyro_x_dps.push_back(0.0F);
+            session.telemetry.gyro_y_dps.push_back(0.0F);
+            session.telemetry.gyro_z_dps.push_back(0.0F);
             session.telemetry.satellites.push_back(18);
             session.telemetry.raw_lap.push_back(static_cast<std::int32_t>(lap_number + 1));
 
@@ -157,7 +161,7 @@ int main() {
 
         const auto& comparison_a = *result.comparisons[0];
         require(comparison_a.slot == ComparisonSlot::CompareA && comparison_a.raw_lap == 2, "Compare A identity changed");
-        require(comparison_a.line_translation.applied_to_metrics_only, "GPS correction was not marked analysis-only");
+        require(comparison_a.line_translation.preserves_raw_telemetry, "GPS correction did not preserve raw telemetry");
         require(comparison_a.line_translation.magnitude_m > 1.5 && comparison_a.line_translation.magnitude_m < 2.3,
                 "Whole-lap translation did not recover the synthetic drift");
         require(comparison_a.confidence.line_metrics_enabled, "A recoverable drift incorrectly disabled line metrics");
@@ -204,8 +208,25 @@ int main() {
         }), "Reduced corner time did not generate deterministic positive feedback");
         require(std::all_of(result.insights.begin(), result.insights.end(), [](const Insight& insight) {
             return insight.confidence >= 40 && insight.navigation.reference_progress >= 0.0 &&
-                   insight.navigation.reference_progress <= 1.0 && !insight.rule_stable_id.empty();
+                   insight.navigation.reference_progress <= 1.0 && !insight.rule_stable_id.empty() &&
+                   insight.time_noise_floor_s >= 0.05;
         }), "Suppressed or non-navigable insight escaped the evidence gate");
+        require(std::none_of(result.insights.begin(), result.insights.end(), [](const Insight& insight) {
+            return insight.recommendation == insight_evidence::Recommendation::RecommendTechnique ||
+                   insight.recommendation == insight_evidence::Recommendation::RecommendSequence;
+        }), "Two comparison laps were incorrectly treated as repeatable recommendation evidence");
+        require(std::all_of(result.insights.begin(), result.insights.end(), [](const Insight& insight) {
+            return insight.outcome != insight_evidence::Outcome::Compensation ||
+                   insight.recommendation == insight_evidence::Recommendation::None;
+        }), "A recovery/compensation card produced a driving recommendation");
+        require(std::all_of(result.insights.begin(), result.insights.end(), [](const Insight& insight) {
+            return insight.detail.find("compared with the reference lap") != std::string::npos &&
+                   insight.title.find("delta") == std::string::npos;
+        }), "Insight cards did not use the plain-English driver wording");
+        require(std::any_of(result.insights.begin(), result.insights.end(), [](const Insight& insight) {
+            return insight.metric == MetricKind::BrakePointDelta && insight.detail.find("Braked") != std::string::npos &&
+                   insight.detail.find("(brake point)") != std::string::npos;
+        }), "Brake insight did not pair plain English with the motorsport term");
 
         auto disabled_brake_rule = rules;
         for (auto& setting : disabled_brake_rule.metrics) {
@@ -268,7 +289,28 @@ int main() {
         require(drift_comparison.line_translation.magnitude_m > 1.0 && drift_comparison.line_translation.magnitude_m < 2.8,
                 "Golden offset lap correction is outside its known drift range");
         require(drift_comparison.confidence.line_metrics_enabled, "Golden offset lap incorrectly disabled line analysis");
+        const auto raw_latitude = golden_session.telemetry.latitude[raw_7->begin_index];
+        const auto raw_longitude = golden_session.telemetry.longitude[raw_7->begin_index];
+        const auto display_coordinate = apply_line_translation(raw_latitude, raw_longitude,
+                                                               drift_comparison.line_translation);
+        const auto east_m = (display_coordinate.longitude - raw_longitude) * 111'320.0 *
+            std::cos(raw_latitude * 3.14159265358979323846 / 180.0);
+        const auto north_m = (display_coordinate.latitude - raw_latitude) * 110'540.0;
+        close_to(east_m, drift_comparison.line_translation.east_m, 0.001,
+                 "Visible trace east correction changed");
+        close_to(north_m, drift_comparison.line_translation.north_m, 0.001,
+                 "Visible trace north correction changed");
+        close_to(golden_session.telemetry.latitude[raw_7->begin_index], raw_latitude, 1e-12,
+                 "Visible correction rewrote raw latitude");
+        close_to(golden_session.telemetry.longitude[raw_7->begin_index], raw_longitude, 1e-12,
+                 "Visible correction rewrote raw longitude");
         require(wide_entry_insights == 0, "Golden offset lap produced a false wide-entry insight after correction");
+        require(std::all_of(drift_result.insights.begin(), drift_result.insights.end(), [](const Insight& insight) {
+            return insight.time_noise_floor_s > 0.0 &&
+                   (insight.recommendation != insight_evidence::Recommendation::RecommendTechnique &&
+                    insight.recommendation != insight_evidence::Recommendation::RecommendSequence ||
+                    insight.reliability == insight_evidence::Reliability::ReliableAssociation);
+        }), "Golden session insight bypassed the integrated evidence gates");
 
         std::cout << "All deterministic driver-analysis checks passed\n";
         return 0;

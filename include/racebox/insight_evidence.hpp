@@ -9,8 +9,8 @@
 
 namespace racebox::insight_evidence {
 
-// This add-on is intentionally independent from driver-analysis-v1. It is
-// verified in isolation before the native UI is allowed to consume it.
+// The evidence classifier stays UI-independent so outcome, reliability, and
+// recommendation gates remain deterministic and directly unit-testable.
 inline constexpr std::string_view kAddonVersion{"driver-analysis-v2-evidence-addon-1"};
 
 enum class Outcome : std::uint8_t {
@@ -87,7 +87,7 @@ struct CandidateEvidence {
     double local_effect_s{};
     double retained_effect_s{};
 
-    // Aggregate fields describe repeated comparable clean laps. They are
+    // Aggregate fields describe repeated quality-screened matching laps. They are
     // deliberately optional so one selected comparison cannot impersonate
     // repeatable evidence.
     std::size_t comparable_laps{};

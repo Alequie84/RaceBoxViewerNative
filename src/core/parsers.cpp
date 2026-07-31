@@ -233,6 +233,10 @@ ParsedVbo parse_vbo_full(const std::filesystem::path& path, std::vector<std::str
         parsed.telemetry.altitude_m.push_back(static_cast<float>(field[5]));
         parsed.telemetry.longitudinal_g.push_back(static_cast<float>(field[6]));
         parsed.telemetry.lateral_g.push_back(static_cast<float>(field[7]));
+        parsed.telemetry.vertical_g.push_back(static_cast<float>(field[8]));
+        parsed.telemetry.gyro_x_dps.push_back(static_cast<float>(field[9]));
+        parsed.telemetry.gyro_y_dps.push_back(static_cast<float>(field[10]));
+        parsed.telemetry.gyro_z_dps.push_back(static_cast<float>(field[11]));
         parsed.telemetry.satellites.push_back(static_cast<std::uint8_t>(std::clamp(field[12], 0.0, 255.0)));
         parsed.telemetry.raw_lap.push_back(0);
     }
@@ -263,14 +267,17 @@ bool segments_intersect(double p_lat, double p_lon, double q_lat, double q_lon,
 void TelemetrySeries::reserve(std::size_t count) {
     time_us.reserve(count); absolute_time_us.reserve(count); latitude.reserve(count); longitude.reserve(count);
     speed_kmh.reserve(count); heading_deg.reserve(count); altitude_m.reserve(count); longitudinal_g.reserve(count);
-    lateral_g.reserve(count); satellites.reserve(count); raw_lap.reserve(count);
+    lateral_g.reserve(count); vertical_g.reserve(count); gyro_x_dps.reserve(count); gyro_y_dps.reserve(count);
+    gyro_z_dps.reserve(count); satellites.reserve(count); raw_lap.reserve(count);
 }
 
 void TelemetrySeries::validate() const {
     const auto count = size();
     if (absolute_time_us.size() != count || latitude.size() != count || longitude.size() != count ||
         speed_kmh.size() != count || heading_deg.size() != count || altitude_m.size() != count ||
-        longitudinal_g.size() != count || lateral_g.size() != count || satellites.size() != count || raw_lap.size() != count) {
+        longitudinal_g.size() != count || lateral_g.size() != count || vertical_g.size() != count ||
+        gyro_x_dps.size() != count || gyro_y_dps.size() != count || gyro_z_dps.size() != count ||
+        satellites.size() != count || raw_lap.size() != count) {
         throw std::runtime_error("Telemetry columns have inconsistent lengths");
     }
 }
@@ -306,7 +313,9 @@ TelemetrySeries parse_racebox_csv(const std::filesystem::path& path, std::vector
     };
     const int time_col = column("Time"), lat_col = column("Latitude"), lon_col = column("Longitude");
     if (time_col < 0 || lat_col < 0 || lon_col < 0) throw std::runtime_error("RaceBox CSV is missing Time/Latitude/Longitude");
-    const int alt_col = column("Altitude"), speed_col = column("Speed"), gx_col = column("GForceX"), gy_col = column("GForceY"), lap_col = column("Lap");
+    const int alt_col = column("Altitude"), speed_col = column("Speed"), gx_col = column("GForceX"),
+              gy_col = column("GForceY"), gz_col = column("GForceZ"), gyro_x_col = column("GyroX"),
+              gyro_y_col = column("GyroY"), gyro_z_col = column("GyroZ"), lap_col = column("Lap");
 
     TelemetrySeries result;
     std::int64_t first_absolute = 0;
@@ -325,6 +334,10 @@ TelemetrySeries parse_racebox_csv(const std::filesystem::path& path, std::vector
         result.altitude_m.push_back(static_cast<float>(alt_col >= 0 ? number(fields[alt_col]) : 0.0));
         result.longitudinal_g.push_back(static_cast<float>(gx_col >= 0 ? number(fields[gx_col]) : 0.0));
         result.lateral_g.push_back(static_cast<float>(gy_col >= 0 ? number(fields[gy_col]) : 0.0));
+        result.vertical_g.push_back(static_cast<float>(gz_col >= 0 ? number(fields[gz_col]) : 0.0));
+        result.gyro_x_dps.push_back(static_cast<float>(gyro_x_col >= 0 ? number(fields[gyro_x_col]) : 0.0));
+        result.gyro_y_dps.push_back(static_cast<float>(gyro_y_col >= 0 ? number(fields[gyro_y_col]) : 0.0));
+        result.gyro_z_dps.push_back(static_cast<float>(gyro_z_col >= 0 ? number(fields[gyro_z_col]) : 0.0));
         result.satellites.push_back(0);
         result.raw_lap.push_back(static_cast<std::int32_t>(lap_col >= 0 ? number(fields[lap_col]) : 0.0));
     }
@@ -362,6 +375,10 @@ TelemetrySeries parse_gpx(const std::filesystem::path& path, std::vector<std::st
                 result.altitude_m.push_back(static_cast<float>(xml_value(block, "ele").has_value() ? number(*xml_value(block, "ele")) : 0.0));
                 result.longitudinal_g.push_back(0.0F);
                 result.lateral_g.push_back(0.0F);
+                result.vertical_g.push_back(0.0F);
+                result.gyro_x_dps.push_back(0.0F);
+                result.gyro_y_dps.push_back(0.0F);
+                result.gyro_z_dps.push_back(0.0F);
                 result.satellites.push_back(0);
                 result.raw_lap.push_back(0);
             }
@@ -524,6 +541,10 @@ LoadResult load_session(const LoadRequest& request) {
         merged.altitude_m.push_back(vbo.telemetry.altitude_m[source]);
         merged.longitudinal_g.push_back(vbo.telemetry.longitudinal_g[source]);
         merged.lateral_g.push_back(vbo.telemetry.lateral_g[source]);
+        merged.vertical_g.push_back(vbo.telemetry.vertical_g[source]);
+        merged.gyro_x_dps.push_back(vbo.telemetry.gyro_x_dps[source]);
+        merged.gyro_y_dps.push_back(vbo.telemetry.gyro_y_dps[source]);
+        merged.gyro_z_dps.push_back(vbo.telemetry.gyro_z_dps[source]);
         merged.satellites.push_back(vbo.telemetry.satellites[source]);
         merged.raw_lap.push_back(csv.raw_lap[index]);
     }
@@ -564,6 +585,7 @@ LoadResult load_session(const LoadRequest& request) {
             std::to_string(speed_correlation) + ", mean time error=" + std::to_string(mean_time_error_ms) + " ms");
         if (merge_confidence < 0.55) result.diagnostics.emplace_back("WARNING: VBO/CSV merge confidence is weak; inspect alignment before analysis");
     }
+    result.imu_analysis = imu::analyze(result.session.telemetry);
     return result;
 }
 

@@ -55,23 +55,35 @@ std::vector<std::byte> encode_telemetry(const TelemetrySeries& telemetry) {
     std::vector<std::byte> output;
     output.reserve(telemetry.size() * 64);
     append_value(output, std::uint32_t{0x44584252});
-    append_value(output, std::uint32_t{1});
+    append_value(output, std::uint32_t{2});
     append_vector(output, telemetry.time_us); append_vector(output, telemetry.absolute_time_us);
     append_vector(output, telemetry.latitude); append_vector(output, telemetry.longitude);
     append_vector(output, telemetry.speed_kmh); append_vector(output, telemetry.heading_deg);
     append_vector(output, telemetry.altitude_m); append_vector(output, telemetry.longitudinal_g);
     append_vector(output, telemetry.lateral_g); append_vector(output, telemetry.satellites); append_vector(output, telemetry.raw_lap);
+    append_vector(output, telemetry.vertical_g); append_vector(output, telemetry.gyro_x_dps);
+    append_vector(output, telemetry.gyro_y_dps); append_vector(output, telemetry.gyro_z_dps);
     return output;
 }
 
 bool decode_telemetry(std::span<const std::byte> input, TelemetrySeries& telemetry) {
     std::uint32_t magic = 0, version = 0;
-    if (!read_value(input, magic) || !read_value(input, version) || magic != 0x44584252 || version != 1) return false;
-    return read_vector(input, telemetry.time_us) && read_vector(input, telemetry.absolute_time_us) &&
+    if (!read_value(input, magic) || !read_value(input, version) || magic != 0x44584252 || (version != 1 && version != 2)) return false;
+    const auto legacy_ok = read_vector(input, telemetry.time_us) && read_vector(input, telemetry.absolute_time_us) &&
            read_vector(input, telemetry.latitude) && read_vector(input, telemetry.longitude) &&
            read_vector(input, telemetry.speed_kmh) && read_vector(input, telemetry.heading_deg) &&
            read_vector(input, telemetry.altitude_m) && read_vector(input, telemetry.longitudinal_g) &&
            read_vector(input, telemetry.lateral_g) && read_vector(input, telemetry.satellites) && read_vector(input, telemetry.raw_lap);
+    if (!legacy_ok) return false;
+    if (version == 1) {
+        telemetry.vertical_g.assign(telemetry.size(), 0.0F);
+        telemetry.gyro_x_dps.assign(telemetry.size(), 0.0F);
+        telemetry.gyro_y_dps.assign(telemetry.size(), 0.0F);
+        telemetry.gyro_z_dps.assign(telemetry.size(), 0.0F);
+        return input.empty();
+    }
+    return read_vector(input, telemetry.vertical_g) && read_vector(input, telemetry.gyro_x_dps) &&
+           read_vector(input, telemetry.gyro_y_dps) && read_vector(input, telemetry.gyro_z_dps) && input.empty();
 }
 
 std::vector<std::byte> encode_radio(const RadioSeries& radio) {
@@ -211,6 +223,10 @@ bool save_lap_archive(const Session& session, const LapInfo& lap, const std::fil
     copy(output.telemetry.altitude_m, session.telemetry.altitude_m);
     copy(output.telemetry.longitudinal_g, session.telemetry.longitudinal_g);
     copy(output.telemetry.lateral_g, session.telemetry.lateral_g);
+    copy(output.telemetry.vertical_g, session.telemetry.vertical_g);
+    copy(output.telemetry.gyro_x_dps, session.telemetry.gyro_x_dps);
+    copy(output.telemetry.gyro_y_dps, session.telemetry.gyro_y_dps);
+    copy(output.telemetry.gyro_z_dps, session.telemetry.gyro_z_dps);
     copy(output.telemetry.satellites, session.telemetry.satellites);
     copy(output.telemetry.raw_lap, session.telemetry.raw_lap);
     output.laps.push_back({lap.raw_lap, lap.race_lap, 0, output.telemetry.size() - 1, lap.duration_us, LapPhase::Complete});
@@ -339,14 +355,16 @@ bool export_lap_csv(const Session& session, const LapInfo& lap, const std::files
         error = "Could not create CSV";
         return false;
     }
-    output << "TimeSeconds,Latitude,Longitude,SpeedKmh,LateralG,LongitudinalG,Throttle,Brake,Steering\n";
+    output << "TimeSeconds,Latitude,Longitude,SpeedKmh,LateralG,LongitudinalG,VerticalG,GyroXDegPerSec,GyroYDegPerSec,GyroZDegPerSec,Throttle,Brake,Steering\n";
     output << std::fixed << std::setprecision(6);
     for (auto index = lap.begin_index; index <= lap.end_index; ++index) {
         const auto radio = sample_radio(session, session.telemetry.time_us[index]);
         output << static_cast<double>(session.telemetry.time_us[index] - session.telemetry.time_us[lap.begin_index]) / 1'000'000.0 << ','
                << session.telemetry.latitude[index] << ',' << session.telemetry.longitude[index] << ','
                << session.telemetry.speed_kmh[index] << ',' << session.telemetry.lateral_g[index] << ','
-               << session.telemetry.longitudinal_g[index] << ',' << radio.throttle << ',' << radio.brake << ',' << radio.steering << '\n';
+               << session.telemetry.longitudinal_g[index] << ',' << session.telemetry.vertical_g[index] << ','
+               << session.telemetry.gyro_x_dps[index] << ',' << session.telemetry.gyro_y_dps[index] << ','
+               << session.telemetry.gyro_z_dps[index] << ',' << radio.throttle << ',' << radio.brake << ',' << radio.steering << '\n';
     }
     return true;
 }

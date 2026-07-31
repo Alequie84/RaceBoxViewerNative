@@ -1,12 +1,12 @@
-# Driver Analysis v2 Evidence Add-on
+# Driver Analysis v2 Evidence Engine
 
-Status: isolated pre-integration module. The native UI still uses `driver-analysis-v1`.
+Status: integrated into `driver-analysis-v2`, native insight cards, workspace persistence, and JSON export.
 
 ## Purpose
 
-This add-on prevents a favorable-looking telemetry value from becoming a recommendation unless it also produces a meaningful time gain, retains that gain to the next driver decision, repeats on comparable clean laps, and passes data and driving guardrails.
+This engine prevents a favorable-looking telemetry value from becoming a recommendation unless it also produces a meaningful time gain, retains that gain to the next driver decision, repeats on quality-screened matching laps, and passes available data and driving guardrails.
 
-The implementation is deliberately independent of ImGui, session persistence, and the current insight-card generator. Its public contract is `include/racebox/insight_evidence.hpp`; its deterministic classifier is `src/core/insight_evidence.cpp`.
+The classifier remains independent of ImGui so it is deterministic and directly testable. Its public contract is `include/racebox/insight_evidence.hpp`; `src/core/insight_evidence.cpp` implements classification, and `src/core/driver_analysis.cpp` supplies real per-phase and repeated-lap evidence.
 
 ## Three independent answers
 
@@ -31,7 +31,7 @@ The dynamic timing noise floor is:
 max(0.05 s, 2 x median sample period, 1.5 x measured timing-repeatability sigma)
 ```
 
-The add-on receives the time already lost before the candidate action, the local time response, and the retained result at the next braking point or corner start. The future v2 phase extractor will calculate those values from cumulative position-based Delta-T.
+The integrated phase extractor samples cumulative position-based Delta-T at the corner start, the candidate action, corner end, and the next configured corner start (or lap end). It supplies time already lost before the action, local response through corner end, and retained result at the next driver decision.
 
 ## Recommendation gates
 
@@ -39,7 +39,7 @@ A normal technique recommendation requires all of the following:
 
 - retained gain beyond the dynamic noise floor;
 - data confidence of at least 75;
-- at least eight comparable clean laps;
+- at least eight quality-screened matching laps;
 - at least five supporting laps;
 - at least 75 percent support;
 - an aggregate median beyond the noise floor;
@@ -51,7 +51,7 @@ A slower-entry/faster-exit pattern can only recommend the complete sequence. A b
 
 ## Verified counterexamples
 
-`racebox_insight_evidence_addon` covers:
+`racebox_insight_evidence_addon` covers both classifier counterexamples and live-pipeline integration:
 
 - higher exit speed after an unrecovered entry loss;
 - local recovery that only returns to timing noise;
@@ -63,16 +63,20 @@ A slower-entry/faster-exit pattern can only recommend the complete sequence. A b
 - likely evidence whose interval still crosses noise;
 - low support rate;
 - track limits, steering correction, low confidence, context changes, GPS-line disablement, and invalid inputs;
-- a golden-session harness using R15 as reference and R6/R8 as comparisons.
+- a golden-session harness using R15 as reference and R6/R8 as comparisons;
+- real session aggregation, dynamic noise floor, support counts, and recommendation gates on every visible card.
 
-The golden harness intentionally provides no invented multi-lap aggregate. It verifies that every current v1 card remains an observation, loss, compensation, or inconclusive result and that none becomes a recommendation before the repeated-lap extractor exists.
+The current golden harness reviews 107 integrated cards. It finds six recovery/compensation cases and 24 retained/trade-off observations; zero currently clear the reliable recommendation gate. The test asserts that compensation cannot recommend and that any future recommendation must be backed by reliable evidence and the configured lap/support minima.
 
-## Integration hold point
+## Current integration
 
-Do not connect the add-on to the visible Insights panel until a second implementation stage provides:
+The native app now provides:
 
 - per-corner cumulative Delta-T checkpoints through the next driver decision;
-- clean/comparable-lap classification;
+- quality-screened matching-lap classification;
 - robust median, support rate, repeatability sigma, and interval calculation across the session;
 - archive fields for formula-v2 evidence and rules;
-- wording and UI tests for every outcome/reliability/recommendation combination.
+- cards that expose outcome, reliability, recommendation, timing effects, noise floor, support, confidence, and reasons;
+- editable evidence gates with reset, archive restore, and analysis-JSON export.
+
+The matching-lap screen currently requires a complete lap, no telemetry gap, sufficient confidence, the same triggered metric direction, and line metrics within the GPS-correction gate when applicable. The source recordings have no explicit track-limit channel or structured setup/conditions-change markers, so those guardrails cannot yet be populated automatically. Steering-correction guardrails are populated from detected events. Any future source field for track limits, yellow flags, traffic, damage, tires, setup, or weather should feed the existing `CandidateEvidence` guardrails rather than changing the classifier's outcome definitions.

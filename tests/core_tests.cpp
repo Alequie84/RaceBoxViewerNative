@@ -123,6 +123,22 @@ int main() {
         const auto loaded = racebox::load_session({golden / L"session.vbo", golden / L"session.csv", golden / L"sanwa.csv"});
         const auto& session = loaded.session;
         require(session.telemetry.size() == 13'863, "RaceBox sample count changed");
+        require(*std::max_element(session.telemetry.vertical_g.begin(), session.telemetry.vertical_g.end()) > 1.3F,
+                "VBO vertical acceleration was not retained");
+        require(*std::max_element(session.telemetry.gyro_z_dps.begin(), session.telemetry.gyro_z_dps.end()) > 200.0F,
+                "VBO gyroscope data was not retained");
+        require(loaded.imu_analysis.available, "Golden RaceBox IMU was not detected");
+        require(loaded.imu_analysis.initial_stationary_zero_used, "Golden initial stationary zero was not found");
+        require(loaded.imu_analysis.zero_begin_index == 104, "Golden stationary calibration start changed");
+        close_to(loaded.imu_analysis.acceleration_zero_g[0], -0.017, 0.003,
+                 "Golden longitudinal zero changed");
+        close_to(loaded.imu_analysis.acceleration_zero_g[1], 0.051, 0.003,
+                 "Golden lateral zero changed");
+        close_to(loaded.imu_analysis.acceleration_zero_g[2], 0.994, 0.003,
+                 "Golden vertical zero changed");
+        require(loaded.imu_analysis.calibration.valid, "Golden vehicle-yaw calibration is not reliable");
+        require(loaded.imu_analysis.calibration.heading_correlation > 0.75,
+                "Golden vehicle-yaw calibration correlation is too weak");
         require(session.radio.size() == 43'199, "Sanwa sample count changed");
         require(session.laps.size() == 20, "Lap count changed");
         require(session.start_finish_line.has_value(), "VBO start/finish line was not retained");
@@ -163,6 +179,10 @@ int main() {
         racebox::Session restored;
         require(racebox::load_session_archive(archive, restored, error), error.c_str());
         require(restored.telemetry.size() == session.telemetry.size(), "Archive telemetry round trip failed");
+        close_to(restored.telemetry.vertical_g[500], session.telemetry.vertical_g[500], 1e-6,
+                 "Archive lost vertical acceleration");
+        close_to(restored.telemetry.gyro_z_dps[500], session.telemetry.gyro_z_dps[500], 1e-6,
+                 "Archive lost gyroscope data");
         require(restored.radio.size() == session.radio.size(), "Archive radio round trip failed");
         require(restored.map_background.georeferenced, "Archive lost the map georeference");
         require(restored.start_finish_line.has_value(), "Archive lost the start/finish line");

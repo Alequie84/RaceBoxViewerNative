@@ -1,6 +1,7 @@
 #pragma once
 
 #include "racebox/session.hpp"
+#include "racebox/imu_analysis.hpp"
 
 #include <filesystem>
 #include <span>
@@ -18,6 +19,7 @@ struct LoadRequest {
 
 struct LoadResult {
     Session session;
+    imu::Analysis imu_analysis;
     std::vector<std::string> diagnostics;
 };
 

@@ -216,51 +216,54 @@ int main() {
                     evidence::has_reason(result, evidence::Reason::InvalidInput),
                 "Invalid evidence parameters were not rejected");
 
-        // Golden-session pre-integration harness: pass every existing v1 card
-        // through the add-on with one selected lap and no invented aggregate.
-        // Nothing is allowed to become a recommendation yet.
+        // Golden-session integration harness: the driver-analysis engine now
+        // supplies real phase effects and repeated-lap aggregates to the same
+        // deterministic classifier exercised above.
         const std::filesystem::path golden = GOLDEN_DIR;
         const auto session = load_session({golden / L"session.vbo", golden / L"session.csv", golden / L"sanwa.csv"}).session;
         const auto& reference = raw_lap(session, 16);  // Mirrors the currently loaded R15 reference.
         const auto& compare_a = raw_lap(session, 7);  // R6, the known translated GPS lap.
         const auto& compare_b = raw_lap(session, 9);  // R8.
         const auto corners = analysis::suggest_corner_zones(session, reference);
-        require(!corners.empty(), "Golden pre-integration harness produced no analyzable corners");
-        const auto v1 = analysis::analyze_driver_performance(
+        require(!corners.empty(), "Golden integration harness produced no analyzable corners");
+        const auto integrated = analysis::analyze_driver_performance(
             session, reference, &compare_a, &compare_b, corners, analysis::default_analysis_rules());
-        require(!v1.insights.empty(), "Golden pre-integration harness produced no v1 cards");
+        require(!integrated.insights.empty(), "Golden integration harness produced no insight cards");
 
         std::size_t compensation_count = 0;
         std::size_t retained_observation_count = 0;
         std::size_t recommendation_count = 0;
-        for (const auto& insight : v1.insights) {
-            evidence::CandidateEvidence golden_candidate;
-            golden_candidate.sample_period_s = 0.04;
-            golden_candidate.data_confidence = insight.confidence;
-            golden_candidate.technique_change_detected = true;
-            golden_candidate.favorable_local_metric = insight.positive;
-            golden_candidate.retained_effect_s = insight.estimated_time_effect_s;
-            golden_candidate.comparable_laps = 1;
-            golden_candidate.supporting_laps = insight.estimated_time_effect_s <= -0.08 ? 1U : 0U;
-            const auto classified = evidence::evaluate(golden_candidate, parameters);
-            if (classified.outcome == evidence::Outcome::Compensation) ++compensation_count;
-            if (classified.outcome == evidence::Outcome::RetainedGain ||
-                classified.outcome == evidence::Outcome::TradeoffGain) {
+        for (const auto& insight : integrated.insights) {
+            require(insight.time_noise_floor_s >= parameters.minimum_time_floor_s,
+                    "Integrated card did not disclose its dynamic timing floor");
+            require(insight.supporting_laps <= insight.comparable_laps,
+                    "Integrated card has more supporting laps than comparable laps");
+            if (insight.outcome == evidence::Outcome::Compensation) {
+                ++compensation_count;
+                require(insight.recommendation == evidence::Recommendation::None,
+                        "Integrated compensation card produced a recommendation");
+            }
+            if (insight.outcome == evidence::Outcome::RetainedGain ||
+                insight.outcome == evidence::Outcome::TradeoffGain) {
                 ++retained_observation_count;
             }
-            if (classified.recommendation == evidence::Recommendation::RecommendTechnique ||
-                classified.recommendation == evidence::Recommendation::RecommendSequence) {
+            if (insight.recommendation == evidence::Recommendation::RecommendTechnique ||
+                insight.recommendation == evidence::Recommendation::RecommendSequence) {
                 ++recommendation_count;
+                require(insight.reliability == evidence::Reliability::ReliableAssociation,
+                        "Integrated recommendation was not backed by reliable session evidence");
+                require(insight.comparable_laps >= parameters.reliable_comparable_laps &&
+                            insight.supporting_laps >= parameters.reliable_supporting_laps,
+                        "Integrated recommendation bypassed the repeated-lap count gates");
             }
         }
         std::cout << "Golden auto-suggested corners for current R15 reference: " << corners.size() << '\n';
-        std::cout << "Golden v1 cards checked by isolated evidence add-on: " << v1.insights.size() << '\n';
+        std::cout << "Golden cards checked by integrated evidence engine: " << integrated.insights.size() << '\n';
         std::cout << "Golden compensation cards detected: " << compensation_count << '\n';
-        std::cout << "Golden retained-gain observations awaiting repeats: " << retained_observation_count << '\n';
-        require(recommendation_count == 0,
-                "A selected golden comparison was promoted before repeated-lap evidence existed");
+        std::cout << "Golden retained/trade-off gain cards: " << retained_observation_count << '\n';
+        std::cout << "Golden reliable recommendations: " << recommendation_count << '\n';
 
-        std::cout << "All isolated recommendation-evidence add-on checks passed\n";
+        std::cout << "All recommendation-evidence and integration checks passed\n";
         return 0;
     } catch (const std::exception& exception) {
         std::cerr << "Insight-evidence add-on test failure: " << exception.what() << '\n';

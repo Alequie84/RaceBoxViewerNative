@@ -20,6 +20,7 @@ enum class UiWorkspace {
     Analysis,
     Compare,
     Sectors,
+    RaceDay,
 };
 
 struct UtilityPanelPreferences {
@@ -48,6 +49,7 @@ struct UiPreferences {
     bool show_map_grid{true};
     float map_grid_spacing_m{10.0F};
     bool separate_compare_maps{};
+    bool analysis_aligned_map_traces{true};
     int layout_version{kCurrentUiLayoutVersion};
     std::vector<TelemetryPlotId> telemetry_plot_order{default_telemetry_plot_order()};
     WorkspacePreferences workspace;

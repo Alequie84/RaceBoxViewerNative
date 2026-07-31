@@ -27,7 +27,7 @@ powershell -ExecutionPolicy Bypass -File C:\CodexProjects\RaceBoxViewerNative\sc
 | --- | --- |
 | `Project-Paths.ps1` | Shared paths, tool discovery, and process helpers. |
 | `Get-ProjectState.ps1` | Read-only status for source, artifacts, map hashes, server port, and running demo. |
-| `Build-Test-Native.ps1` | Configure, compile, and run all seven CTest targets with the Visual Studio developer environment. Add `-Package` for install and the portable ZIP. |
+| `Build-Test-Native.ps1` | Configure, compile, and run all ten CTest targets with the Visual Studio developer environment. Add `-Package` for install and the portable ZIP. |
 | `Test-BrowserReference.ps1` | Historical frozen-browser validation; do not run unless the user explicitly reopens browser development. |
 | `Start-NativeDemo.ps1` | Launch the C++ UI with the golden VBO, RaceBox CSV, and Sanwa CSV. It quotes paths as one argument line so filenames containing spaces and parentheses work. |
 | `Start-BrowserReference.ps1` | Historical frozen-browser launcher; not part of current development. |
@@ -47,15 +47,18 @@ After editing C++ code, always build/test first and finish by running `Start-Nat
 
 ## What native validation covers
 
-CTest currently reports seven tests:
+CTest currently reports ten tests:
 
 - `racebox_core_golden`: parser/alignment golden values, three Google anchor reprojections and equal map-axis scale, archive round trips, and corruption rejection;
 - `racebox_driver_analysis`: sustained event detectors, thresholds, confidence gates, severity bands, positive feedback, corner metrics, analysis-only GPS translation, and the raw-lap-7/R6 regression;
-- `racebox_insight_evidence_addon`: isolated v2 retained-gain, compensation, downstream-payback, repeatability, guardrail, and golden-session gates; the app does not consume this module yet;
+- `racebox_insight_evidence_addon`: v2 retained-gain, compensation, downstream-payback, repeatability, guardrail, and live driver-analysis integration gates;
 - `racebox_dx11_warp`: Microsoft software-renderer availability;
 - `racebox_one_million_samples`: bounded memory on a large synthetic session;
 - `racebox_plot_order`: stable telemetry IDs, stored ordering, and relative-time visibility behavior.
 - `racebox_ui_preferences`: dark defaults, workspace/density/panel persistence, malformed-file recovery, atomic saving, and one-time layout-v3 backup.
+- `racebox_imu_analysis`: first-stationary-block zero calibration, IMU availability, mounting-independent yaw calibration, sustained low-load/landing detection, high-load and rapid-rotation gates, and empty legacy channels.
+- `racebox_crew_chief`: bounded private-gateway report and evidence contracts.
+- `racebox_race_day`: event/run persistence, pre-run checklist and tire history, golden multi-source loading, canonical analytics CSV, setup-analytics-v3 straight-speed attribution, brake-response indicators, overdriving/tire-scrub risk, chassis-roll amount, and roll-rate math.
 
 After a successful UI-affecting change, manually review the launched native demo in Compare mode: Reference/Compare A/Compare B/Playback distance synchronization, Insights/Rules/Dev Notes, Events/Sectors, graph dragging and annotation attachment, plus triangulated-map drag/lock/reset across a resize.
 

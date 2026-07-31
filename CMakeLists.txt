@@ -64,20 +64,18 @@ target_link_libraries(implot_native PUBLIC imgui_native)
 add_library(racebox_core STATIC
   src/core/parsers.cpp
   src/core/analysis.cpp
+  src/core/crew_chief.cpp
   src/core/driver_analysis.cpp
+  src/core/imu_analysis.cpp
+  src/core/insight_evidence.cpp
   src/core/persistence.cpp
+  src/core/race_day.cpp
   src/core/settings.cpp)
 target_include_directories(racebox_core PUBLIC include)
 target_link_libraries(racebox_core PUBLIC nlohmann_json::nlohmann_json miniz)
-target_link_libraries(racebox_core PUBLIC shell32 ole32)
+target_link_libraries(racebox_core PUBLIC shell32 ole32 winhttp)
+target_compile_definitions(racebox_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(racebox_core PRIVATE /W4 /permissive- /EHsc)
-
-# Pre-integration driver-analysis-v2 evidence add-on. RaceBoxViewer does not
-# link this library yet; only its isolated verification target consumes it.
-add_library(racebox_insight_evidence STATIC
-  src/core/insight_evidence.cpp)
-target_include_directories(racebox_insight_evidence PUBLIC include)
-target_compile_options(racebox_insight_evidence PRIVATE /W4 /permissive- /EHsc)
 
 add_executable(racebox_cli src/cli/main.cpp)
 target_link_libraries(racebox_cli PRIVATE racebox_core)
@@ -106,7 +104,7 @@ target_compile_definitions(racebox_driver_analysis_tests PRIVATE GOLDEN_DIR=L"${
 add_test(NAME racebox_driver_analysis COMMAND racebox_driver_analysis_tests)
 
 add_executable(racebox_insight_evidence_tests tests/insight_evidence_tests.cpp)
-target_link_libraries(racebox_insight_evidence_tests PRIVATE racebox_insight_evidence racebox_core)
+target_link_libraries(racebox_insight_evidence_tests PRIVATE racebox_core)
 target_compile_definitions(racebox_insight_evidence_tests PRIVATE GOLDEN_DIR=L"${CMAKE_SOURCE_DIR}/golden")
 add_test(NAME racebox_insight_evidence_addon COMMAND racebox_insight_evidence_tests)
 
@@ -133,10 +131,25 @@ target_compile_definitions(racebox_ui_preferences_tests PRIVATE WIN32_LEAN_AND_M
 target_compile_options(racebox_ui_preferences_tests PRIVATE /W4 /permissive- /EHsc)
 add_test(NAME racebox_ui_preferences COMMAND racebox_ui_preferences_tests)
 
+add_executable(racebox_imu_analysis_tests tests/imu_analysis_tests.cpp)
+target_link_libraries(racebox_imu_analysis_tests PRIVATE racebox_core)
+add_test(NAME racebox_imu_analysis COMMAND racebox_imu_analysis_tests)
+
+add_executable(racebox_crew_chief_tests tests/crew_chief_tests.cpp)
+target_link_libraries(racebox_crew_chief_tests PRIVATE racebox_core)
+target_compile_definitions(racebox_crew_chief_tests PRIVATE GOLDEN_DIR=L"${CMAKE_SOURCE_DIR}/golden")
+add_test(NAME racebox_crew_chief COMMAND racebox_crew_chief_tests)
+
+add_executable(racebox_race_day_tests tests/race_day_tests.cpp)
+target_link_libraries(racebox_race_day_tests PRIVATE racebox_core)
+target_compile_definitions(racebox_race_day_tests PRIVATE GOLDEN_DIR=L"${CMAKE_SOURCE_DIR}/golden")
+add_test(NAME racebox_race_day COMMAND racebox_race_day_tests)
+
 install(TARGETS RaceBoxViewer racebox_cli RUNTIME DESTINATION .)
 install(FILES VERSION DESTINATION .)
 install(FILES README.md DESTINATION .)
 install(FILES HANDOFF.md DESTINATION .)
+install(FILES docs/race-day-crew-chief.md DESTINATION docs)
 install(FILES "Start RaceBox Demo.cmd" DESTINATION .)
 install(FILES assets/rrr-map.png assets/rrr-map-original.png DESTINATION assets)
 install(FILES golden/session.vbo golden/session.csv golden/sanwa.csv DESTINATION demo)

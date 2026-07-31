@@ -32,12 +32,32 @@ int main(int argc, char** argv) {
             {"lap_steering_correlation", session.alignment.lap_steering_correlation},
             {"alignment_confidence", session.alignment.confidence},
             {"theoretical_best_seconds", seconds(session.theoretical_best.duration_us)},
+            {"imu", {
+                {"available", loaded.imu_analysis.available},
+                {"initial_stationary_zero_used", loaded.imu_analysis.initial_stationary_zero_used},
+                {"zero_begin_seconds", loaded.imu_analysis.initial_stationary_zero_used
+                    ? seconds(session.telemetry.time_us[loaded.imu_analysis.zero_begin_index]) : 0.0},
+                {"acceleration_zero_g", loaded.imu_analysis.acceleration_zero_g},
+                {"vertical_rest_g", loaded.imu_analysis.vertical_rest_g},
+                {"yaw_calibrated", loaded.imu_analysis.calibration.valid},
+                {"yaw_heading_correlation", loaded.imu_analysis.calibration.heading_correlation},
+                {"yaw_calibration_samples", loaded.imu_analysis.calibration.matched_samples},
+                {"events", loaded.imu_analysis.events.size()}
+            }},
             {"diagnostics", loaded.diagnostics}
         };
         for (const auto& lap : session.laps) {
             output["lap_times"].push_back({
                 {"raw_lap", lap.raw_lap}, {"race_lap", lap.race_lap},
                 {"seconds", seconds(lap.duration_us)}, {"phase", static_cast<int>(lap.phase)}});
+        }
+        for (const auto& event : loaded.imu_analysis.events) {
+            output["imu"]["event_list"].push_back({
+                {"type", racebox::imu::event_name(event.type)},
+                {"seconds", seconds(event.time_us)},
+                {"magnitude", event.magnitude},
+                {"confidence", event.confidence}
+            });
         }
         std::cout << std::setw(2) << output << '\n';
         return 0;
@@ -46,4 +66,3 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
-

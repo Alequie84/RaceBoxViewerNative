@@ -51,6 +51,8 @@ int main() {
     passed &= expect(!missing.preferences.workspace.utility_panels.diagnostics,
                      "optional utility panels default hidden");
     passed &= expect(missing.preferences.show_turn_numbers, "turn numbers default visible");
+    passed &= expect(missing.preferences.analysis_aligned_map_traces,
+                     "analysis-aligned comparison traces default visible");
 
     {
         std::ofstream legacy(preferences_path);
@@ -102,6 +104,7 @@ int main() {
     saved.workspace.telemetry_density = TelemetryDensity::Detailed;
     saved.workspace.utility_panels.altitude = true;
     saved.workspace.utility_panels.theoretical_analysis = true;
+    saved.analysis_aligned_map_traces = false;
     saved.telemetry_plot_order = {TelemetryPlotId::Steering, TelemetryPlotId::Speed};
     std::string save_error;
     passed &= expect(save_ui_preferences_atomic(preferences_path, saved, &save_error), "atomic preference save succeeds");
@@ -119,6 +122,8 @@ int main() {
                      "workspace, density, and utility visibility round trip");
     passed &= expect(round_trip.preferences.map_grid_spacing_m == 25.0F, "unsafe grid spacing is clamped");
     passed &= expect(!round_trip.preferences.show_turn_numbers, "turn-number visibility round trips");
+    passed &= expect(!round_trip.preferences.analysis_aligned_map_traces,
+                     "analysis-aligned trace visibility round trips");
     passed &= expect(round_trip.preferences.telemetry_plot_order.front() == TelemetryPlotId::Steering &&
                          round_trip.preferences.telemetry_plot_order[1] == TelemetryPlotId::Speed &&
                          round_trip.preferences.telemetry_plot_order.size() == kDefaultTelemetryPlotOrder.size(),

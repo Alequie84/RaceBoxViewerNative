@@ -45,6 +45,25 @@ std::vector<std::filesystem::path> open_telemetry_files(HWND owner) {
     return paths;
 }
 
+std::optional<std::filesystem::path> open_race_day_file(HWND owner) {
+    IFileOpenDialog* dialog = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&dialog)))) return std::nullopt;
+    dialog->SetTitle(L"Open RaceBox Race Day");
+    const COMDLG_FILTERSPEC filters[] = {{L"RaceBox race day", L"*.rbxday"}};
+    dialog->SetFileTypes(1, filters);
+    dialog->SetOptions(FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
+    std::optional<std::filesystem::path> result;
+    if (SUCCEEDED(dialog->Show(owner))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&item))) {
+            result = shell_path(item);
+            item->Release();
+        }
+    }
+    dialog->Release();
+    return result;
+}
+
 std::optional<std::filesystem::path> open_image_file(HWND owner) {
     IFileOpenDialog* dialog = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&dialog)))) return std::nullopt;

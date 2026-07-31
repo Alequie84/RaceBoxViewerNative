@@ -1,4 +1,5 @@
 #include "native_app.hpp"
+#include "racebox_version.h"
 #include "ui_preferences.hpp"
 #include "ui_theme.hpp"
 
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <ctime>
 #include <cwctype>
 #include <fstream>
 #include <format>
@@ -23,9 +25,330 @@ namespace {
 
 constexpr Timestamp kSecond = 1'000'000;
 
+std::string environment_variable(const char* name) {
+    const auto length = GetEnvironmentVariableA(name, nullptr, 0);
+    if (length == 0) return {};
+    std::string value(length, '\0');
+    const auto copied = GetEnvironmentVariableA(name, value.data(), length);
+    if (copied == 0 || copied >= length) return {};
+    value.resize(copied);
+    return value;
+}
+
+template <std::size_t Size>
+void set_text_buffer(std::array<char, Size>& buffer, std::string_view text) {
+    buffer.fill('\0');
+    std::copy_n(text.begin(), std::min(text.size(), Size - 1), buffer.begin());
+}
+
+struct StringInputUserData {
+    std::string* value{};
+    ImGuiInputTextCallback chained_callback{};
+    void* chained_user_data{};
+};
+
+int string_input_callback(ImGuiInputTextCallbackData* data) {
+    auto* user_data = static_cast<StringInputUserData*>(data->UserData);
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
+        auto* value = user_data->value;
+        value->resize(static_cast<std::size_t>(data->BufTextLen));
+        data->Buf = value->data();
+    } else if (user_data->chained_callback) {
+        data->UserData = user_data->chained_user_data;
+        return user_data->chained_callback(data);
+    }
+    return 0;
+}
+
+bool input_text_string(const char* label, std::string& value,
+                       ImGuiInputTextFlags flags = 0,
+                       ImGuiInputTextCallback callback = nullptr,
+                       void* user_data = nullptr) {
+    flags |= ImGuiInputTextFlags_CallbackResize;
+    StringInputUserData data{&value, callback, user_data};
+    return ImGui::InputText(label, value.data(), value.capacity() + 1, flags, string_input_callback, &data);
+}
+
+bool input_text_multiline_string(const char* label, std::string& value, ImVec2 size,
+                                 ImGuiInputTextFlags flags = 0) {
+    flags |= ImGuiInputTextFlags_CallbackResize;
+    StringInputUserData data{&value, nullptr, nullptr};
+    return ImGui::InputTextMultiline(
+        label, value.data(), value.capacity() + 1, size, flags, string_input_callback, &data);
+}
+
+std::string local_date_label() {
+    std::time_t now = std::time(nullptr);
+    std::tm local{};
+    localtime_s(&local, &now);
+    return std::format("{:04}-{:02}-{:02}", local.tm_year + 1900, local.tm_mon + 1, local.tm_mday);
+}
+
+std::string utc_timestamp() {
+    std::time_t now = std::time(nullptr);
+    std::tm utc{};
+    gmtime_s(&utc, &now);
+    return std::format("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+        utc.tm_hour, utc.tm_min, utc.tm_sec);
+}
+
+std::string setup_knowledge_id(
+    std::string_view previous_run_id,
+    std::string_view current_run_id,
+    std::string_view question,
+    std::string_view setup_change,
+    std::string_view driver_result) {
+    std::uint64_t hash = 14'695'981'039'346'656'037ULL;
+    const auto add = [&](std::string_view value) {
+        for (const auto character : value) {
+            hash ^= static_cast<unsigned char>(character);
+            hash *= 1'099'511'628'211ULL;
+        }
+        hash ^= 0xFFU;
+        hash *= 1'099'511'628'211ULL;
+    };
+    add(previous_run_id);
+    add(current_run_id);
+    add(question);
+    add(setup_change);
+    add(driver_result);
+    return std::format("setup-result-{:016X}", hash);
+}
+
+void apply_crew_chief_report(
+    race_day::SetupKnowledgeRecord& record,
+    const crew_chief::Report& report) {
+    record.verdict = report.verdict;
+    record.confidence = report.confidence;
+    record.summary = report.summary;
+    record.observations.clear();
+    for (const auto& observation : report.observations) {
+        record.observations.push_back({
+            observation.area, observation.change, observation.meaning, observation.evidence_ids});
+    }
+    record.confounds = report.confounds;
+    record.next_test = report.next_test;
+    record.causality_note = report.causality_note;
+    record.route = report.route;
+    record.model = report.model;
+    record.thinking = report.thinking;
+    record.selected_lane = report.selected_lane;
+    record.evidence = {
+        report.evidence.analytics_contract,
+        report.evidence.formula_version,
+        report.evidence.quality_confidence,
+        report.evidence.track_status,
+        report.evidence.track_translation_m,
+        report.evidence.track_residual_rms_m,
+        report.evidence.lap_time_delta_s,
+        report.evidence.lateral_status,
+        report.evidence.lateral_response_delta_g,
+        report.evidence.forward_status,
+        report.evidence.forward_bite_delta_g,
+        report.evidence.previous_brake_indicators,
+        report.evidence.current_brake_indicators,
+        report.evidence.top_speed_status,
+        report.evidence.straight_top_speed_delta_kmh,
+        report.evidence.straight_entry_speed_delta_kmh,
+        report.evidence.straight_acceleration_delta_g,
+        report.evidence.straight_speed_attribution,
+        report.evidence.brake_response_status,
+        report.evidence.brake_decel_delta_g,
+        report.evidence.brake_response_delay_delta_s,
+        report.evidence.corner_balance_status,
+        report.evidence.steering_for_lateral_g_delta_percent,
+        report.evidence.yaw_per_steering_delta_dps,
+        report.evidence.overdriving_status,
+        report.evidence.overdriving_index_delta,
+        report.evidence.overdriving_risk_sample_delta_percent,
+        report.evidence.current_late_overdriving_delta_score,
+        report.evidence.chassis_roll_status,
+        report.evidence.surface_tilt_delta_deg,
+        report.evidence.chassis_roll_delta_deg,
+        report.evidence.roll_per_lateral_g_delta_deg,
+        report.evidence.roll_rate_status,
+        report.evidence.previous_roll_rate_p90_dps,
+        report.evidence.current_roll_rate_p90_dps,
+        report.evidence.roll_rate_delta_dps,
+        report.evidence.roll_rate_per_lateral_g_delta_dps,
+        report.evidence.current_late_roll_rate_delta_dps,
+        report.evidence.previous_roll_rate_samples,
+        report.evidence.current_roll_rate_samples,
+        report.evidence.current_surface_tilt_source,
+        report.evidence.current_surface_tilt_samples,
+    };
+}
+
+void fill_missing_setup_evidence(
+    crew_chief::Report& report,
+    const race_day::SetupAnalyticsSummary& summary) {
+    report.evidence.analytics_contract = summary.analytics_contract;
+    report.evidence.formula_version = summary.formula_version;
+    if (report.evidence.quality_confidence == 0) report.evidence.quality_confidence = summary.quality_confidence;
+    if (report.evidence.track_status.empty()) report.evidence.track_status = summary.track_status;
+    if (!report.evidence.lap_time_delta_s) report.evidence.lap_time_delta_s = summary.lap_time_delta_s;
+    if (report.evidence.lateral_status.empty()) report.evidence.lateral_status = summary.lateral_status;
+    if (!report.evidence.lateral_response_delta_g) report.evidence.lateral_response_delta_g = summary.lateral_response_delta_g;
+    if (report.evidence.forward_status.empty()) report.evidence.forward_status = summary.forward_status;
+    if (!report.evidence.forward_bite_delta_g) report.evidence.forward_bite_delta_g = summary.forward_bite_delta_g;
+    if (report.evidence.previous_brake_indicators == 0) {
+        report.evidence.previous_brake_indicators = summary.previous_brake_indicators;
+    }
+    if (report.evidence.current_brake_indicators == 0) {
+        report.evidence.current_brake_indicators = summary.current_brake_indicators;
+    }
+    if (report.evidence.top_speed_status.empty()) report.evidence.top_speed_status = summary.top_speed_status;
+    if (!report.evidence.straight_top_speed_delta_kmh) {
+        report.evidence.straight_top_speed_delta_kmh = summary.straight_top_speed_delta_kmh;
+    }
+    if (!report.evidence.straight_entry_speed_delta_kmh) {
+        report.evidence.straight_entry_speed_delta_kmh = summary.straight_entry_speed_delta_kmh;
+    }
+    if (!report.evidence.straight_acceleration_delta_g) {
+        report.evidence.straight_acceleration_delta_g = summary.straight_acceleration_delta_g;
+    }
+    if (report.evidence.straight_speed_attribution.empty()) {
+        report.evidence.straight_speed_attribution = summary.straight_speed_attribution;
+    }
+    if (report.evidence.brake_response_status.empty()) {
+        report.evidence.brake_response_status = summary.brake_response_status;
+    }
+    if (!report.evidence.brake_decel_delta_g) report.evidence.brake_decel_delta_g = summary.brake_decel_delta_g;
+    if (!report.evidence.brake_response_delay_delta_s) {
+        report.evidence.brake_response_delay_delta_s = summary.brake_response_delay_delta_s;
+    }
+    if (report.evidence.corner_balance_status.empty()) {
+        report.evidence.corner_balance_status = summary.corner_balance_status;
+    }
+    if (!report.evidence.steering_for_lateral_g_delta_percent) {
+        report.evidence.steering_for_lateral_g_delta_percent = summary.steering_for_lateral_g_delta_percent;
+    }
+    if (!report.evidence.yaw_per_steering_delta_dps) {
+        report.evidence.yaw_per_steering_delta_dps = summary.yaw_per_steering_delta_dps;
+    }
+    if (report.evidence.overdriving_status.empty()) {
+        report.evidence.overdriving_status = summary.overdriving_status;
+    }
+    if (!report.evidence.overdriving_index_delta) {
+        report.evidence.overdriving_index_delta = summary.overdriving_index_delta;
+    }
+    if (!report.evidence.overdriving_risk_sample_delta_percent) {
+        report.evidence.overdriving_risk_sample_delta_percent = summary.overdriving_risk_sample_delta_percent;
+    }
+    if (!report.evidence.current_late_overdriving_delta_score) {
+        report.evidence.current_late_overdriving_delta_score = summary.current_late_overdriving_delta_score;
+    }
+    if (report.evidence.chassis_roll_status.empty()) {
+        report.evidence.chassis_roll_status = summary.chassis_roll_status;
+    }
+    if (!report.evidence.surface_tilt_delta_deg) {
+        report.evidence.surface_tilt_delta_deg = summary.surface_tilt_delta_deg;
+    }
+    if (!report.evidence.chassis_roll_delta_deg) {
+        report.evidence.chassis_roll_delta_deg = summary.chassis_roll_delta_deg;
+    }
+    if (!report.evidence.roll_per_lateral_g_delta_deg) {
+        report.evidence.roll_per_lateral_g_delta_deg = summary.roll_per_lateral_g_delta_deg;
+    }
+    if (report.evidence.roll_rate_status.empty()) {
+        report.evidence.roll_rate_status = summary.roll_rate_status;
+    }
+    if (!report.evidence.previous_roll_rate_p90_dps) {
+        report.evidence.previous_roll_rate_p90_dps = summary.previous_roll_rate_p90_dps;
+    }
+    if (!report.evidence.current_roll_rate_p90_dps) {
+        report.evidence.current_roll_rate_p90_dps = summary.current_roll_rate_p90_dps;
+    }
+    if (!report.evidence.roll_rate_delta_dps) {
+        report.evidence.roll_rate_delta_dps = summary.roll_rate_delta_dps;
+    }
+    if (!report.evidence.roll_rate_per_lateral_g_delta_dps) {
+        report.evidence.roll_rate_per_lateral_g_delta_dps = summary.roll_rate_per_lateral_g_delta_dps;
+    }
+    if (!report.evidence.current_late_roll_rate_delta_dps) {
+        report.evidence.current_late_roll_rate_delta_dps = summary.current_late_roll_rate_delta_dps;
+    }
+    if (report.evidence.previous_roll_rate_samples == 0) {
+        report.evidence.previous_roll_rate_samples = summary.previous_roll_rate_samples;
+    }
+    if (report.evidence.current_roll_rate_samples == 0) {
+        report.evidence.current_roll_rate_samples = summary.current_roll_rate_samples;
+    }
+    if (report.evidence.current_surface_tilt_source.empty()) {
+        report.evidence.current_surface_tilt_source = summary.current_surface_tilt_source;
+    }
+    if (report.evidence.current_surface_tilt_samples == 0) {
+        report.evidence.current_surface_tilt_samples = summary.current_surface_tilt_samples;
+    }
+}
+
+nlohmann::json race_day_run_context(const race_day::Day& day, const race_day::Run& run) {
+    auto checklist = nlohmann::json::array();
+    int checklist_complete = 0;
+    for (const auto& item : run.checklist) {
+        checklist.push_back({
+            {"id", item.id},
+            {"label", item.label},
+            {"checked", item.checked},
+            {"note", item.note},
+        });
+        if (item.checked) ++checklist_complete;
+    }
+    const auto number_or_null = [](const std::optional<double>& value) {
+        return value ? nlohmann::json(*value) : nlohmann::json(nullptr);
+    };
+    return {
+        {"event", {
+            {"name", day.event_name},
+            {"track", day.track_name},
+            {"date", day.date},
+        }},
+        {"run", {
+            {"id", run.id},
+            {"label", run.label},
+            {"kind", race_day::kind_name(run.kind)},
+            {"ordinal", run.ordinal},
+            {"main_group", std::string(1, run.main_group)},
+            {"main_leg", run.main_leg},
+        }},
+        {"notes", {
+            {"pre_run", run.pre_run_notes},
+            {"setup_changes", run.setup_changes},
+            {"post_run_driver_feel", run.post_run_notes},
+        }},
+        {"conditions", {
+            {"ambient_temperature_c", number_or_null(run.conditions.ambient_temperature_c)},
+            {"track_temperature_c", number_or_null(run.conditions.track_temperature_c)},
+            {"track_condition", run.conditions.track_condition},
+            {"tire_set_id", run.conditions.tire_set_id},
+            {"tire_compound", run.conditions.tire_compound},
+            {"tire_runs_before", run.conditions.tire_runs_before >= 0
+                ? nlohmann::json(run.conditions.tire_runs_before) : nlohmann::json(nullptr)},
+            {"sauce_compound", run.conditions.sauce_compound},
+            {"sauce_minutes_before", run.conditions.sauce_minutes_before >= 0
+                ? nlohmann::json(run.conditions.sauce_minutes_before) : nlohmann::json(nullptr)},
+            {"tire_warmer_minutes", run.conditions.tire_warmer_minutes >= 0
+                ? nlohmann::json(run.conditions.tire_warmer_minutes) : nlohmann::json(nullptr)},
+            {"tire_warmer_temperature_c", number_or_null(run.conditions.tire_warmer_temperature_c)},
+            {"battery_pack", run.conditions.battery_pack},
+            {"battery_voltage", number_or_null(run.conditions.battery_voltage)},
+        }},
+        {"pre_run_checklist", {
+            {"completed", checklist_complete},
+            {"total", run.checklist.size()},
+            {"items", std::move(checklist)},
+        }},
+        {"attached_sources", {
+            {"file_count", run.telemetry_files.size()},
+            {"original_paths_shared", false},
+        }},
+    };
+}
+
 float application_header_height() {
     const auto* viewport = ImGui::GetMainViewport();
-    return 88.0F * std::clamp(viewport ? viewport->DpiScale : 1.0F, 1.0F, 2.0F);
+    return 104.0F * std::clamp(viewport ? viewport->DpiScale : 1.0F, 1.0F, 2.0F);
 }
 
 std::string recorded_time_label(const Session* session) {
@@ -65,6 +388,75 @@ std::size_t automatic_corner_limit(const Session& session) {
     // known layout prevents a moved start line from promoting a minor ripple
     // into a tenth label; unknown tracks retain the general twelve-turn cap.
     return uses_parking_track_background(session) ? std::size_t{9} : std::size_t{12};
+}
+
+const char* insight_outcome_label(insight_evidence::Outcome outcome) noexcept {
+    switch (outcome) {
+    case insight_evidence::Outcome::DataLimited: return "NOT ENOUGH DATA";
+    case insight_evidence::Outcome::Inconclusive: return "NO CLEAR TIME EFFECT";
+    case insight_evidence::Outcome::NetLoss: return "TIME LOST";
+    case insight_evidence::Outcome::Compensation: return "RECOVERY ONLY";
+    case insight_evidence::Outcome::RetainedGain: return "TIME GAIN HELD";
+    case insight_evidence::Outcome::TradeoffGain: return "WHOLE-CORNER GAIN";
+    }
+    return "RESULT UNKNOWN";
+}
+
+const char* insight_reliability_label(insight_evidence::Reliability reliability) noexcept {
+    switch (reliability) {
+    case insight_evidence::Reliability::Unproven: return "NOT REPEATED YET";
+    case insight_evidence::Reliability::Likely: return "PROMISING PATTERN";
+    case insight_evidence::Reliability::ReliableAssociation: return "REPEATED AND CONSISTENT";
+    }
+    return "RELIABILITY UNKNOWN";
+}
+
+const char* insight_recommendation_label(insight_evidence::Recommendation recommendation) noexcept {
+    switch (recommendation) {
+    case insight_evidence::Recommendation::None: return "NO DRIVING CHANGE";
+    case insight_evidence::Recommendation::Observe: return "WATCH ONLY";
+    case insight_evidence::Recommendation::Validate: return "TEST AGAIN";
+    case insight_evidence::Recommendation::RecommendTechnique: return "TRY THIS TECHNIQUE";
+    case insight_evidence::Recommendation::RecommendSequence: return "COPY THE WHOLE SEQUENCE";
+    }
+    return "NO RECOMMENDATION";
+}
+
+const char* insight_reason_label(insight_evidence::Reason reason) noexcept {
+    switch (reason) {
+    case insight_evidence::Reason::InvalidInput: return "invalid analysis input";
+    case insight_evidence::Reason::LowDataConfidence: return "recording quality is too low";
+    case insight_evidence::Reason::IncompleteLap: return "lap is incomplete";
+    case insight_evidence::Reason::TelemetryGap: return "recording has a data gap";
+    case insight_evidence::Reason::ContextChanged: return "setup or conditions changed";
+    case insight_evidence::Reason::LineMetricDisabled: return "GPS line comparison is unavailable";
+    case insight_evidence::Reason::BelowNoiseFloor: return "difference is smaller than normal timing variation";
+    case insight_evidence::Reason::PriorPhaseLoss: return "time was lost earlier in the corner";
+    case insight_evidence::Reason::DownstreamPayback: return "most of the local gain was lost afterward";
+    case insight_evidence::Reason::TrackLimitViolation: return "track limits were exceeded";
+    case insight_evidence::Reason::ExtraSteeringCorrection: return "an extra steering correction was needed";
+    case insight_evidence::Reason::PossibleInstability: return "possible instability was detected";
+    case insight_evidence::Reason::AggregateEvidenceMissing: return "more matching laps are needed";
+    case insight_evidence::Reason::InsufficientComparableLaps: return "too few matching laps";
+    case insight_evidence::Reason::InsufficientSupportingLaps: return "too few laps showed the same result";
+    case insight_evidence::Reason::LowSupportRate: return "the result did not repeat often enough";
+    case insight_evidence::Reason::ReliabilityIntervalCrossesNoise: return "normal variation could explain the result";
+    }
+    return "evidence unavailable";
+}
+
+std::string timing_position_label(double effect_s) {
+    constexpr double epsilon = 0.0005;
+    if (effect_s < -epsilon) return std::format("{:.3f} s ahead", -effect_s);
+    if (effect_s > epsilon) return std::format("{:.3f} s behind", effect_s);
+    return "even with reference";
+}
+
+std::string timing_change_label(double effect_s) {
+    constexpr double epsilon = 0.0005;
+    if (effect_s < -epsilon) return std::format("gained {:.3f} s", -effect_s);
+    if (effect_s > epsilon) return std::format("lost {:.3f} s", effect_s);
+    return "no measurable change";
 }
 
 std::filesystem::path triangulated_map_path() {
@@ -262,6 +654,16 @@ std::size_t fastest_complete_lap(const std::vector<LapInfo>& laps) {
 
 NativeApp::NativeApp(HWND window, ID3D11Device* device, bool software_renderer)
     : window_(window), device_(device), software_renderer_(software_renderer) {
+    auto crew_endpoint = environment_variable("RACEBOX_CREW_CHIEF_URL");
+    if (crew_endpoint.empty()) {
+        crew_endpoint = "http://100.73.60.87:18804/v1/crew-chief/chat";
+    }
+    set_text_buffer(crew_chief_endpoint_, crew_endpoint);
+    set_text_buffer(crew_chief_question_,
+        "What does the telemetry say changed, did the change produce a reliable gain, and what should I test next?");
+    crew_chief_bearer_token_ = environment_variable("RACEBOX_CREW_CHIEF_TOKEN");
+    race_day_ = race_day::standard_day(false, false);
+    race_day_.date = local_date_label();
     const auto loaded = load_ui_preferences(settings_directory() / L"preferences.json");
     const auto& preferences = loaded.preferences;
     light_theme_ = preferences.light_theme;
@@ -272,6 +674,7 @@ NativeApp::NativeApp(HWND window, ID3D11Device* device, bool software_renderer)
     show_map_grid_ = preferences.show_map_grid;
     map_grid_spacing_m_ = preferences.map_grid_spacing_m;
     separate_compare_maps_ = preferences.separate_compare_maps;
+    show_analysis_aligned_traces_ = preferences.analysis_aligned_map_traces;
     telemetry_plot_order_ = preferences.telemetry_plot_order;
     compact_telemetry_ = preferences.workspace.telemetry_density == TelemetryDensity::Compact;
     show_radio_panel_ = preferences.workspace.utility_panels.radio_alignment;
@@ -307,6 +710,7 @@ NativeApp::~NativeApp() {
     preferences.show_map_grid = show_map_grid_;
     preferences.map_grid_spacing_m = map_grid_spacing_m_;
     preferences.separate_compare_maps = separate_compare_maps_;
+    preferences.analysis_aligned_map_traces = show_analysis_aligned_traces_;
     preferences.layout_version = loaded_layout_version_;
     preferences.telemetry_plot_order = telemetry_plot_order_;
     preferences.workspace.active = static_cast<UiWorkspace>(workspace_section_);
@@ -432,6 +836,13 @@ void NativeApp::reset_workspace_state() {
     selected_insight_index_ = -1;
     selected_corner_index_ = -1;
     session_notes_.fill('\0');
+    crew_chief_setup_change_.fill('\0');
+    set_text_buffer(crew_chief_question_,
+        "What does the telemetry say changed, did the change produce a reliable gain, and what should I test next?");
+    crew_chief_after_slot_ = driver_analysis::ComparisonSlot::CompareA;
+    crew_chief_history_.clear();
+    crew_chief_report_.reset();
+    crew_chief_error_.clear();
     annotations_.clear();
     next_annotation_id_ = 1;
     selected_annotation_id_ = 0;
@@ -439,12 +850,17 @@ void NativeApp::reset_workspace_state() {
 
 std::string NativeApp::serialize_workspace_state() const {
     nlohmann::json state{
-        {"format", "racebox-native-workspace"}, {"version", 2},
+        {"format", "racebox-native-workspace"}, {"version", 4},
         {"formula_version", std::string(driver_analysis::kFormulaVersion)},
         {"fastest_reference", fastest_reference_}, {"reference_index", active_lap_index_},
         {"compare_a_index", compare_lap_index_}, {"compare_b_index", compare_b_lap_index_},
         {"playback_index", playback_lap_index_}, {"view_mode", static_cast<int>(view_mode_)},
         {"session_notes", std::string(session_notes_.data())},
+        {"crew_chief", {
+            {"setup_change", std::string(crew_chief_setup_change_.data())},
+            {"question", std::string(crew_chief_question_.data())},
+            {"after_slot", crew_chief_after_slot_ == driver_analysis::ComparisonSlot::CompareA ? "compare_a" : "compare_b"},
+            {"history", nlohmann::json::array()}}},
         {"rules", nlohmann::json::array()}, {"corners", nlohmann::json::array()},
         {"annotations", nlohmann::json::array()},
         {"detectors", {
@@ -459,7 +875,20 @@ std::string NativeApp::serialize_workspace_state() const {
             {"first_throttle_percent", analysis_rules_.first_throttle_percent},
             {"full_throttle_percent", analysis_rules_.full_throttle_percent},
             {"steering_correction_percent", analysis_rules_.steering_correction_percent},
-            {"turn_in_curvature_per_m", analysis_rules_.turn_in_curvature_per_m}}}
+            {"turn_in_curvature_per_m", analysis_rules_.turn_in_curvature_per_m}}},
+        {"evidence", {
+            {"minimum_time_floor_s", analysis_rules_.evidence.minimum_time_floor_s},
+            {"sample_period_multiplier", analysis_rules_.evidence.sample_period_multiplier},
+            {"repeatability_sigma_multiplier", analysis_rules_.evidence.repeatability_sigma_multiplier},
+            {"maximum_payback_fraction", analysis_rules_.evidence.maximum_payback_fraction},
+            {"minimum_data_confidence", analysis_rules_.evidence.minimum_data_confidence},
+            {"reliable_data_confidence", analysis_rules_.evidence.reliable_data_confidence},
+            {"likely_comparable_laps", analysis_rules_.evidence.likely_comparable_laps},
+            {"likely_supporting_laps", analysis_rules_.evidence.likely_supporting_laps},
+            {"likely_support_rate", analysis_rules_.evidence.likely_support_rate},
+            {"reliable_comparable_laps", analysis_rules_.evidence.reliable_comparable_laps},
+            {"reliable_supporting_laps", analysis_rules_.evidence.reliable_supporting_laps},
+            {"reliable_support_rate", analysis_rules_.evidence.reliable_support_rate}}}
     };
     for (const auto& rule : analysis_rules_.metrics) {
         state["rules"].push_back({{"id", static_cast<int>(rule.id)}, {"enabled", rule.enabled}, {"threshold", rule.threshold}});
@@ -479,6 +908,12 @@ std::string NativeApp::serialize_workspace_state() const {
             {"view_mode", static_cast<int>(annotation.view_mode)}, {"note", std::string(annotation.note.data())}
         });
     }
+    for (const auto& turn : crew_chief_history_) {
+        state["crew_chief"]["history"].push_back({
+            {"role", turn.role == "assistant" ? "assistant" : "user"},
+            {"content", turn.content.substr(0, 4000)}
+        });
+    }
     return state.dump();
 }
 
@@ -496,6 +931,22 @@ void NativeApp::restore_workspace_state() {
         view_mode_ = static_cast<ViewMode>(std::clamp(state.value("view_mode", static_cast<int>(view_mode_)), 0, 2));
         const auto notes = state.value("session_notes", std::string{});
         std::copy_n(notes.begin(), std::min(notes.size(), session_notes_.size() - 1), session_notes_.begin());
+        if (const auto crew = state.find("crew_chief"); crew != state.end() && crew->is_object()) {
+            set_text_buffer(crew_chief_setup_change_, crew->value("setup_change", std::string{}));
+            set_text_buffer(crew_chief_question_, crew->value("question",
+                std::string{"What does the telemetry say changed, did the change produce a reliable gain, and what should I test next?"}));
+            crew_chief_after_slot_ = crew->value("after_slot", std::string{"compare_a"}) == "compare_b"
+                ? driver_analysis::ComparisonSlot::CompareB
+                : driver_analysis::ComparisonSlot::CompareA;
+            crew_chief_history_.clear();
+            for (const auto& turn : crew->value("history", nlohmann::json::array())) {
+                if (!turn.is_object() || crew_chief_history_.size() >= 20) break;
+                crew_chief_history_.push_back({
+                    turn.value("role", std::string{"user"}) == "assistant" ? "assistant" : "user",
+                    turn.value("content", std::string{}).substr(0, 4000)
+                });
+            }
+        }
         for (const auto& value : state.value("rules", nlohmann::json::array())) {
             const auto id = static_cast<driver_analysis::RuleId>(value.value("id", -1));
             for (auto& rule : analysis_rules_.metrics) {
@@ -517,6 +968,29 @@ void NativeApp::restore_workspace_state() {
             analysis_rules_.full_throttle_percent = detectors->value("full_throttle_percent", analysis_rules_.full_throttle_percent);
             analysis_rules_.steering_correction_percent = detectors->value("steering_correction_percent", analysis_rules_.steering_correction_percent);
             analysis_rules_.turn_in_curvature_per_m = detectors->value("turn_in_curvature_per_m", analysis_rules_.turn_in_curvature_per_m);
+        }
+        if (const auto evidence = state.find("evidence"); evidence != state.end() && evidence->is_object()) {
+            auto& parameters = analysis_rules_.evidence;
+            parameters.minimum_time_floor_s = std::clamp(evidence->value("minimum_time_floor_s", parameters.minimum_time_floor_s), 0.001, 2.0);
+            parameters.sample_period_multiplier = std::clamp(evidence->value("sample_period_multiplier", parameters.sample_period_multiplier), 0.01, 20.0);
+            parameters.repeatability_sigma_multiplier = std::clamp(evidence->value("repeatability_sigma_multiplier", parameters.repeatability_sigma_multiplier), 0.0, 20.0);
+            parameters.maximum_payback_fraction = std::clamp(evidence->value("maximum_payback_fraction", parameters.maximum_payback_fraction), 0.0, 1.0);
+            parameters.minimum_data_confidence = std::clamp(evidence->value("minimum_data_confidence", parameters.minimum_data_confidence), 0, 100);
+            parameters.reliable_data_confidence = std::clamp(evidence->value("reliable_data_confidence", parameters.reliable_data_confidence), parameters.minimum_data_confidence, 100);
+            parameters.likely_comparable_laps = static_cast<std::size_t>(std::clamp(
+                evidence->value("likely_comparable_laps", static_cast<int>(parameters.likely_comparable_laps)), 1, 1000));
+            parameters.likely_supporting_laps = static_cast<std::size_t>(std::clamp(
+                evidence->value("likely_supporting_laps", static_cast<int>(parameters.likely_supporting_laps)),
+                1, static_cast<int>(parameters.likely_comparable_laps)));
+            parameters.likely_support_rate = std::clamp(evidence->value("likely_support_rate", parameters.likely_support_rate), 0.0, 1.0);
+            parameters.reliable_comparable_laps = static_cast<std::size_t>(std::clamp(
+                evidence->value("reliable_comparable_laps", static_cast<int>(parameters.reliable_comparable_laps)),
+                static_cast<int>(parameters.likely_comparable_laps), 1000));
+            parameters.reliable_supporting_laps = static_cast<std::size_t>(std::clamp(
+                evidence->value("reliable_supporting_laps", static_cast<int>(parameters.reliable_supporting_laps)),
+                static_cast<int>(parameters.likely_supporting_laps), static_cast<int>(parameters.reliable_comparable_laps)));
+            parameters.reliable_support_rate = std::clamp(evidence->value("reliable_support_rate", parameters.reliable_support_rate),
+                parameters.likely_support_rate, 1.0);
         }
         for (const auto& value : state.value("corners", nlohmann::json::array())) {
             driver_analysis::CornerZone corner;
@@ -720,6 +1194,7 @@ void NativeApp::begin_load(const std::vector<std::filesystem::path>& files) {
             LoadResult result;
             std::string error;
             if (!load_session_archive(archive, result.session, error)) throw std::runtime_error(error);
+            result.imu_analysis = imu::analyze(result.session.telemetry);
             result.diagnostics.emplace_back("Loaded native session archive");
             return result;
         });
@@ -746,6 +1221,7 @@ void NativeApp::begin_load(const std::vector<std::filesystem::path>& files) {
             if (result.session.telemetry.empty()) throw std::runtime_error("GPX contains no track points");
             result.session.laps.push_back({1, 0, 0, result.session.telemetry.size() - 1,
                 result.session.telemetry.time_us.back(), LapPhase::InLap});
+            result.imu_analysis = imu::analyze(result.session.telemetry);
             return result;
         });
         return;
@@ -789,6 +1265,7 @@ void NativeApp::begin_load(const std::vector<std::filesystem::path>& files) {
             }
             result.session.sector_markers = default_sector_markers(result.session);
             result.session.theoretical_best = calculate_theoretical_best(result.session);
+            result.imu_analysis = imu::analyze(result.session.telemetry);
             return result;
         });
     }
@@ -803,6 +1280,7 @@ void NativeApp::poll_loader() {
             return value.rfind("WARNING:", 0) == 0;
         });
         session_ = std::move(loaded.session);
+        imu_analysis_ = std::move(loaded.imu_analysis);
         auto average_track = build_average_track_profile(*session_);
         average_track_latitude_ = std::move(average_track.latitude);
         average_track_longitude_ = std::move(average_track.longitude);
@@ -951,6 +1429,14 @@ bool NativeApp::render() {
     ImGui::End();
     ImGui::PopStyleVar(2);
 
+    if (workspace_section_ == WorkspaceSection::RaceDay) {
+        draw_review_locked([&] { draw_race_day(); });
+        draw_annotations();
+        handle_annotation_workspace();
+        if (!hover_seen_this_frame_) hover_cursor_us_.reset();
+        return !exit_requested_;
+    }
+
     draw_review_locked([&] { draw_playback(); });
     draw_map();
     draw_telemetry();
@@ -1017,14 +1503,28 @@ void NativeApp::draw_app_header() {
     }
 
     if (ImGui::BeginMenuBar()) {
+        const auto toggle_theme = [&] {
+            light_theme_ = !light_theme_;
+            ui::apply_theme(light_theme_ ? ui::ThemeMode::Light : ui::ThemeMode::Dark,
+                            ui::dpi_scale_for_window(window_));
+            status_ = light_theme_ ? "Light mode enabled" : "Dark mode enabled";
+        };
         ImGui::TextColored(ImVec4(0.95F, 0.10F, 0.28F, 1.0F), "R");
         ImGui::SameLine(0.0F, 4.0F);
         ImGui::TextUnformatted("RACEBOX");
         ImGui::SameLine(0.0F, 8.0F);
         ImGui::TextDisabled("Telemetry Analysis");
+        ImGui::SameLine(0.0F, 6.0F);
+        ImGui::TextColored(ImVec4(0.34F, 0.72F, 0.92F, 1.0F), "v%s", RACEBOX_VERSION_STRING);
         ImGui::Separator();
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open telemetry...", "Ctrl+O")) begin_load(open_telemetry_files(window_));
+        ImGui::SeparatorText("Race day");
+        if (ImGui::MenuItem("New race day")) new_race_day();
+        if (ImGui::MenuItem("Open race day...")) open_race_day();
+        if (ImGui::MenuItem("Save race day", nullptr, false, !race_day_.runs.empty())) save_race_day(false);
+        if (ImGui::MenuItem("Save race day as...", nullptr, false, !race_day_.runs.empty())) save_race_day(true);
+        ImGui::SeparatorText("Telemetry");
         if (ImGui::MenuItem("Save processed session...", nullptr, false, session_.has_value())) save_session();
         if (ImGui::MenuItem("Save active lap archive...", nullptr, false, active_lap() != nullptr)) save_active_lap();
         if (ImGui::MenuItem("Export active lap CSV...", nullptr, false, active_lap() != nullptr)) export_active_lap();
@@ -1040,6 +1540,7 @@ void NativeApp::draw_app_header() {
             !pending_vbo_.empty() || !pending_racebox_csv_.empty() || !pending_sanwa_csv_.empty())) {
             playing_ = false;
             session_.reset();
+            imu_analysis_ = {};
             background_.reset();
             average_track_latitude_.clear();
             average_track_longitude_.clear();
@@ -1056,9 +1557,7 @@ void NativeApp::draw_app_header() {
     }
     if (ImGui::BeginMenu("View")) {
         if (ImGui::MenuItem("Light theme", nullptr, light_theme_)) {
-            light_theme_ = !light_theme_;
-            ui::apply_theme(light_theme_ ? ui::ThemeMode::Light : ui::ThemeMode::Dark,
-                            ui::dpi_scale_for_window(window_));
+            toggle_theme();
         }
         ImGui::MenuItem("Speed-coloured map", nullptr, &show_speed_color_);
         ImGui::MenuItem("Metric units", nullptr, &metric_units_);
@@ -1114,6 +1613,15 @@ void NativeApp::draw_app_header() {
         workspace_button("ANALYSIS", WorkspaceSection::Analysis);
         workspace_button("COMPARE", WorkspaceSection::Compare);
         workspace_button("SECTORS", WorkspaceSection::Sectors);
+        workspace_button("RACE DAY", WorkspaceSection::RaceDay);
+
+        ImGui::SameLine(0.0F, 12.0F);
+        if (ImGui::SmallButton(light_theme_ ? "THEME: LIGHT" : "THEME: DARK")) {
+            toggle_theme();
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Switch between light and dark graphics.");
+        }
 
         ImGui::SameLine(0.0F, 12.0F);
         ImGui::PushStyleColor(ImGuiCol_Button, annotation_mode_
@@ -1284,8 +1792,10 @@ void NativeApp::draw_playback() {
             const auto radio = sample_radio(*session_, inspected_data_time);
             const auto speed = interpolate_time_channel(session_->telemetry.time_us, session_->telemetry.speed_kmh,
                 inspected_data_time) * (metric_units_ ? 1.0 : 0.621371);
-            const auto lateral = interpolate_time_channel(session_->telemetry.time_us, session_->telemetry.lateral_g, inspected_data_time);
-            const auto longitudinal = interpolate_time_channel(session_->telemetry.time_us, session_->telemetry.longitudinal_g, inspected_data_time);
+            const auto lateral = interpolate_time_channel(session_->telemetry.time_us, session_->telemetry.lateral_g, inspected_data_time) -
+                (imu_analysis_.initial_stationary_zero_used ? imu_analysis_.acceleration_zero_g[1] : 0.0);
+            const auto longitudinal = interpolate_time_channel(session_->telemetry.time_us, session_->telemetry.longitudinal_g, inspected_data_time) -
+                (imu_analysis_.initial_stationary_zero_used ? imu_analysis_.acceleration_zero_g[0] : 0.0);
             const auto altitude = interpolate_time_channel(session_->telemetry.time_us, session_->telemetry.altitude_m, inspected_data_time);
             ImGui::Text("%.1f %s   Lat %+.2f g   Long %+.2f g", speed, metric_units_ ? "km/h" : "mph", lateral, longitudinal);
             ImGui::Text("Altitude %.1f m   Distance %.1f%%", altitude, inspected_progress);
@@ -1297,8 +1807,10 @@ void NativeApp::draw_playback() {
                     const auto timestamp = time_at_progress(lap, inspected_progress);
                     const auto lap_speed = interpolate_time_channel(session_->telemetry.time_us, session_->telemetry.speed_kmh,
                         timestamp) * (metric_units_ ? 1.0 : 0.621371);
-                    const auto lat = interpolate_time_channel(session_->telemetry.time_us, session_->telemetry.lateral_g, timestamp);
-                    const auto lon = interpolate_time_channel(session_->telemetry.time_us, session_->telemetry.longitudinal_g, timestamp);
+                    const auto lat = interpolate_time_channel(session_->telemetry.time_us, session_->telemetry.lateral_g, timestamp) -
+                        (imu_analysis_.initial_stationary_zero_used ? imu_analysis_.acceleration_zero_g[1] : 0.0);
+                    const auto lon = interpolate_time_channel(session_->telemetry.time_us, session_->telemetry.longitudinal_g, timestamp) -
+                        (imu_analysis_.initial_stationary_zero_used ? imu_analysis_.acceleration_zero_g[0] : 0.0);
                     const auto controls = sample_radio(*session_, timestamp);
                     ImGui::TextColored(ui::color(token), "%s  %.1f %s | Lat %+.2f  Long %+.2f", role, lap_speed,
                         metric_units_ ? "km/h" : "mph", lat, lon);
@@ -1337,6 +1849,9 @@ NativeApp::PlotData NativeApp::build_plot_data(const LapInfo* lap, std::size_t m
     output.time.reserve(count / stride + 1); output.elapsed.reserve(count / stride + 1);
     output.speed.reserve(count / stride + 1); output.speed_mph.reserve(count / stride + 1);
     output.lateral.reserve(count / stride + 1); output.longitudinal.reserve(count / stride + 1); output.altitude.reserve(count / stride + 1);
+    output.vertical.reserve(count / stride + 1); output.gyro_x.reserve(count / stride + 1);
+    output.gyro_y.reserve(count / stride + 1); output.gyro_z.reserve(count / stride + 1);
+    output.vehicle_yaw.reserve(count / stride + 1);
     output.controls.reserve(count / stride + 1); output.steering.reserve(count / stride + 1);
     for (auto index = begin; index <= end; index += stride) {
         const auto radio = sample_radio(*session_, session_->telemetry.time_us[index]);
@@ -1346,9 +1861,21 @@ NativeApp::PlotData NativeApp::build_plot_data(const LapInfo* lap, std::size_t m
         output.elapsed.push_back(static_cast<double>(session_->telemetry.time_us[index] - base) / kSecond);
         output.speed.push_back(session_->telemetry.speed_kmh[index]);
         output.speed_mph.push_back(session_->telemetry.speed_kmh[index] * 0.621371);
-        output.lateral.push_back(session_->telemetry.lateral_g[index]);
-        output.longitudinal.push_back(session_->telemetry.longitudinal_g[index]);
+        output.lateral.push_back(session_->telemetry.lateral_g[index] -
+            (imu_analysis_.initial_stationary_zero_used ? imu_analysis_.acceleration_zero_g[1] : 0.0));
+        output.longitudinal.push_back(session_->telemetry.longitudinal_g[index] -
+            (imu_analysis_.initial_stationary_zero_used ? imu_analysis_.acceleration_zero_g[0] : 0.0));
         output.altitude.push_back(session_->telemetry.altitude_m[index]);
+        output.vertical.push_back(session_->telemetry.vertical_g[index] -
+            (imu_analysis_.initial_stationary_zero_used ? imu_analysis_.acceleration_zero_g[2] : 0.0));
+        output.gyro_x.push_back(session_->telemetry.gyro_x_dps[index] -
+            (imu_analysis_.calibration.stationary_bias_used ? imu_analysis_.calibration.gyro_bias_dps[0] : 0.0));
+        output.gyro_y.push_back(session_->telemetry.gyro_y_dps[index] -
+            (imu_analysis_.calibration.stationary_bias_used ? imu_analysis_.calibration.gyro_bias_dps[1] : 0.0));
+        output.gyro_z.push_back(session_->telemetry.gyro_z_dps[index] -
+            (imu_analysis_.calibration.stationary_bias_used ? imu_analysis_.calibration.gyro_bias_dps[2] : 0.0));
+        output.vehicle_yaw.push_back(index < imu_analysis_.vehicle_yaw_rate_dps.size()
+            ? imu_analysis_.vehicle_yaw_rate_dps[index] : std::numeric_limits<float>::quiet_NaN());
         output.controls.push_back(radio.valid ? radio.throttle - radio.brake : std::numeric_limits<double>::quiet_NaN());
         output.steering.push_back(radio.valid ? radio.steering : std::numeric_limits<double>::quiet_NaN());
     }
@@ -1908,6 +2435,11 @@ void NativeApp::draw_telemetry() {
         draw_events_tab();
         ImGui::EndTabItem();
     }
+    if (ImGui::BeginTabItem("IMU", nullptr, tab_flags(TelemetryTab::Imu))) {
+        if (telemetry_tab_request_pending_ && requested_telemetry_tab_ == TelemetryTab::Imu) telemetry_tab_request_pending_ = false;
+        draw_imu_tab();
+        ImGui::EndTabItem();
+    }
     if (ImGui::BeginTabItem("Sectors", nullptr, tab_flags(TelemetryTab::Sectors))) {
         if (telemetry_tab_request_pending_ && requested_telemetry_tab_ == TelemetryTab::Sectors) telemetry_tab_request_pending_ = false;
         draw_sectors_tab();
@@ -1915,6 +2447,167 @@ void NativeApp::draw_telemetry() {
     }
     ImGui::EndTabBar();
     ImGui::End();
+}
+
+void NativeApp::draw_imu_tab() {
+    if (!session_ || !imu_analysis_.available) {
+        ImGui::TextWrapped("No recorded IMU channels are available. Older archives and GPX files open with empty compatibility channels.");
+        return;
+    }
+    refresh_plot_cache();
+    const auto& data = primary_plot_cache_;
+    const auto sample_rate = session_->telemetry.size() > 1 && session_->telemetry.time_us.back() > session_->telemetry.time_us.front()
+        ? static_cast<double>(session_->telemetry.size() - 1) * kSecond /
+            static_cast<double>(session_->telemetry.time_us.back() - session_->telemetry.time_us.front())
+        : 0.0;
+    ImGui::Text("Recorded IMU output: %.1f Hz", sample_rate);
+    if (imu_analysis_.initial_stationary_zero_used) {
+        const auto zero_start = static_cast<double>(session_->telemetry.time_us[imu_analysis_.zero_begin_index]) / kSecond;
+        const auto zero_end = static_cast<double>(session_->telemetry.time_us[imu_analysis_.zero_end_index]) / kSecond;
+        ImGui::TextColored(ui::color(ui::ColorToken::Positive),
+            "Initial stationary zero: %.2f-%.2f s   Long %+.3f  Lat %+.3f  Vertical %+.3f g",
+            zero_start, zero_end, imu_analysis_.acceleration_zero_g[0], imu_analysis_.acceleration_zero_g[1],
+            imu_analysis_.acceleration_zero_g[2]);
+    } else {
+        ImGui::TextColored(ui::color(ui::ColorToken::Warning),
+            "No two-second stationary block was found; acceleration graphs remain uncalibrated.");
+    }
+    const auto& calibration = imu_analysis_.calibration;
+    if (calibration.valid) {
+        ImGui::TextColored(ui::color(ui::ColorToken::Positive),
+            "Vehicle yaw estimate calibrated: r=%.3f from %zu GPS/gyro samples",
+            calibration.heading_correlation, calibration.matched_samples);
+        ImGui::TextDisabled("Axis mix X %+.3f  Y %+.3f  Z %+.3f   Bias %+.2f / %+.2f / %+.2f deg/s (%s)",
+            calibration.yaw_projection[0], calibration.yaw_projection[1], calibration.yaw_projection[2],
+            calibration.gyro_bias_dps[0], calibration.gyro_bias_dps[1], calibration.gyro_bias_dps[2],
+            calibration.stationary_bias_used ? "stationary samples" : "whole-session fallback");
+    } else {
+        ImGui::TextColored(ui::color(ui::ColorToken::Warning),
+            "Vehicle yaw estimate withheld: gyro/GPS correlation %.3f is below the 0.60 reliability gate.",
+            calibration.heading_correlation);
+    }
+    ImGui::TextWrapped("Displayed acceleration and gyro axes are zeroed from the first stationary block. Stored channels remain untouched. X/Y/Z are not assumed roll/pitch/yaw; vehicle yaw is a separate calibrated estimate. Raw GPS is never moved or rewritten.");
+    ImGui::Separator();
+
+    const auto [range_begin, range_end] = active_range();
+    const auto base_time = session_->telemetry.time_us[range_begin];
+    const auto x_label = view_mode_ == ViewMode::Compare ? "Lap progress (%)" : "Time (s)";
+    const auto cursor_x = [&] {
+        if (view_mode_ == ViewMode::Compare && active_lap() && !primary_distance_elapsed_.empty()) {
+            const auto elapsed = std::clamp(static_cast<double>(cursor_us_ - session_->telemetry.time_us[active_lap()->begin_index]) / kSecond,
+                primary_distance_elapsed_.front(), primary_distance_elapsed_.back());
+            return interpolate_curve(primary_distance_elapsed_, primary_distance_progress_, elapsed);
+        }
+        return static_cast<double>(cursor_us_ - base_time) / kSecond;
+    }();
+    const auto update_hover = [&](bool hovered) {
+        if (!hovered || annotation_mode_) return;
+        const auto mouse = ImPlot::GetPlotMousePos();
+        Timestamp timestamp{};
+        if (view_mode_ == ViewMode::Compare && active_lap() && !primary_distance_progress_.empty()) {
+            const auto elapsed = interpolate_curve(primary_distance_progress_, primary_distance_elapsed_, std::clamp(mouse.x, 0.0, 100.0));
+            timestamp = session_->telemetry.time_us[active_lap()->begin_index] + static_cast<Timestamp>(elapsed * kSecond);
+        } else {
+            timestamp = base_time + static_cast<Timestamp>(mouse.x * kSecond);
+        }
+        hover_seen_this_frame_ = true;
+        hover_cursor_us_ = std::clamp(timestamp, session_->telemetry.time_us[range_begin], session_->telemetry.time_us[range_end]);
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) cursor_us_ = *hover_cursor_us_;
+    };
+    const auto limits = [](std::initializer_list<const std::vector<double>*> series, double fallback) {
+        auto maximum = fallback;
+        for (const auto* values : series) {
+            for (const auto value : *values) if (std::isfinite(value)) maximum = std::max(maximum, std::abs(value));
+        }
+        return maximum * 1.12;
+    };
+    const auto cursor_style = ImPlotSpec{ImPlotProp_LineColor, ImVec4(1.0F, 0.73F, 0.15F, 0.95F), ImPlotProp_LineWeight, 1.6F};
+    const auto plot_height = std::max(150.0F, ImGui::GetContentRegionAvail().y * 0.31F);
+
+    const auto vertical_limit = limits({&data.vertical}, 1.5);
+    if (ImPlot::BeginPlot("Zero-calibrated vertical acceleration###imu-vertical", ImVec2(-1, plot_height),
+                          annotation_mode_ ? ImPlotFlags_NoInputs : ImPlotFlags_None)) {
+        ImPlot::SetupAxes(x_label, "Vertical G");
+        if (!data.time.empty()) ImPlot::SetupAxisLimits(ImAxis_X1, data.time.front(), data.time.back(), ImGuiCond_Always);
+        ImPlot::SetupAxisLimits(ImAxis_Y1, -vertical_limit, vertical_limit, ImGuiCond_Always);
+        const ImPlotSpec vertical_style{ImPlotProp_LineColor, ImVec4(0.20F, 0.78F, 0.40F, 1.0F), ImPlotProp_LineWeight, 1.8F};
+        ImPlot::PlotLine("Vertical G", data.time.data(), data.vertical.data(),
+            static_cast<int>(std::min(data.time.size(), data.vertical.size())), vertical_style);
+        const double reference_lines[] = {0.0, -imu_analysis_.vertical_rest_g * 0.60};
+        const ImPlotSpec reference_style{ImPlotProp_LineColor, ImVec4(0.55F, 0.62F, 0.70F, 0.65F),
+            ImPlotProp_LineWeight, 1.0F, ImPlotProp_Flags, ImPlotInfLinesFlags_Horizontal};
+        ImPlot::PlotInfLines("Zero / possible-airborne threshold", reference_lines, 2, reference_style);
+        ImPlot::PlotInfLines("Playback cursor", &cursor_x, 1, cursor_style);
+        const auto hovered = ImPlot::IsPlotHovered();
+        update_hover(hovered);
+        const auto origin = ImPlot::GetPlotPos();
+        const auto size = ImPlot::GetPlotSize();
+        handle_annotation_surface("Vertical acceleration", -1, origin.x, origin.y, size.x, size.y, hovered, "imu_vertical");
+        ImPlot::EndPlot();
+    }
+
+    const auto gyro_limit = limits({&data.gyro_x, &data.gyro_y, &data.gyro_z, &data.vehicle_yaw}, 100.0);
+    if (ImPlot::BeginPlot("Gyroscope###imu-gyro", ImVec2(-1, plot_height),
+                          annotation_mode_ ? ImPlotFlags_NoInputs : ImPlotFlags_None)) {
+        ImPlot::SetupAxes(x_label, "Degrees / second");
+        if (!data.time.empty()) ImPlot::SetupAxisLimits(ImAxis_X1, data.time.front(), data.time.back(), ImGuiCond_Always);
+        ImPlot::SetupAxisLimits(ImAxis_Y1, -gyro_limit, gyro_limit, ImGuiCond_Always);
+        const ImPlotSpec x_style{ImPlotProp_LineColor, ImVec4(0.95F, 0.30F, 0.30F, 0.8F), ImPlotProp_LineWeight, 1.2F};
+        const ImPlotSpec y_style{ImPlotProp_LineColor, ImVec4(0.35F, 0.75F, 1.0F, 0.8F), ImPlotProp_LineWeight, 1.2F};
+        const ImPlotSpec z_style{ImPlotProp_LineColor, ImVec4(0.75F, 0.45F, 1.0F, 0.8F), ImPlotProp_LineWeight, 1.2F};
+        const ImPlotSpec yaw_style{ImPlotProp_LineColor, ImVec4(1.0F, 0.78F, 0.18F, 1.0F), ImPlotProp_LineWeight, 2.0F};
+        ImPlot::PlotLine("Zeroed X", data.time.data(), data.gyro_x.data(), static_cast<int>(std::min(data.time.size(), data.gyro_x.size())), x_style);
+        ImPlot::PlotLine("Zeroed Y", data.time.data(), data.gyro_y.data(), static_cast<int>(std::min(data.time.size(), data.gyro_y.size())), y_style);
+        ImPlot::PlotLine("Zeroed Z", data.time.data(), data.gyro_z.data(), static_cast<int>(std::min(data.time.size(), data.gyro_z.size())), z_style);
+        if (calibration.valid) ImPlot::PlotLine("Vehicle yaw estimate", data.time.data(), data.vehicle_yaw.data(),
+            static_cast<int>(std::min(data.time.size(), data.vehicle_yaw.size())), yaw_style);
+        ImPlot::PlotInfLines("Playback cursor", &cursor_x, 1, cursor_style);
+        const auto hovered = ImPlot::IsPlotHovered();
+        update_hover(hovered);
+        const auto origin = ImPlot::GetPlotPos();
+        const auto size = ImPlot::GetPlotSize();
+        handle_annotation_surface("Gyroscope", -1, origin.x, origin.y, size.x, size.y, hovered, "imu_gyro");
+        ImPlot::EndPlot();
+    }
+
+    ImGui::Text("Detected IMU indicators: %zu", imu_analysis_.events.size());
+    ImGui::TextDisabled("Possible airborne requires low vertical load for 80 ms; high load (>3.5 g) and rapid rotation (>220 deg/s) are indicators, not automatic crash claims.");
+    if (ImGui::BeginTable("imu-events", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+                          ImVec2(-1, 150.0F))) {
+        ImGui::TableSetupColumn("Indicator"); ImGui::TableSetupColumn("Lap"); ImGui::TableSetupColumn("Time"); ImGui::TableSetupColumn("Reading");
+        ImGui::TableSetupColumn("Confidence"); ImGui::TableSetupColumn("Action"); ImGui::TableHeadersRow();
+        for (std::size_t index = 0; index < imu_analysis_.events.size(); ++index) {
+            const auto& event = imu_analysis_.events[index];
+            ImGui::PushID(static_cast<int>(index));
+            ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(imu::event_name(event.type).data());
+            const auto event_lap = std::find_if(session_->laps.begin(), session_->laps.end(), [&](const LapInfo& lap) {
+                return event.peak_index >= lap.begin_index && event.peak_index <= lap.end_index;
+            });
+            ImGui::TableNextColumn();
+            if (event_lap == session_->laps.end()) ImGui::TextUnformatted("-");
+            else if (event_lap->race_lap > 0) ImGui::Text("R%d", event_lap->race_lap);
+            else ImGui::Text("Raw %d", event_lap->raw_lap);
+            ImGui::TableNextColumn(); ImGui::Text("%.3f s", static_cast<double>(event.time_us) / kSecond);
+            ImGui::TableNextColumn(); ImGui::Text(event.type == imu::EventType::RapidRotation ? "%+.1f deg/s" : "%+.2f g", event.magnitude);
+            ImGui::TableNextColumn(); ImGui::Text("%d%%", event.confidence);
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("Go")) {
+                for (std::size_t lap_index = 0; lap_index < session_->laps.size(); ++lap_index) {
+                    const auto& lap = session_->laps[lap_index];
+                    if (event.peak_index >= lap.begin_index && event.peak_index <= lap.end_index) {
+                        active_lap_index_ = static_cast<int>(lap_index);
+                        view_mode_ = ViewMode::SingleLap;
+                        plot_cache_mode_ = static_cast<ViewMode>(-1);
+                        break;
+                    }
+                }
+                cursor_us_ = event.time_us;
+                playing_ = false;
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
 }
 
 void NativeApp::draw_events_tab() {
@@ -2012,6 +2705,7 @@ void NativeApp::draw_sectors_tab() {
 void NativeApp::draw_map() {
     if (!ImGui::Begin("Track Map")) { ImGui::End(); return; }
     if (!session_) { ImGui::TextDisabled("No session loaded"); ImGui::End(); return; }
+    if (view_mode_ == ViewMode::Compare && show_analysis_aligned_traces_) refresh_driver_analysis();
     if (annotation_mode_) ImGui::BeginDisabled();
     const auto triangulated_available = uses_parking_track_background(*session_);
     ImGui::BeginDisabled(!triangulated_available);
@@ -2063,6 +2757,10 @@ void NativeApp::draw_map() {
             ImGui::SliderFloat("Grid spacing", &map_grid_spacing_m_, 5.0F, 25.0F, "%.0f m");
         }
         if (view_mode_ == ViewMode::Compare) ImGui::Checkbox("Three separate lap maps", &separate_compare_maps_);
+        if (view_mode_ == ViewMode::Compare) {
+            ImGui::Checkbox("Analysis-aligned comparison traces", &show_analysis_aligned_traces_);
+            ImGui::TextDisabled("Display-only whole-lap correction; raw GPS remains stored unchanged.");
+        }
         ImGui::Separator();
         if (ImGui::Button("Load uncalibrated image (advanced)...")) load_background();
         if (background_.view) {
@@ -2091,6 +2789,30 @@ void NativeApp::draw_map() {
     if (background_.view && session_->map_background.georeferenced) {
         ImGui::SameLine(); ImGui::TextColored(ui::color(ui::ColorToken::Positive), "1:1");
         if (!session_->map_background.locked) { ImGui::SameLine(); ImGui::TextDisabled("drag background to align"); }
+    }
+    const auto display_translation_for = [&](const LapInfo* lap) -> const driver_analysis::LineTranslation* {
+        if (!show_analysis_aligned_traces_ || view_mode_ != ViewMode::Compare || !lap) return nullptr;
+        const auto slot = lap == compare_lap() ? std::size_t{0} : lap == compare_b_lap() ? std::size_t{1} : std::size_t{2};
+        if (slot >= driver_analysis_.comparisons.size() || !driver_analysis_.comparisons[slot] ||
+            !driver_analysis_.comparisons[slot]->confidence.line_metrics_enabled) return nullptr;
+        return &driver_analysis_.comparisons[slot]->line_translation;
+    };
+    if (view_mode_ == ViewMode::Compare && show_analysis_aligned_traces_) {
+        auto displayed = false;
+        for (std::size_t slot = 0; slot < driver_analysis_.comparisons.size(); ++slot) {
+            if (!driver_analysis_.comparisons[slot] || !driver_analysis_.comparisons[slot]->confidence.line_metrics_enabled) continue;
+            if (!displayed) {
+                ImGui::TextColored(ui::color(ui::ColorToken::Inspection), "DISPLAY: analysis-aligned comparison GPS");
+                displayed = true;
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("%c %.2f m", slot == 0 ? 'A' : 'B',
+                driver_analysis_.comparisons[slot]->line_translation.magnitude_m);
+        }
+        if (displayed) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(raw recording preserved)");
+        }
     }
     if (start_finish_placement_mode_) {
         ImGui::TextColored(ui::color(ui::ColorToken::Warning),
@@ -2124,9 +2846,13 @@ void NativeApp::draw_map() {
         auto min_lat = std::numeric_limits<double>::max(), max_lat = -min_lat, min_lon = min_lat, max_lon = -min_lat;
         for (const auto* lap : laps) {
             if (!lap) continue;
+            const auto* translation = display_translation_for(lap);
             for (auto index = lap->begin_index; index <= lap->end_index; ++index) {
-                min_lat = std::min(min_lat, session_->telemetry.latitude[index]); max_lat = std::max(max_lat, session_->telemetry.latitude[index]);
-                min_lon = std::min(min_lon, session_->telemetry.longitude[index]); max_lon = std::max(max_lon, session_->telemetry.longitude[index]);
+                const auto coordinate = translation
+                    ? driver_analysis::apply_line_translation(session_->telemetry.latitude[index], session_->telemetry.longitude[index], *translation)
+                    : driver_analysis::TranslatedCoordinate{session_->telemetry.latitude[index], session_->telemetry.longitude[index]};
+                min_lat = std::min(min_lat, coordinate.latitude); max_lat = std::max(max_lat, coordinate.latitude);
+                min_lon = std::min(min_lon, coordinate.longitude); max_lon = std::max(max_lon, coordinate.longitude);
             }
         }
         for (std::size_t index = 0; index < std::min(average_track_latitude_.size(), average_track_longitude_.size()); ++index) {
@@ -2172,6 +2898,14 @@ void NativeApp::draw_map() {
     };
     const auto convert = [&](const Projection& projection, std::size_t index) {
         return project_coordinate(projection, session_->telemetry.latitude[index], session_->telemetry.longitude[index]);
+    };
+    const auto convert_lap = [&](const Projection& projection, const LapInfo* lap, std::size_t index) {
+        if (const auto* translation = display_translation_for(lap)) {
+            const auto coordinate = driver_analysis::apply_line_translation(
+                session_->telemetry.latitude[index], session_->telemetry.longitude[index], *translation);
+            return project_coordinate(projection, coordinate.latitude, coordinate.longitude);
+        }
+        return convert(projection, index);
     };
     const auto convert_coordinate = [&](const Projection& projection, double latitude, double longitude) {
         return project_coordinate(projection, latitude, longitude);
@@ -2341,9 +3075,9 @@ void NativeApp::draw_map() {
         const auto count = lap->end_index - lap->begin_index + 1;
         const auto stride = std::max<std::size_t>(1, count / 2200);
         const auto maximum = *std::max_element(session_->telemetry.speed_kmh.begin() + lap->begin_index, session_->telemetry.speed_kmh.begin() + lap->end_index + 1);
-        auto previous = convert(projection, lap->begin_index);
+        auto previous = convert_lap(projection, lap, lap->begin_index);
         for (auto index = lap->begin_index + stride; index <= lap->end_index; index += stride) {
-            const auto point = convert(projection, index);
+            const auto point = convert_lap(projection, lap, index);
             draw->AddLine(previous, point, show_speed_color_ && view_mode_ != ViewMode::Compare ? speed_color(session_->telemetry.speed_kmh[index], maximum) : fixed_color, width);
             previous = point;
         }
@@ -2356,10 +3090,10 @@ void NativeApp::draw_map() {
                 if (progress < corner.exit_progress * 100.0) return IM_COL32(230, 95, 235, 245);
                 return IM_COL32(45, 225, 135, 245);
             };
-            auto previous_zone = convert(projection, lap->begin_index);
+            auto previous_zone = convert_lap(projection, lap, lap->begin_index);
             for (std::size_t offset = 1; offset < lap_distance.progress.size(); ++offset) {
                 const auto progress = lap_distance.progress[offset];
-                const auto point = convert(projection, lap->begin_index + offset);
+                const auto point = convert_lap(projection, lap, lap->begin_index + offset);
                 if (progress >= corner.start_progress * 100.0 && progress <= corner.end_progress * 100.0) {
                     draw->AddLine(previous_zone, point, IM_COL32(6, 12, 18, 230), 8.0F);
                     draw->AddLine(previous_zone, point, phase_color(progress), 4.5F);
@@ -2374,7 +3108,7 @@ void NativeApp::draw_map() {
                 const auto target = normalized * 100.0;
                 const auto found = std::lower_bound(lap_distance.progress.begin(), lap_distance.progress.end(), target);
                 const auto offset = static_cast<std::size_t>(std::distance(lap_distance.progress.begin(), found));
-                const auto point = convert(projection, lap->begin_index + std::min(offset, lap_distance.progress.size() - 1));
+                const auto point = convert_lap(projection, lap, lap->begin_index + std::min(offset, lap_distance.progress.size() - 1));
                 draw->AddCircleFilled(point, marker_label[0] == 'A' ? 6.0F : 4.5F, IM_COL32(245, 248, 252, 255));
                 draw->AddText(point + ImVec2(5.0F, -13.0F), IM_COL32(245, 248, 252, 255), marker_label);
             }
@@ -2384,7 +3118,7 @@ void NativeApp::draw_map() {
             auto nearest = lap->begin_index;
             auto nearest_distance = std::numeric_limits<float>::max();
             for (auto index = lap->begin_index; index <= lap->end_index; index += stride) {
-                const auto point = convert(projection, index);
+                const auto point = convert_lap(projection, lap, index);
                 const auto distance = (point.x - mouse.x) * (point.x - mouse.x) + (point.y - mouse.y) * (point.y - mouse.y);
                 if (distance < nearest_distance) { nearest_distance = distance; nearest = index; }
             }
@@ -2414,18 +3148,22 @@ void NativeApp::draw_map() {
         };
         const auto playback_index = cursor_index_at(cursor_us_);
         const auto chosen_playback = view_mode_ != ViewMode::Compare || lap == playback_lap();
-        draw->AddCircleFilled(convert(projection, playback_index), chosen_playback ? 5.5F : 4.5F, fixed_color);
-        draw->AddCircle(convert(projection, playback_index), chosen_playback ? 7.5F : 6.0F,
+        draw->AddCircleFilled(convert_lap(projection, lap, playback_index), chosen_playback ? 5.5F : 4.5F, fixed_color);
+        draw->AddCircle(convert_lap(projection, lap, playback_index), chosen_playback ? 7.5F : 6.0F,
             chosen_playback ? IM_COL32(25, 220, 245, 255) : IM_COL32(255, 190, 42, 230), 0, chosen_playback ? 2.3F : 1.5F);
         if (hover_cursor_us_) {
             const auto inspection_index = cursor_index_at(*hover_cursor_us_);
-            const auto inspection_point = convert(projection, inspection_index);
+            const auto inspection_point = convert_lap(projection, lap, inspection_index);
             draw->AddCircle(inspection_point, 7.0F, IM_COL32(25, 220, 245, 255), 0, 2.0F);
             draw->AddCircleFilled(inspection_point, 2.5F, IM_COL32(25, 220, 245, 255));
         }
         const auto speed = metric_units_ ? session_->telemetry.speed_kmh[playback_index] : session_->telemetry.speed_kmh[playback_index] * 0.621371F;
+        const auto* displayed_translation = display_translation_for(lap);
         draw->AddText(projection.panel_origin + ImVec2(8, label_y), fixed_color,
-            std::format("{}  {:.1f} {}", label, speed, metric_units_ ? "km/h" : "mph").c_str());
+            (displayed_translation
+                ? std::format("{}  {:.1f} {}  aligned {:.2f} m", label, speed, metric_units_ ? "km/h" : "mph",
+                              displayed_translation->magnitude_m)
+                : std::format("{}  {:.1f} {}", label, speed, metric_units_ ? "km/h" : "mph")).c_str());
         if (view_mode_ == ViewMode::Compare && label_y == 8.0F) {
             draw->AddText(projection.panel_origin + ImVec2(8, projection.panel_size.y - 62), IM_COL32(225, 235, 240, 210),
                 "Dots: same track distance");
@@ -2440,7 +3178,7 @@ void NativeApp::draw_map() {
                 const auto distance = lat * lat + lon * lon;
                 if (distance < best) { best = distance; nearest = index; }
             }
-            draw->AddCircle(convert(projection, nearest), 6.0F, IM_COL32(70, 230, 135, 255), 0, 2.0F);
+            draw->AddCircle(convert_lap(projection, lap, nearest), 6.0F, IM_COL32(70, 230, 135, 255), 0, 2.0F);
         }
     };
     const auto draw_independent_playback_marker = [&](const Projection& projection) {
@@ -2697,7 +3435,8 @@ void NativeApp::draw_laps() {
         double speed_sum = 0.0;
         for (auto index = lap->begin_index; index <= lap->end_index; ++index) {
             maximum_speed = std::max(maximum_speed, session_->telemetry.speed_kmh[index]);
-            lateral = std::max(lateral, std::abs(session_->telemetry.lateral_g[index]));
+            lateral = std::max(lateral, static_cast<float>(std::abs(session_->telemetry.lateral_g[index] -
+                (imu_analysis_.initial_stationary_zero_used ? imu_analysis_.acceleration_zero_g[1] : 0.0))));
             speed_sum += session_->telemetry.speed_kmh[index];
         }
         const auto count = lap->end_index - lap->begin_index + 1;
@@ -2792,7 +3531,7 @@ void NativeApp::draw_diagnostics() {
     ImGui::Text("Working memory: %.1f MB", static_cast<double>(memory.WorkingSetSize) / (1024.0 * 1024.0));
     if (session_) {
         const auto telemetry_bytes = session_->telemetry.size() *
-            (sizeof(Timestamp) + sizeof(std::int64_t) + 2 * sizeof(double) + 5 * sizeof(float) + sizeof(std::uint8_t) + sizeof(std::int32_t));
+            (sizeof(Timestamp) + sizeof(std::int64_t) + 2 * sizeof(double) + 9 * sizeof(float) + sizeof(std::uint8_t) + sizeof(std::int32_t));
         const auto radio_bytes = session_->radio.size() * (sizeof(Timestamp) + 3 * sizeof(float));
         ImGui::Text("Canonical buffers: %.1f MB", static_cast<double>(telemetry_bytes + radio_bytes) / (1024.0 * 1024.0));
         ImGui::Text("Plot cache: %zu reference + %zu A + %zu B points", primary_plot_cache_.time.size(),
@@ -3081,27 +3820,35 @@ void NativeApp::draw_annotations() {
             for (std::size_t slot = 0; slot < driver_analysis_.comparisons.size(); ++slot) {
                 if (!driver_analysis_.comparisons[slot]) continue;
                 const auto& comparison = *driver_analysis_.comparisons[slot];
-                ImGui::TextDisabled("Compare %c GPS analysis-only correction %.2f m (residual %.2f m) | line metrics %s",
+                ImGui::TextDisabled("Compare %c GPS correction %.2f m (residual %.2f m) | visible %s | line metrics %s",
                     slot == 0 ? 'A' : 'B', comparison.line_translation.magnitude_m,
                     comparison.line_translation.residual_rms_m,
+                    show_analysis_aligned_traces_ && comparison.confidence.line_metrics_enabled ? "aligned" : "raw",
                     comparison.confidence.line_metrics_enabled ? "enabled" : "disabled");
             }
             if (driver_analysis_.insights.empty()) {
-                ImGui::TextWrapped("No verified insights passed the enabled confidence and rule gates for these laps.");
+                ImGui::TextWrapped("No telemetry changes passed the enabled metric and minimum data-quality gates for these laps.");
             }
             for (std::size_t index = 0; index < driver_analysis_.insights.size(); ++index) {
                 const auto& insight = driver_analysis_.insights[index];
                 ImGui::PushID(static_cast<int>(index));
                 ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0F);
-                ImGui::BeginChild("insight-card", ImVec2(-1.0F, 132.0F), ImGuiChildFlags_Borders,
+                ImGui::BeginChild("insight-card", ImVec2(-1.0F, 310.0F), ImGuiChildFlags_Borders,
                                   ImGuiWindowFlags_NoScrollbar);
-                const auto severity_color = insight.positive ? ImVec4(0.20F, 0.82F, 0.42F, 1.0F) :
-                    insight.severity == driver_analysis::Severity::High ? ImVec4(0.96F, 0.25F, 0.27F, 1.0F) :
-                    insight.severity == driver_analysis::Severity::Medium ? ImVec4(1.0F, 0.65F, 0.12F, 1.0F) :
-                    ImVec4(0.72F, 0.76F, 0.82F, 1.0F);
+                const auto severity_color = [&] {
+                    switch (insight.outcome) {
+                    case insight_evidence::Outcome::RetainedGain: return ImVec4(0.20F, 0.82F, 0.42F, 1.0F);
+                    case insight_evidence::Outcome::TradeoffGain: return ImVec4(0.90F, 0.72F, 0.20F, 1.0F);
+                    case insight_evidence::Outcome::Compensation: return ImVec4(0.25F, 0.68F, 0.94F, 1.0F);
+                    case insight_evidence::Outcome::NetLoss: return ImVec4(0.96F, 0.25F, 0.27F, 1.0F);
+                    case insight_evidence::Outcome::Inconclusive: return ImVec4(0.72F, 0.76F, 0.82F, 1.0F);
+                    case insight_evidence::Outcome::DataLimited: return ImVec4(0.58F, 0.62F, 0.68F, 1.0F);
+                    }
+                    return ImVec4(0.72F, 0.76F, 0.82F, 1.0F);
+                }();
                 ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(severity_color.x, severity_color.y, severity_color.z, 0.23F));
                 const auto role = insight.comparison == driver_analysis::ComparisonSlot::CompareA ? "A" : "B";
-                const auto heading = std::format("{} | {} | Compare {}##insight", insight.title, insight.corner_name, role);
+                const auto heading = std::format("{}##insight", insight.title);
                 if (ImGui::Selectable(heading.c_str(), selected_insight_index_ == static_cast<int>(index))) {
                     selected_insight_index_ = static_cast<int>(index);
                     const auto corner = std::find_if(corner_zones_.begin(), corner_zones_.end(), [&](const auto& value) {
@@ -3111,14 +3858,33 @@ void NativeApp::draw_annotations() {
                     navigate_to_analysis_target(insight.navigation);
                 }
                 ImGui::PopStyleColor();
+                ImGui::TextDisabled("%s | Compare %s", insight.corner_name.c_str(), role);
                 ImGui::TextWrapped("%s", insight.detail.c_str());
-                const auto confidence_label = insight.confidence_band == driver_analysis::ConfidenceBand::WeakSignal
-                    ? "WEAK SIGNAL" : "ACTIONABLE";
-                ImGui::TextColored(severity_color, "%s | %s | confidence %d%% | time effect %+.3f s",
-                    insight.positive ? "POSITIVE" : insight.severity == driver_analysis::Severity::High ? "HIGH" :
-                    insight.severity == driver_analysis::Severity::Medium ? "MEDIUM" : "LOW",
-                    confidence_label, insight.confidence, insight.estimated_time_effect_s);
-                ImGui::TextDisabled("Rule %s | threshold %.3f", insight.rule_stable_id.c_str(), insight.threshold);
+                ImGui::TextColored(severity_color, "Result: %s", insight_outcome_label(insight.outcome));
+                ImGui::Text("Repeatability: %s", insight_reliability_label(insight.reliability));
+                ImGui::Text("Driver advice: %s", insight_recommendation_label(insight.recommendation));
+                const auto retained_label = timing_position_label(insight.retained_effect_s);
+                const auto local_label = timing_change_label(insight.local_effect_s);
+                const auto prior_label = timing_change_label(insight.prior_phase_effect_s);
+                ImGui::Text("At next decision: %s", retained_label.c_str());
+                ImGui::TextWrapped("After this input: %s | before it: %s", local_label.c_str(), prior_label.c_str());
+                ImGui::TextWrapped("Normal timing variation %.3f s | same result %zu/%zu laps | recording quality %d%%",
+                    insight.time_noise_floor_s, insight.supporting_laps, insight.comparable_laps, insight.confidence);
+                if (insight.downstream_payback_fraction) {
+                    ImGui::TextDisabled("Downstream payback %.0f%%", *insight.downstream_payback_fraction * 100.0);
+                }
+                if (!insight.evidence_reasons.empty()) {
+                    std::string reasons;
+                    for (std::size_t reason_index = 0; reason_index < std::min<std::size_t>(3, insight.evidence_reasons.size()); ++reason_index) {
+                        if (!reasons.empty()) reasons += " | ";
+                        reasons += insight_reason_label(insight.evidence_reasons[reason_index]);
+                    }
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                    ImGui::TextWrapped("Evidence: %s", reasons.c_str());
+                    ImGui::PopStyleColor();
+                }
+                ImGui::TextDisabled("Motorsport metric: %s | trigger %.3f",
+                    driver_analysis::metric_name(insight.metric).data(), insight.threshold);
                 ImGui::EndChild();
                 ImGui::PopStyleVar();
                 ImGui::Dummy(ImVec2(0.0F, 3.0F));
@@ -3143,9 +3909,9 @@ void NativeApp::draw_annotations() {
                         if (metric.rule_id) ImGui::Text("%.3f", metric.threshold); else ImGui::TextDisabled("context");
                         ImGui::TableNextColumn();
                         if (!metric.value) ImGui::TextDisabled("N/A");
-                        else if (metric.positive && metric.triggered) ImGui::TextColored(ImVec4(0.2F, 0.82F, 0.42F, 1), "GAIN");
-                        else if (metric.triggered) ImGui::TextColored(ImVec4(1.0F, 0.52F, 0.16F, 1), "FLAG");
-                        else ImGui::TextColored(ImVec4(0.38F, 0.76F, 0.52F, 1), "PASS");
+                        else if (metric.positive && metric.triggered) ImGui::TextColored(ImVec4(0.2F, 0.82F, 0.42F, 1), "FAVORABLE");
+                        else if (metric.triggered) ImGui::TextColored(ImVec4(1.0F, 0.52F, 0.16F, 1), "CHANGED");
+                        else ImGui::TextColored(ImVec4(0.38F, 0.76F, 0.52F, 1), "WITHIN");
                         ImGui::TableNextColumn(); ImGui::Text("%d%%", metric.confidence);
                     }
                 }
@@ -3196,6 +3962,52 @@ void NativeApp::draw_annotations() {
                 dwell_input("First-throttle dwell", analysis_rules_.first_throttle_dwell_us);
                 dwell_input("Full-throttle dwell", analysis_rules_.full_throttle_dwell_us);
             }
+            if (ImGui::CollapsingHeader("Recommendation evidence gates", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::TextWrapped("A favorable single-lap metric is only a candidate. A recommendation must retain time through the next driver decision, clear the timing-noise floor, and repeat on quality-screened matching laps.");
+                auto& evidence = analysis_rules_.evidence;
+                rules_changed |= ImGui::InputDouble("Minimum timing floor (s)", &evidence.minimum_time_floor_s, 0.005, 0.025, "%.3f");
+                rules_changed |= ImGui::InputDouble("Sample-period multiplier", &evidence.sample_period_multiplier, 0.1, 0.5, "%.2f");
+                rules_changed |= ImGui::InputDouble("Repeatability sigma multiplier", &evidence.repeatability_sigma_multiplier, 0.1, 0.5, "%.2f");
+                auto payback_percent = evidence.maximum_payback_fraction * 100.0;
+                if (ImGui::InputDouble("Maximum downstream payback (%)", &payback_percent, 1.0, 5.0, "%.0f")) {
+                    evidence.maximum_payback_fraction = std::clamp(payback_percent / 100.0, 0.0, 1.0);
+                    rules_changed = true;
+                }
+                rules_changed |= ImGui::InputInt("Minimum data confidence", &evidence.minimum_data_confidence, 1, 5);
+                rules_changed |= ImGui::InputInt("Reliable data confidence", &evidence.reliable_data_confidence, 1, 5);
+                const auto edit_count = [&](const char* label, std::size_t& value) {
+                    auto temporary = static_cast<int>(value);
+                    if (ImGui::InputInt(label, &temporary, 1, 2)) {
+                        value = static_cast<std::size_t>(std::max(1, temporary));
+                        rules_changed = true;
+                    }
+                };
+                edit_count("Likely: comparable laps", evidence.likely_comparable_laps);
+                edit_count("Likely: supporting laps", evidence.likely_supporting_laps);
+                auto likely_rate_percent = evidence.likely_support_rate * 100.0;
+                if (ImGui::InputDouble("Likely: support rate (%)", &likely_rate_percent, 1.0, 5.0, "%.0f")) {
+                    evidence.likely_support_rate = std::clamp(likely_rate_percent / 100.0, 0.0, 1.0);
+                    rules_changed = true;
+                }
+                edit_count("Reliable: comparable laps", evidence.reliable_comparable_laps);
+                edit_count("Reliable: supporting laps", evidence.reliable_supporting_laps);
+                auto reliable_rate_percent = evidence.reliable_support_rate * 100.0;
+                if (ImGui::InputDouble("Reliable: support rate (%)", &reliable_rate_percent, 1.0, 5.0, "%.0f")) {
+                    evidence.reliable_support_rate = std::clamp(reliable_rate_percent / 100.0, 0.0, 1.0);
+                    rules_changed = true;
+                }
+                evidence.minimum_time_floor_s = std::clamp(evidence.minimum_time_floor_s, 0.001, 2.0);
+                evidence.sample_period_multiplier = std::clamp(evidence.sample_period_multiplier, 0.01, 20.0);
+                evidence.repeatability_sigma_multiplier = std::clamp(evidence.repeatability_sigma_multiplier, 0.0, 20.0);
+                evidence.minimum_data_confidence = std::clamp(evidence.minimum_data_confidence, 0, 100);
+                evidence.reliable_data_confidence = std::clamp(evidence.reliable_data_confidence, evidence.minimum_data_confidence, 100);
+                evidence.likely_supporting_laps = std::min(evidence.likely_supporting_laps, evidence.likely_comparable_laps);
+                evidence.reliable_comparable_laps = std::max(evidence.reliable_comparable_laps, evidence.likely_comparable_laps);
+                evidence.reliable_supporting_laps = std::clamp(evidence.reliable_supporting_laps,
+                    evidence.likely_supporting_laps, evidence.reliable_comparable_laps);
+                evidence.reliable_support_rate = std::max(evidence.reliable_support_rate, evidence.likely_support_rate);
+                ImGui::TextDisabled("Dynamic floor = max(minimum, sample multiplier x sample period, sigma multiplier x repeatability sigma).");
+            }
             ImGui::SeparatorText("EDITABLE CORNERS / DISTANCE TIMELINE");
             if (ImGui::Button("Auto-suggest corners from reference")) {
                 auto_number_corners();
@@ -3231,12 +4043,979 @@ void NativeApp::draw_annotations() {
             if (rules_changed) { driver_analysis_dirty_ = true; refresh_driver_analysis(); }
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Crew Chief")) {
+            draw_crew_chief();
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("Dev Notes")) {
             draw_dev_notes();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
     }
+    ImGui::End();
+}
+
+void NativeApp::draw_crew_chief() {
+    using namespace std::chrono_literals;
+    if (crew_chief_busy_ && crew_chief_future_.valid() &&
+        crew_chief_future_.wait_for(0ms) == std::future_status::ready) {
+        auto response = crew_chief_future_.get();
+        crew_chief_busy_ = false;
+        if (response.ok) {
+            crew_chief_report_ = std::move(response.report);
+            crew_chief_error_.clear();
+            crew_chief_history_.push_back({
+                "user",
+                std::format("Setup change: {}\nQuestion: {}",
+                    crew_chief_setup_change_.data(), crew_chief_question_.data())
+            });
+            crew_chief_history_.push_back({"assistant", crew_chief_report_->summary});
+            if (crew_chief_history_.size() > 20) {
+                crew_chief_history_.erase(
+                    crew_chief_history_.begin(),
+                    crew_chief_history_.begin() + static_cast<std::ptrdiff_t>(crew_chief_history_.size() - 20));
+            }
+            status_ = std::format("Crew Chief answered with {}% confidence", crew_chief_report_->confidence);
+        } else {
+            crew_chief_error_ = std::move(response.error);
+            status_ = "Crew Chief is unavailable; deterministic analysis remains active";
+        }
+    }
+
+    ImGui::TextWrapped(
+        "Tell the Crew Chief exactly what setup, tire, repair, or driving change you made. "
+        "It compares the selected before and after laps using measured telemetry and the deterministic insight rules.");
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30F, 0.78F, 0.95F, 1.0F));
+    ImGui::TextWrapped(
+        "The AI receives calculated evidence, not graph screenshots or your telemetry files. "
+        "It must describe association separately from proof that the setting caused the result.");
+    ImGui::PopStyleColor();
+    nlohmann::json crew_prior_setup_results = nlohmann::json::array();
+    std::size_t crew_prior_setup_result_count = 0;
+    if (!race_day_.runs.empty()) {
+        const auto current_index = std::clamp(
+            race_day_current_run_, 0, static_cast<int>(race_day_.runs.size()) - 1);
+        const auto& current_run = race_day_.runs[static_cast<std::size_t>(current_index)];
+        const auto memory_query = std::string(crew_chief_question_.data()) + " " +
+            std::string(crew_chief_setup_change_.data());
+        const auto relevant = race_day::relevant_setup_knowledge(
+            race_day_, memory_query, current_run);
+        crew_prior_setup_result_count = relevant.size();
+        crew_prior_setup_results = race_day::build_prior_setup_results(
+            race_day_, relevant);
+        ImGui::TextColored(
+            ImVec4(0.30F, 0.78F, 0.95F, 1.0F),
+            "Setup Knowledge: %zu matching saved result%s from the Race Day book",
+            crew_prior_setup_result_count,
+            crew_prior_setup_result_count == 1 ? "" : "s");
+    } else {
+        ImGui::TextDisabled(
+            "Setup Knowledge: create or open a Race Day book to use saved real-world results.");
+    }
+
+    const auto* before = active_lap();
+    const auto* after_a = compare_lap();
+    const auto* after_b = compare_b_lap();
+    const auto lap_name = [&](const LapInfo* lap) {
+        if (!lap) return std::string("not loaded");
+        return lap->race_lap > 0
+            ? std::format("R{} (raw {}, {})", lap->race_lap, lap->raw_lap, lap_time(lap->duration_us))
+            : std::format("raw {} ({}, {})", lap->raw_lap, phase_name(lap->phase), lap_time(lap->duration_us));
+    };
+    ImGui::SeparatorText("BEFORE / AFTER");
+    ImGui::Text("Before (Reference): %s", lap_name(before).c_str());
+    auto after_slot = crew_chief_after_slot_ == driver_analysis::ComparisonSlot::CompareA ? 0 : 1;
+    if (ImGui::RadioButton(std::format("After: Compare A - {}", lap_name(after_a)).c_str(), after_slot == 0)) {
+        after_slot = 0;
+        crew_chief_after_slot_ = driver_analysis::ComparisonSlot::CompareA;
+        crew_chief_report_.reset();
+    }
+    if (ImGui::RadioButton(std::format("After: Compare B - {}", lap_name(after_b)).c_str(), after_slot == 1)) {
+        after_slot = 1;
+        crew_chief_after_slot_ = driver_analysis::ComparisonSlot::CompareB;
+        crew_chief_report_.reset();
+    }
+
+    ImGui::SeparatorText("WHAT CHANGED");
+    ImGui::TextWrapped(
+        "Include the old and new value when you know it. Example: rear spring 2.6 to 2.8, "
+        "front ride height +1 mm, fresh rear tires, or repaired bent steering link.");
+    ImGui::InputTextMultiline(
+        "Setup / condition change##crew-change",
+        crew_chief_setup_change_.data(), crew_chief_setup_change_.size(), ImVec2(-1, 92.0F));
+    ImGui::InputTextMultiline(
+        "Question##crew-question",
+        crew_chief_question_.data(), crew_chief_question_.size(), ImVec2(-1, 82.0F));
+
+    if (ImGui::CollapsingHeader("Connection")) {
+        ImGui::InputText("Crew Chief address", crew_chief_endpoint_.data(), crew_chief_endpoint_.size());
+        ImGui::TextDisabled(
+            "Default: private Tailscale service on the existing OpenClaw/Codex server. "
+            "Optional bearer token: RACEBOX_CREW_CHIEF_TOKEN.");
+        ImGui::Text("Bearer token: %s", crew_chief_bearer_token_.empty() ? "not required/configured" : "configured");
+    }
+
+    const auto* after = crew_chief_after_slot_ == driver_analysis::ComparisonSlot::CompareA ? after_a : after_b;
+    const auto can_send = session_ && before && after && before->phase == LapPhase::Complete &&
+        after->phase == LapPhase::Complete && crew_chief_setup_change_.front() != '\0' &&
+        crew_chief_question_.front() != '\0' && crew_chief_endpoint_.front() != '\0' && !crew_chief_busy_;
+    ImGui::BeginDisabled(!can_send);
+    if (ImGui::Button("Ask Crew Chief", ImVec2(-1, 34.0F))) {
+        refresh_driver_analysis(true);
+        const auto evidence = crew_chief::build_evidence_packet(
+            *session_, *before, *after, driver_analysis_, crew_chief_after_slot_, &imu_analysis_);
+        const auto endpoint = std::string(crew_chief_endpoint_.data());
+        const auto token = crew_chief_bearer_token_;
+        const auto setup_change = std::string(crew_chief_setup_change_.data());
+        const auto question = std::string(crew_chief_question_.data());
+        const auto history = crew_chief_history_;
+        const auto prior_setup_results = crew_prior_setup_results;
+        crew_chief_report_.reset();
+        crew_chief_error_.clear();
+        crew_chief_busy_ = true;
+        crew_chief_future_ = std::async(std::launch::async,
+            [endpoint, token, setup_change, question, evidence, prior_setup_results, history] {
+                return crew_chief::request_report(
+                    endpoint, token, setup_change, question, evidence,
+                    prior_setup_results, history);
+            });
+        status_ = "Crew Chief is reviewing the measured before/after evidence";
+    }
+    ImGui::EndDisabled();
+    if (!can_send && !crew_chief_busy_) {
+        if (!before || !after || before->phase != LapPhase::Complete || after->phase != LapPhase::Complete) {
+            ImGui::TextDisabled("Choose complete Reference and Compare laps first.");
+        } else if (crew_chief_setup_change_.front() == '\0') {
+            ImGui::TextDisabled("Write what changed before asking the Crew Chief.");
+        }
+    }
+    if (crew_chief_busy_) {
+        ImGui::TextColored(ImVec4(0.90F, 0.72F, 0.20F, 1.0F),
+            "Reviewing speed, G-load, yaw, steering, controls, corners, timing, quality, and repeatability...");
+    }
+    if (!crew_chief_error_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96F, 0.32F, 0.30F, 1.0F));
+        ImGui::TextWrapped("Crew Chief connection: %s", crew_chief_error_.c_str());
+        ImGui::PopStyleColor();
+        ImGui::TextWrapped(
+            "The local telemetry, graphs, and deterministic Insights still work normally while the private AI service is offline.");
+    }
+
+    if (crew_chief_report_) {
+        const auto& report = *crew_chief_report_;
+        const auto verdict_color =
+            report.verdict == "supported" ? ImVec4(0.20F, 0.82F, 0.42F, 1.0F) :
+            report.verdict == "mixed" ? ImVec4(0.90F, 0.72F, 0.20F, 1.0F) :
+            ImVec4(0.72F, 0.76F, 0.82F, 1.0F);
+        ImGui::SeparatorText("CREW CHIEF REPORT");
+        ImGui::TextColored(verdict_color, "%s | %d%% confidence",
+            report.verdict == "supported" ? "CHANGE SUPPORTED" :
+            report.verdict == "mixed" ? "MIXED RESULT" :
+            report.verdict == "not_supported" ? "CHANGE NOT SUPPORTED" :
+            report.verdict == "data_limited" ? "MORE CLEAN LAPS NEEDED" :
+            "NO CLEAR ANSWER",
+            report.confidence);
+        ImGui::TextWrapped("%s", report.summary.c_str());
+        for (std::size_t index = 0; index < report.observations.size(); ++index) {
+            const auto& observation = report.observations[index];
+            ImGui::PushID(static_cast<int>(index));
+            const auto flags = index == 0 ? ImGuiTreeNodeFlags_DefaultOpen : ImGuiTreeNodeFlags_None;
+            if (ImGui::TreeNodeEx(observation.area.c_str(), flags)) {
+                ImGui::TextWrapped("Measured change: %s", observation.change.c_str());
+                ImGui::TextWrapped("What that means: %s", observation.meaning.c_str());
+                if (!observation.evidence_ids.empty()) {
+                    std::string ids;
+                    for (const auto& id : observation.evidence_ids) {
+                        if (!ids.empty()) ids += " | ";
+                        ids += id;
+                    }
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                    ImGui::TextWrapped("Evidence: %s", ids.c_str());
+                    ImGui::PopStyleColor();
+                }
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+        if (!report.confounds.empty() && ImGui::CollapsingHeader("What could be misleading")) {
+            for (const auto& confound : report.confounds) ImGui::BulletText("%s", confound.c_str());
+        }
+        ImGui::SeparatorText("NEXT TEST");
+        ImGui::TextWrapped("%s", report.next_test.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("Causality: %s", report.causality_note.c_str());
+        ImGui::PopStyleColor();
+        if (!report.model.empty()) {
+            ImGui::TextDisabled(
+                "Private lane: %s | %s | %s | saved results used: %zu",
+                report.model.c_str(), report.route.c_str(),
+                report.thinking.empty() ? "thinking not reported" : report.thinking.c_str(),
+                report.prior_setup_result_ids.size());
+        }
+    }
+
+    if (!crew_chief_history_.empty() && ImGui::CollapsingHeader("Conversation history")) {
+        if (ImGui::Button("Clear conversation")) {
+            crew_chief_history_.clear();
+            crew_chief_report_.reset();
+        }
+        ImGui::BeginChild("crew-chief-history", ImVec2(-1, 190.0F), ImGuiChildFlags_Borders);
+        for (const auto& turn : crew_chief_history_) {
+            ImGui::TextColored(
+                turn.role == "assistant" ? ImVec4(0.30F, 0.78F, 0.95F, 1.0F) : ImGui::GetStyleColorVec4(ImGuiCol_Text),
+                "%s", turn.role == "assistant" ? "Crew Chief" : "You");
+            ImGui::TextWrapped("%s", turn.content.c_str());
+            ImGui::Separator();
+        }
+        ImGui::EndChild();
+    }
+}
+
+void NativeApp::new_race_day() {
+    race_day_ = race_day::standard_day(race_day_include_q4_, race_day_triple_a_);
+    race_day_.date = local_date_label();
+    race_day_path_.clear();
+    selected_race_day_run_ = 0;
+    race_day_previous_run_ = 0;
+    race_day_current_run_ = std::min(1, static_cast<int>(race_day_.runs.size()) - 1);
+    race_day_report_.reset();
+    race_day_pending_knowledge_.reset();
+    selected_setup_knowledge_record_ = -1;
+    race_day_relevant_history_count_ = 0;
+    race_day_error_.clear();
+    race_day_dirty_ = true;
+    workspace_section_ = WorkspaceSection::RaceDay;
+    status_ = "New race day created";
+}
+
+void NativeApp::open_race_day() {
+    const auto path = open_race_day_file(window_);
+    if (!path) return;
+    race_day::Day loaded;
+    std::string load_error;
+    if (!race_day::load(*path, loaded, load_error)) {
+        race_day_error_ = load_error;
+        error_ = load_error;
+        return;
+    }
+    race_day_ = std::move(loaded);
+    race_day_path_ = *path;
+    selected_race_day_run_ = 0;
+    race_day_previous_run_ = 0;
+    race_day_current_run_ = std::min(1, static_cast<int>(race_day_.runs.size()) - 1);
+    race_day_report_.reset();
+    race_day_pending_knowledge_.reset();
+    selected_setup_knowledge_record_ = race_day_.setup_knowledge.empty()
+        ? -1 : static_cast<int>(race_day_.setup_knowledge.size()) - 1;
+    race_day_relevant_history_count_ = 0;
+    race_day_error_.clear();
+    race_day_dirty_ = false;
+    workspace_section_ = WorkspaceSection::RaceDay;
+    status_ = std::format("Opened race day with {} runs", race_day_.runs.size());
+}
+
+void NativeApp::save_race_day(bool choose_path) {
+    if (race_day_.runs.empty()) return;
+    auto destination = race_day_path_;
+    if (choose_path || destination.empty()) {
+        const auto selected = save_file(window_, L"RaceBox Race Day", L"rbxday", L"*.rbxday");
+        if (!selected) return;
+        destination = *selected;
+    }
+    std::string save_error;
+    if (!race_day::save(race_day_, destination, save_error)) {
+        race_day_error_ = save_error;
+        error_ = save_error;
+        return;
+    }
+    race_day_path_ = std::move(destination);
+    race_day_dirty_ = false;
+    race_day_error_.clear();
+    status_ = std::format("Race day saved: {}", race_day_path_.filename().string());
+}
+
+void NativeApp::attach_race_day_telemetry() {
+    if (race_day_.runs.empty()) return;
+    selected_race_day_run_ = std::clamp(
+        selected_race_day_run_, 0, static_cast<int>(race_day_.runs.size()) - 1);
+    auto files = open_telemetry_files(window_);
+    if (files.empty()) return;
+    auto& attached = race_day_.runs[static_cast<std::size_t>(selected_race_day_run_)].telemetry_files;
+    for (const auto& path : files) {
+        if (attached.size() >= 8) break;
+        if (std::find(attached.begin(), attached.end(), path) == attached.end()) attached.push_back(path);
+    }
+    race_day_dirty_ = true;
+    race_day_report_.reset();
+    status_ = std::format("Attached {} telemetry source(s) to {}",
+        attached.size(), race_day_.runs[static_cast<std::size_t>(selected_race_day_run_)].label);
+}
+
+void NativeApp::analyze_race_day_runs() {
+    if (race_day_busy_ || race_day_.runs.size() < 2) return;
+    const auto count = static_cast<int>(race_day_.runs.size());
+    race_day_previous_run_ = std::clamp(race_day_previous_run_, 0, count - 1);
+    race_day_current_run_ = std::clamp(race_day_current_run_, 0, count - 1);
+    if (race_day_previous_run_ == race_day_current_run_) {
+        race_day_error_ = "Previous and current must be two different runs";
+        return;
+    }
+    const auto previous = race_day_.runs[static_cast<std::size_t>(race_day_previous_run_)];
+    const auto current = race_day_.runs[static_cast<std::size_t>(race_day_current_run_)];
+    if (previous.telemetry_files.empty() || current.telemetry_files.empty()) {
+        race_day_error_ = "Attach telemetry to both the previous and current run first";
+        return;
+    }
+
+    const auto previous_context = race_day_run_context(race_day_, previous);
+    const auto current_context = race_day_run_context(race_day_, current);
+    const auto relevant_indices = race_day::relevant_setup_knowledge(
+        race_day_, race_day_question_, current);
+    const auto prior_setup_results = race_day::build_prior_setup_results(
+        race_day_, relevant_indices);
+    const auto endpoint = std::string(crew_chief_endpoint_.data());
+    const auto token = crew_chief_bearer_token_;
+    const auto question = race_day_question_;
+    race_day::SetupKnowledgeRecord pending;
+    pending.id = setup_knowledge_id(
+        previous.id, current.id, question, current.setup_changes, current.post_run_notes);
+    pending.created_at_utc = utc_timestamp();
+    pending.event_name = race_day_.event_name;
+    pending.track_name = race_day_.track_name;
+    pending.previous_run_id = previous.id;
+    pending.previous_run_label = previous.label;
+    pending.current_run_id = current.id;
+    pending.current_run_label = current.label;
+    pending.handling_question = question;
+    pending.setup_change = current.setup_changes;
+    pending.driver_result = current.post_run_notes;
+    pending.previous_conditions = previous.conditions;
+    pending.current_conditions = current.conditions;
+    race_day_pending_knowledge_ = std::move(pending);
+    race_day_relevant_history_count_ = relevant_indices.size();
+    race_day_report_.reset();
+    race_day_error_.clear();
+    race_day_busy_ = true;
+    race_day_future_ = std::async(std::launch::async,
+        [previous, current, previous_context, current_context, prior_setup_results,
+         endpoint, token, question] {
+            try {
+                const auto previous_loaded = race_day::load_run_telemetry(previous);
+                const auto current_loaded = race_day::load_run_telemetry(current);
+                const auto deterministic_summary = race_day::analyze_setup_change(
+                    previous_loaded.session, previous_loaded.imu_analysis,
+                    current_loaded.session, current_loaded.imu_analysis);
+                const auto previous_csv = race_day::build_analytics_csv(
+                    previous_loaded.session, previous_loaded.imu_analysis);
+                const auto current_csv = race_day::build_analytics_csv(
+                    current_loaded.session, current_loaded.imu_analysis);
+                auto response = crew_chief::request_race_day_report(
+                    endpoint, token, previous_context, previous_csv,
+                    current_context, current_csv, question, prior_setup_results);
+                if (response.ok) fill_missing_setup_evidence(response.report, deterministic_summary);
+                return response;
+            } catch (const std::exception& exception) {
+                crew_chief::Response response;
+                response.error = exception.what();
+                return response;
+            }
+        });
+    status_ = std::format("Analyzing {} against {}", current.label, previous.label);
+}
+
+void NativeApp::draw_race_day() {
+    using namespace std::chrono_literals;
+    if (race_day_busy_ && race_day_future_.valid() &&
+        race_day_future_.wait_for(0ms) == std::future_status::ready) {
+        auto response = race_day_future_.get();
+        race_day_busy_ = false;
+        if (response.ok) {
+            race_day_report_ = std::move(response.report);
+            race_day_error_.clear();
+            if (race_day_pending_knowledge_) {
+                apply_crew_chief_report(*race_day_pending_knowledge_, *race_day_report_);
+                const auto stored_id = race_day_pending_knowledge_->id;
+                race_day::upsert_setup_knowledge(
+                    race_day_, std::move(*race_day_pending_knowledge_));
+                race_day_pending_knowledge_.reset();
+                const auto stored = std::find_if(
+                    race_day_.setup_knowledge.begin(), race_day_.setup_knowledge.end(),
+                    [&](const auto& record) { return record.id == stored_id; });
+                selected_setup_knowledge_record_ = stored == race_day_.setup_knowledge.end()
+                    ? -1 : static_cast<int>(std::distance(race_day_.setup_knowledge.begin(), stored));
+                race_day_dirty_ = true;
+                if (!race_day_path_.empty()) {
+                    std::string save_error;
+                    if (race_day::save(race_day_, race_day_path_, save_error)) {
+                        race_day_dirty_ = false;
+                    } else {
+                        race_day_error_ =
+                            "Analysis completed, but the setup result could not be saved: " + save_error;
+                    }
+                }
+            }
+            status_ = std::format(
+                "Race-day analysis answered with {}% confidence; setup result stored",
+                race_day_report_->confidence);
+        } else {
+            race_day_pending_knowledge_.reset();
+            race_day_error_ = std::move(response.error);
+            status_ = "Race-day AI unavailable; the event book remains saved locally";
+        }
+    }
+
+    const auto* viewport = ImGui::GetMainViewport();
+    const auto origin = viewport->WorkPos + ImVec2(0.0F, application_header_height());
+    const auto size = ImVec2(viewport->WorkSize.x,
+        std::max(1.0F, viewport->WorkSize.y - application_header_height()));
+    ImGui::SetNextWindowPos(origin, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+    ImGui::SetNextWindowViewport(viewport->ID);
+    constexpr auto flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDocking |
+        ImGuiWindowFlags_NoSavedSettings;
+    if (!ImGui::Begin("Race Day Workspace", nullptr, flags)) {
+        ImGui::End();
+        return;
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30F, 0.78F, 0.95F, 1.0F));
+    ImGui::TextUnformatted("RACE DAY BOOK");
+    ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::TextDisabled("Attach each run now; telemetry is loaded only when opened or analyzed.");
+    ImGui::SameLine();
+    if (race_day_dirty_) ImGui::TextColored(ImVec4(0.95F, 0.68F, 0.18F, 1.0F), "UNSAVED");
+
+    ImGui::SetNextItemWidth(230.0F);
+    if (input_text_string("Event##race-day-event", race_day_.event_name)) race_day_dirty_ = true;
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(210.0F);
+    if (input_text_string("Track##race-day-track", race_day_.track_name)) race_day_dirty_ = true;
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0F);
+    if (input_text_string("Date##race-day-date", race_day_.date)) race_day_dirty_ = true;
+    ImGui::SameLine();
+    if (ImGui::Button("New")) ImGui::OpenPopup("Replace race day?");
+    ImGui::SameLine();
+    if (ImGui::Button("Open...")) open_race_day();
+    ImGui::SameLine();
+    if (ImGui::Button("Save")) save_race_day(false);
+    ImGui::SameLine();
+    if (ImGui::Button("Save as...")) save_race_day(true);
+
+    if (ImGui::BeginPopupModal("Replace race day?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("Create a new race day and replace the unsaved event currently in memory?");
+        ImGui::Checkbox("Include Q4 (trophy race)", &race_day_include_q4_);
+        ImGui::Checkbox("Triple A Main", &race_day_triple_a_);
+        if (ImGui::Button("Create new day")) {
+            new_race_day();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    ImGui::Separator();
+    const auto available = ImGui::GetContentRegionAvail();
+    const auto left_width = std::clamp(available.x * 0.22F, 210.0F, 280.0F);
+    const auto center_width = std::clamp(available.x * 0.43F, 360.0F, 620.0F);
+
+    ImGui::BeginChild("race-day-runs", ImVec2(left_width, -1.0F), ImGuiChildFlags_Borders);
+    ImGui::SeparatorText("RUNS");
+    for (std::size_t index = 0; index < race_day_.runs.size(); ++index) {
+        auto& run = race_day_.runs[index];
+        ImGui::PushID(static_cast<int>(index));
+        const auto selected = selected_race_day_run_ == static_cast<int>(index);
+        const auto label = std::format("{}##run", run.label);
+        if (ImGui::Selectable(label.c_str(), selected, ImGuiSelectableFlags_None, ImVec2(-1.0F, 34.0F))) {
+            selected_race_day_run_ = static_cast<int>(index);
+            race_day_current_run_ = selected_race_day_run_;
+            if (race_day_previous_run_ == race_day_current_run_) {
+                race_day_previous_run_ = std::max(0, race_day_current_run_ - 1);
+                if (race_day_previous_run_ == race_day_current_run_ && race_day_.runs.size() > 1) {
+                    race_day_previous_run_ = 1;
+                }
+            }
+        }
+        if (run.telemetry_files.empty()) {
+            ImGui::TextDisabled("%s | no telemetry", race_day::kind_name(run.kind));
+        } else {
+            ImGui::TextColored(ImVec4(0.28F, 0.80F, 0.45F, 1.0F), "%s | %zu source%s",
+                race_day::kind_name(run.kind), run.telemetry_files.size(),
+                run.telemetry_files.size() == 1 ? "" : "s");
+        }
+        ImGui::PopID();
+    }
+    ImGui::SeparatorText("ADD AS YOU GO");
+    if (ImGui::Button("Add practice", ImVec2(-1.0F, 0.0F))) {
+        race_day::add_practice(race_day_);
+        selected_race_day_run_ = static_cast<int>(race_day_.runs.size()) - 1;
+        race_day_current_run_ = selected_race_day_run_;
+        race_day_dirty_ = true;
+    }
+    if (ImGui::Button("Add qualifier", ImVec2(-1.0F, 0.0F))) {
+        race_day::add_qualifying(race_day_);
+        selected_race_day_run_ = static_cast<int>(race_day_.runs.size()) - 1;
+        race_day_current_run_ = selected_race_day_run_;
+        race_day_dirty_ = true;
+    }
+    const char* groups[] = {"A Main", "B Main", "C Main", "D Main"};
+    ImGui::SetNextItemWidth(110.0F);
+    ImGui::Combo("##main-group", &race_day_main_group_, groups, 4);
+    ImGui::SameLine();
+    const char* legs[] = {"Single", "Triple"};
+    ImGui::SetNextItemWidth(90.0F);
+    ImGui::Combo("##main-legs", &race_day_main_legs_, legs, 2);
+    if (ImGui::Button("Add main", ImVec2(-1.0F, 0.0F))) {
+        const auto added = race_day::add_main_group(
+            race_day_, static_cast<char>('A' + race_day_main_group_), race_day_main_legs_ == 0 ? 1 : 3);
+        if (!added.empty()) {
+            selected_race_day_run_ = static_cast<int>(added.front());
+            race_day_current_run_ = selected_race_day_run_;
+            race_day_dirty_ = true;
+        } else {
+            race_day_error_ = "That main is already in the race day";
+        }
+    }
+    if (ImGui::Button("Add custom run", ImVec2(-1.0F, 0.0F))) {
+        race_day::add_custom(race_day_, {});
+        selected_race_day_run_ = static_cast<int>(race_day_.runs.size()) - 1;
+        race_day_current_run_ = selected_race_day_run_;
+        race_day_dirty_ = true;
+    }
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+    ImGui::BeginChild("race-day-details", ImVec2(center_width, -1.0F), ImGuiChildFlags_Borders);
+    if (race_day_.runs.empty()) {
+        ImGui::TextDisabled("Add a run to begin.");
+    } else {
+        selected_race_day_run_ = std::clamp(
+            selected_race_day_run_, 0, static_cast<int>(race_day_.runs.size()) - 1);
+        auto& run = race_day_.runs[static_cast<std::size_t>(selected_race_day_run_)];
+        ImGui::PushID(selected_race_day_run_);
+        ImGui::SeparatorText("SELECTED RUN");
+        if (input_text_string("Run name", run.label)) race_day_dirty_ = true;
+        if (ImGui::Button("Attach VBO / RaceBox / Sanwa...")) attach_race_day_telemetry();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(run.telemetry_files.empty());
+        if (ImGui::Button("Load in viewer")) {
+            const auto files = run.telemetry_files;
+            workspace_section_ = WorkspaceSection::Overview;
+            begin_load(files);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(run.telemetry_files.empty());
+        if (ImGui::Button("Clear attachments")) {
+            run.telemetry_files.clear();
+            race_day_dirty_ = true;
+            race_day_report_.reset();
+        }
+        ImGui::EndDisabled();
+        for (const auto& path : run.telemetry_files) {
+            ImGui::BulletText("%s", path.filename().string().c_str());
+        }
+
+        if (ImGui::BeginTabBar("race-day-detail-tabs")) {
+            if (ImGui::BeginTabItem("Pre-run check")) {
+                ImGui::TextWrapped(
+                    "Record what the car is starting with. This is the context the Crew Chief needs before comparing runs.");
+                if (input_text_multiline_string(
+                    "Planned setup changes##setup", run.setup_changes, ImVec2(-1.0F, 86.0F))) race_day_dirty_ = true;
+                if (input_text_multiline_string(
+                    "Pre-run notes##pre", run.pre_run_notes, ImVec2(-1.0F, 76.0F))) race_day_dirty_ = true;
+                ImGui::SeparatorText("CHECKLIST");
+                for (auto& item : run.checklist) {
+                    ImGui::PushID(item.id.c_str());
+                    if (ImGui::Checkbox(item.label.c_str(), &item.checked)) race_day_dirty_ = true;
+                    ImGui::SetNextItemWidth(-1.0F);
+                    if (input_text_string("Note##check-note", item.note)) race_day_dirty_ = true;
+                    ImGui::PopID();
+                }
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Conditions & tires")) {
+                const auto optional_double = [&](const char* label, std::optional<double>& value,
+                                                 const char* suffix, double step) {
+                    ImGui::PushID(label);
+                    auto known = value.has_value();
+                    if (ImGui::Checkbox("Recorded", &known)) {
+                        if (known) value = 0.0; else value.reset();
+                        race_day_dirty_ = true;
+                    }
+                    ImGui::SameLine();
+                    ImGui::BeginDisabled(!known);
+                    auto number = value.value_or(0.0);
+                    ImGui::SetNextItemWidth(120.0F);
+                    if (ImGui::InputDouble(label, &number, step, step * 5.0, "%.1f")) {
+                        value = number;
+                        race_day_dirty_ = true;
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%s", suffix);
+                    ImGui::EndDisabled();
+                    ImGui::PopID();
+                };
+                const auto optional_int = [&](const char* label, int& value, const char* suffix) {
+                    ImGui::PushID(label);
+                    auto known = value >= 0;
+                    if (ImGui::Checkbox("Recorded", &known)) {
+                        value = known ? 0 : -1;
+                        race_day_dirty_ = true;
+                    }
+                    ImGui::SameLine();
+                    ImGui::BeginDisabled(!known);
+                    auto number = std::max(0, value);
+                    ImGui::SetNextItemWidth(110.0F);
+                    if (ImGui::InputInt(label, &number)) {
+                        value = std::max(0, number);
+                        race_day_dirty_ = true;
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%s", suffix);
+                    ImGui::EndDisabled();
+                    ImGui::PopID();
+                };
+                optional_double("Ambient temperature", run.conditions.ambient_temperature_c, "C", 0.5);
+                optional_double("Track temperature", run.conditions.track_temperature_c, "C", 0.5);
+                if (input_text_string("Track condition", run.conditions.track_condition)) race_day_dirty_ = true;
+                ImGui::SeparatorText("TIRES");
+                if (input_text_string("Tire set ID", run.conditions.tire_set_id)) race_day_dirty_ = true;
+                if (input_text_string("Tire compound", run.conditions.tire_compound)) race_day_dirty_ = true;
+                optional_int("Runs already on this tire set", run.conditions.tire_runs_before, "runs before this session");
+                if (input_text_string("Sauce compound", run.conditions.sauce_compound)) race_day_dirty_ = true;
+                optional_int("Sauce timing", run.conditions.sauce_minutes_before, "minutes before run");
+                optional_int("Tire warmer time", run.conditions.tire_warmer_minutes, "minutes");
+                optional_double("Tire warmer temperature", run.conditions.tire_warmer_temperature_c, "C", 1.0);
+                ImGui::SeparatorText("POWER");
+                if (input_text_string("Battery pack / ID", run.conditions.battery_pack)) race_day_dirty_ = true;
+                optional_double("Battery voltage", run.conditions.battery_voltage, "V", 0.1);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Post-run feel")) {
+                ImGui::TextWrapped(
+                    "Write what changed from the driver's seat: rotation, steering load, forward bite, braking, bumps, consistency, or tire feel.");
+                if (input_text_multiline_string(
+                    "Post-run notes##post", run.post_run_notes, ImVec2(-1.0F, 240.0F))) race_day_dirty_ = true;
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+    ImGui::BeginChild("race-day-analysis", ImVec2(0.0F, -1.0F), ImGuiChildFlags_Borders);
+    ImGui::SeparatorText("PREVIOUS RUN -> CURRENT RUN");
+    ImGui::TextWrapped(
+        "The deterministic analytics layer compares the two complete recordings first. "
+        "The Crew Chief then explains those calculated results with your setup, checklist, tire, temperature, and driver notes.");
+    const auto run_combo = [&](const char* label, int& selected) {
+        if (race_day_.runs.empty()) return;
+        selected = std::clamp(selected, 0, static_cast<int>(race_day_.runs.size()) - 1);
+        if (ImGui::BeginCombo(label, race_day_.runs[static_cast<std::size_t>(selected)].label.c_str())) {
+            for (std::size_t index = 0; index < race_day_.runs.size(); ++index) {
+                const auto active = selected == static_cast<int>(index);
+                if (ImGui::Selectable(race_day_.runs[index].label.c_str(), active)) {
+                    selected = static_cast<int>(index);
+                    race_day_report_.reset();
+                }
+                if (active) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+    };
+    run_combo("Previous / baseline", race_day_previous_run_);
+    run_combo("Current / changed", race_day_current_run_);
+    if (!race_day_.runs.empty()) {
+        const auto& previous = race_day_.runs[static_cast<std::size_t>(std::clamp(
+            race_day_previous_run_, 0, static_cast<int>(race_day_.runs.size()) - 1))];
+        const auto& current = race_day_.runs[static_cast<std::size_t>(std::clamp(
+            race_day_current_run_, 0, static_cast<int>(race_day_.runs.size()) - 1))];
+        ImGui::TextDisabled("Previous: %zu source(s) | Current: %zu source(s)",
+            previous.telemetry_files.size(), current.telemetry_files.size());
+        if (current.setup_changes.empty()) {
+            ImGui::TextColored(ImVec4(0.95F, 0.68F, 0.18F, 1.0F),
+                "Current run has no setup-change note yet.");
+        }
+        const auto relevant = race_day::relevant_setup_knowledge(
+            race_day_, race_day_question_, current);
+        ImGui::TextColored(ImVec4(0.30F, 0.78F, 0.95F, 1.0F),
+            "%zu matching saved setup result%s available for this question",
+            relevant.size(), relevant.size() == 1 ? "" : "s");
+    }
+    if (input_text_multiline_string(
+        "Question##race-day-question", race_day_question_, ImVec2(-1.0F, 92.0F))) {
+        race_day_report_.reset();
+    }
+    const auto can_analyze = race_day_.runs.size() >= 2 && !race_day_busy_ &&
+        race_day_previous_run_ != race_day_current_run_ &&
+        race_day_previous_run_ >= 0 && race_day_current_run_ >= 0 &&
+        race_day_previous_run_ < static_cast<int>(race_day_.runs.size()) &&
+        race_day_current_run_ < static_cast<int>(race_day_.runs.size()) &&
+        !race_day_.runs[static_cast<std::size_t>(race_day_previous_run_)].telemetry_files.empty() &&
+        !race_day_.runs[static_cast<std::size_t>(race_day_current_run_)].telemetry_files.empty();
+    ImGui::BeginDisabled(!can_analyze);
+    if (ImGui::Button("Analyze previous vs current", ImVec2(-1.0F, 38.0F))) analyze_race_day_runs();
+    ImGui::EndDisabled();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30F, 0.78F, 0.95F, 1.0F));
+    ImGui::TextWrapped(
+        "Privacy: this button sends generated aligned telemetry CSV plus these two runs' notes and conditions "
+        "to your Tailscale-only gateway. Original paths and raw files are not sent. The model receives calculated evidence.");
+    ImGui::PopStyleColor();
+    if (race_day_busy_) {
+        ImGui::TextColored(ImVec4(0.95F, 0.68F, 0.18F, 1.0F),
+            "Loading both runs and calculating matched speed/input evidence...");
+    }
+    if (!race_day_error_.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96F, 0.32F, 0.30F, 1.0F));
+        ImGui::TextWrapped("%s", race_day_error_.c_str());
+        ImGui::PopStyleColor();
+    }
+    if (race_day_report_) {
+        const auto& report = *race_day_report_;
+        const auto color = report.verdict == "supported" ? ImVec4(0.20F, 0.82F, 0.42F, 1.0F) :
+            report.verdict == "mixed" ? ImVec4(0.95F, 0.68F, 0.18F, 1.0F) :
+            ImVec4(0.72F, 0.76F, 0.82F, 1.0F);
+        ImGui::SeparatorText("CREW CHIEF ANALYSIS");
+        ImGui::TextColored(color, "%s | %d%% confidence",
+            report.verdict == "supported" ? "CHANGE SUPPORTED" :
+            report.verdict == "mixed" ? "MIXED RESULT" :
+            report.verdict == "not_supported" ? "CHANGE NOT SUPPORTED" :
+            report.verdict == "data_limited" ? "MORE MATCHED RUNS NEEDED" :
+            "NO CLEAR ANSWER", report.confidence);
+        ImGui::TextWrapped("%s", report.summary.c_str());
+        for (std::size_t index = 0; index < report.observations.size(); ++index) {
+            const auto& observation = report.observations[index];
+            ImGui::PushID(static_cast<int>(index));
+            if (ImGui::TreeNodeEx(observation.area.c_str(),
+                index == 0 ? ImGuiTreeNodeFlags_DefaultOpen : ImGuiTreeNodeFlags_None)) {
+                ImGui::TextWrapped("Measured: %s", observation.change.c_str());
+                ImGui::TextWrapped("Meaning: %s", observation.meaning.c_str());
+                if (!observation.evidence_ids.empty()) {
+                    std::string ids;
+                    for (const auto& id : observation.evidence_ids) {
+                        if (!ids.empty()) ids += " | ";
+                        ids += id;
+                    }
+                    ImGui::TextDisabled("%s", ids.c_str());
+                }
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+        if (!report.confounds.empty() && ImGui::CollapsingHeader("Possible confounds")) {
+            for (const auto& confound : report.confounds) ImGui::BulletText("%s", confound.c_str());
+        }
+        ImGui::SeparatorText("NEXT CONTROLLED TEST");
+        ImGui::TextWrapped("%s", report.next_test.c_str());
+        ImGui::TextDisabled("Causality: %s", report.causality_note.c_str());
+        ImGui::TextDisabled(
+            "Agent: %s | %s | %s | prior results used: %zu",
+            report.model.empty() ? "not reported" : report.model.c_str(),
+            report.thinking.empty() ? "thinking not reported" : report.thinking.c_str(),
+            report.selected_lane.empty() ? "lane not reported" : report.selected_lane.c_str(),
+            report.prior_setup_result_ids.size());
+    }
+    if (ImGui::CollapsingHeader("What the formulas can and cannot say")) {
+        ImGui::BulletText(
+            "Side response: compare lateral G in matched speed and steering-input bins; require repeated complete laps.");
+        ImGui::BulletText(
+            "Forward bite: compare speed-derived acceleration at full throttle in matched speed/steering bins.");
+        ImGui::BulletText(
+            "Brake indicator: sustained high brake with falling deceleration plus yaw/lateral disturbance is only a possible lockup or low-grip signal.");
+        ImGui::TextWrapped(
+            "Chassis IMU G is not direct tire load. Wheel-speed sensors are required to confirm a locked tire, "
+            "and controlled A/B repetition is required before a setup change is called causal.");
+    }
+
+    const auto knowledge_heading = std::format(
+        "SETUP KNOWLEDGE ({} SAVED)", race_day_.setup_knowledge.size());
+    ImGui::SeparatorText(knowledge_heading.c_str());
+    ImGui::TextWrapped(
+        "Each completed comparison stores the change, driver result, conditions, measured evidence, "
+        "and Crew Chief conclusion inside this Race Day file. Matching records can be referenced in future questions.");
+    if (race_day_.setup_knowledge.empty()) {
+        ImGui::TextDisabled(
+            "No setup results saved yet. Complete a previous-vs-current analysis to create the first record.");
+    } else {
+        selected_setup_knowledge_record_ = std::clamp(
+            selected_setup_knowledge_record_, 0,
+            static_cast<int>(race_day_.setup_knowledge.size()) - 1);
+        const auto& selected = race_day_.setup_knowledge[
+            static_cast<std::size_t>(selected_setup_knowledge_record_)];
+        const auto selected_label = std::format(
+            "{} -> {} | {} | {}%",
+            selected.previous_run_label, selected.current_run_label,
+            selected.verdict, selected.confidence);
+        if (ImGui::BeginCombo("Saved setup result", selected_label.c_str())) {
+            for (std::size_t reverse = race_day_.setup_knowledge.size(); reverse > 0; --reverse) {
+                const auto index = reverse - 1;
+                const auto& record = race_day_.setup_knowledge[index];
+                const auto label = std::format(
+                    "{} -> {} | {} | {}%##{}",
+                    record.previous_run_label, record.current_run_label,
+                    record.verdict, record.confidence, record.id);
+                const auto active = selected_setup_knowledge_record_ == static_cast<int>(index);
+                if (ImGui::Selectable(label.c_str(), active)) {
+                    selected_setup_knowledge_record_ = static_cast<int>(index);
+                }
+                if (active) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        const auto& record = race_day_.setup_knowledge[
+            static_cast<std::size_t>(selected_setup_knowledge_record_)];
+        ImGui::TextDisabled("%s | %s | %s",
+            record.created_at_utc.c_str(), record.track_name.c_str(), record.id.c_str());
+        ImGui::TextWrapped("Setup change: %s",
+            record.setup_change.empty() ? "none recorded" : record.setup_change.c_str());
+        ImGui::TextWrapped("Driver result: %s",
+            record.driver_result.empty() ? "none recorded" : record.driver_result.c_str());
+        ImGui::TextWrapped("Crew Chief result: %s", record.summary.c_str());
+        if (ImGui::TreeNodeEx(
+            "Measured evidence##saved-setup-evidence", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Text("Quality confidence: %d%%", record.evidence.quality_confidence);
+            if (record.evidence.lap_time_delta_s) {
+                ImGui::Text("Top-three lap median: current %+.3f s vs previous",
+                    *record.evidence.lap_time_delta_s);
+            } else {
+                ImGui::TextDisabled("Top-three lap median: insufficient data");
+            }
+            if (record.evidence.lateral_response_delta_g) {
+                ImGui::Text("Matched lateral response: %+.4f G (%s)",
+                    *record.evidence.lateral_response_delta_g,
+                    record.evidence.lateral_status.c_str());
+            } else {
+                ImGui::TextDisabled("Matched lateral response: insufficient data");
+            }
+            if (record.evidence.forward_bite_delta_g) {
+                ImGui::Text("Matched full-throttle acceleration: %+.4f G (%s)",
+                    *record.evidence.forward_bite_delta_g,
+                    record.evidence.forward_status.c_str());
+            } else {
+                ImGui::TextDisabled("Matched full-throttle acceleration: insufficient data");
+            }
+            if (record.evidence.straight_top_speed_delta_kmh) {
+                ImGui::Text("Straight top speed: %+.2f km/h (%s)",
+                    *record.evidence.straight_top_speed_delta_kmh,
+                    record.evidence.top_speed_status.c_str());
+                ImGui::Text("Straight cause: %s | entry %s | accel %s",
+                    record.evidence.straight_speed_attribution.c_str(),
+                    record.evidence.straight_entry_speed_delta_kmh
+                        ? std::format("{:+.2f} km/h", *record.evidence.straight_entry_speed_delta_kmh).c_str()
+                        : "n/a",
+                    record.evidence.straight_acceleration_delta_g
+                        ? std::format("{:+.4f} G", *record.evidence.straight_acceleration_delta_g).c_str()
+                        : "n/a");
+            } else {
+                ImGui::TextDisabled("Straight top speed: insufficient data");
+            }
+            if (record.evidence.brake_decel_delta_g || record.evidence.brake_response_delay_delta_s) {
+                ImGui::Text("Brake response: %s | decel %s | delay %s",
+                    record.evidence.brake_response_status.c_str(),
+                    record.evidence.brake_decel_delta_g
+                        ? std::format("{:+.4f} G", *record.evidence.brake_decel_delta_g).c_str()
+                        : "n/a",
+                    record.evidence.brake_response_delay_delta_s
+                        ? std::format("{:+.3f} s", *record.evidence.brake_response_delay_delta_s).c_str()
+                        : "n/a");
+            }
+            if (record.evidence.steering_for_lateral_g_delta_percent ||
+                record.evidence.yaw_per_steering_delta_dps) {
+                ImGui::Text("Corner balance: %s", record.evidence.corner_balance_status.c_str());
+            }
+            if (record.evidence.overdriving_index_delta ||
+                record.evidence.overdriving_risk_sample_delta_percent ||
+                record.evidence.current_late_overdriving_delta_score) {
+                ImGui::Text("Overdriving / tire scrub: %s | score %s | risk samples %s | late run %s",
+                    record.evidence.overdriving_status.c_str(),
+                    record.evidence.overdriving_index_delta
+                        ? std::format("{:+.1f}", *record.evidence.overdriving_index_delta).c_str()
+                        : "n/a",
+                    record.evidence.overdriving_risk_sample_delta_percent
+                        ? std::format("{:+.1f}%%", *record.evidence.overdriving_risk_sample_delta_percent).c_str()
+                        : "n/a",
+                    record.evidence.current_late_overdriving_delta_score
+                        ? std::format("{:+.1f}", *record.evidence.current_late_overdriving_delta_score).c_str()
+                        : "n/a");
+            }
+            if (record.evidence.chassis_roll_delta_deg ||
+                record.evidence.roll_per_lateral_g_delta_deg ||
+                record.evidence.surface_tilt_delta_deg) {
+                ImGui::Text("Chassis roll signature: %s | roll %s | per G %s | surface %s (%s, %d samples)",
+                    record.evidence.chassis_roll_status.c_str(),
+                    record.evidence.chassis_roll_delta_deg
+                        ? std::format("{:+.2f} deg", *record.evidence.chassis_roll_delta_deg).c_str()
+                        : "n/a",
+                    record.evidence.roll_per_lateral_g_delta_deg
+                        ? std::format("{:+.2f} deg/G", *record.evidence.roll_per_lateral_g_delta_deg).c_str()
+                        : "n/a",
+                    record.evidence.surface_tilt_delta_deg
+                        ? std::format("{:+.2f} deg", *record.evidence.surface_tilt_delta_deg).c_str()
+                        : "n/a",
+                    record.evidence.current_surface_tilt_source.c_str(),
+                    record.evidence.current_surface_tilt_samples);
+            }
+            if (record.evidence.roll_rate_delta_dps ||
+                record.evidence.roll_rate_per_lateral_g_delta_dps ||
+                record.evidence.current_late_roll_rate_delta_dps) {
+                ImGui::Text("Roll-rate signature: %s | p90 %s -> %s | delta %s | late run %s | samples %d -> %d",
+                    record.evidence.roll_rate_status.c_str(),
+                    record.evidence.previous_roll_rate_p90_dps
+                        ? std::format("{:.1f} deg/s", *record.evidence.previous_roll_rate_p90_dps).c_str()
+                        : "n/a",
+                    record.evidence.current_roll_rate_p90_dps
+                        ? std::format("{:.1f} deg/s", *record.evidence.current_roll_rate_p90_dps).c_str()
+                        : "n/a",
+                    record.evidence.roll_rate_delta_dps
+                        ? std::format("{:+.1f} deg/s", *record.evidence.roll_rate_delta_dps).c_str()
+                        : "n/a",
+                    record.evidence.current_late_roll_rate_delta_dps
+                        ? std::format("{:+.1f} deg/s", *record.evidence.current_late_roll_rate_delta_dps).c_str()
+                        : "n/a",
+                    record.evidence.previous_roll_rate_samples,
+                    record.evidence.current_roll_rate_samples);
+            }
+            ImGui::Text("Possible brake/low-grip indicators: %d -> %d",
+                record.evidence.previous_brake_indicators,
+                record.evidence.current_brake_indicators);
+            ImGui::TextDisabled(
+                "Track check: %s | Formula: %s v%d",
+                record.evidence.track_status.c_str(),
+                record.evidence.analytics_contract.c_str(),
+                record.evidence.formula_version);
+            ImGui::TreePop();
+        }
+        ImGui::TextWrapped("Recommended next test: %s", record.next_test.c_str());
+        if (ImGui::Button("Delete selected setup result")) {
+            ImGui::OpenPopup("Delete saved setup result?");
+        }
+        if (ImGui::BeginPopupModal(
+            "Delete saved setup result?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextWrapped(
+                "Delete this stored comparison? The run notes and telemetry attachments will not be changed.");
+            if (ImGui::Button("Delete result")) {
+                race_day_.setup_knowledge.erase(
+                    race_day_.setup_knowledge.begin() + selected_setup_knowledge_record_);
+                selected_setup_knowledge_record_ = race_day_.setup_knowledge.empty()
+                    ? -1 : std::min(
+                        selected_setup_knowledge_record_,
+                        static_cast<int>(race_day_.setup_knowledge.size()) - 1);
+                race_day_dirty_ = true;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+    }
+    ImGui::EndChild();
     ImGui::End();
 }
 
@@ -3394,13 +5173,28 @@ void NativeApp::export_driver_analysis() {
     if (!path) return;
     try {
         nlohmann::json output{
-            {"format", "racebox-driver-analysis"}, {"version", 1},
+            {"format", "racebox-driver-analysis"}, {"version", 2},
             {"formula_version", driver_analysis_.formula_version}, {"session", session_->name},
             {"reference_raw_lap", driver_analysis_.reference.raw_lap},
             {"session_notes", std::string(session_notes_.data())},
             {"rules", nlohmann::json::array()}, {"corners", nlohmann::json::array()},
             {"comparisons", nlohmann::json::array()}, {"insights", nlohmann::json::array()},
             {"diagnostics", driver_analysis_.diagnostics}
+        };
+        const auto& evidence = analysis_rules_.evidence;
+        output["evidence_parameters"] = {
+            {"minimum_time_floor_s", evidence.minimum_time_floor_s},
+            {"sample_period_multiplier", evidence.sample_period_multiplier},
+            {"repeatability_sigma_multiplier", evidence.repeatability_sigma_multiplier},
+            {"maximum_payback_fraction", evidence.maximum_payback_fraction},
+            {"minimum_data_confidence", evidence.minimum_data_confidence},
+            {"reliable_data_confidence", evidence.reliable_data_confidence},
+            {"likely_comparable_laps", evidence.likely_comparable_laps},
+            {"likely_supporting_laps", evidence.likely_supporting_laps},
+            {"likely_support_rate", evidence.likely_support_rate},
+            {"reliable_comparable_laps", evidence.reliable_comparable_laps},
+            {"reliable_supporting_laps", evidence.reliable_supporting_laps},
+            {"reliable_support_rate", evidence.reliable_support_rate}
         };
         for (const auto& descriptor : driver_analysis::rule_descriptors()) {
             const auto* setting = driver_analysis::find_rule(analysis_rules_, descriptor.id);
@@ -3451,7 +5245,7 @@ void NativeApp::export_driver_analysis() {
             output["comparisons"].push_back(std::move(value));
         }
         for (const auto& insight : driver_analysis_.insights) {
-            output["insights"].push_back({{"id", insight.id}, {"title", insight.title}, {"detail", insight.detail},
+            nlohmann::json insight_value{{"id", insight.id}, {"title", insight.title}, {"detail", insight.detail},
                 {"corner_id", insight.corner_id}, {"corner_name", insight.corner_name},
                 {"slot", insight.comparison == driver_analysis::ComparisonSlot::CompareA ? "compare_a" : "compare_b"},
                 {"comparison_raw_lap", insight.comparison_raw_lap}, {"metric", driver_analysis::metric_name(insight.metric)},
@@ -3459,8 +5253,24 @@ void NativeApp::export_driver_analysis() {
                 {"threshold", insight.threshold}, {"estimated_time_effect_s", insight.estimated_time_effect_s},
                 {"positive", insight.positive}, {"severity", static_cast<int>(insight.severity)},
                 {"confidence", insight.confidence}, {"confidence_band", static_cast<int>(insight.confidence_band)},
+                {"outcome", insight_evidence::outcome_name(insight.outcome)},
+                {"reliability", insight_evidence::reliability_name(insight.reliability)},
+                {"recommendation", insight_evidence::recommendation_name(insight.recommendation)},
+                {"prior_phase_effect_s", insight.prior_phase_effect_s}, {"local_effect_s", insight.local_effect_s},
+                {"retained_effect_s", insight.retained_effect_s}, {"time_noise_floor_s", insight.time_noise_floor_s},
+                {"retained_gain_s", insight.retained_gain_s}, {"comparable_laps", insight.comparable_laps},
+                {"supporting_laps", insight.supporting_laps},
+                {"median_retained_effect_s", insight.median_retained_effect_s ? nlohmann::json(*insight.median_retained_effect_s) : nlohmann::json(nullptr)},
+                {"retained_interval_low_s", insight.retained_interval_low_s ? nlohmann::json(*insight.retained_interval_low_s) : nlohmann::json(nullptr)},
+                {"retained_interval_high_s", insight.retained_interval_high_s ? nlohmann::json(*insight.retained_interval_high_s) : nlohmann::json(nullptr)},
+                {"downstream_payback_fraction", insight.downstream_payback_fraction ? nlohmann::json(*insight.downstream_payback_fraction) : nlohmann::json(nullptr)},
+                {"evidence_reasons", nlohmann::json::array()},
                 {"reference_progress", insight.navigation.reference_progress},
-                {"reference_timestamp_us", insight.navigation.reference_timestamp_us}});
+                {"reference_timestamp_us", insight.navigation.reference_timestamp_us}};
+            for (const auto reason : insight.evidence_reasons) {
+                insight_value["evidence_reasons"].push_back(insight_evidence::reason_name(reason));
+            }
+            output["insights"].push_back(std::move(insight_value));
         }
         std::ofstream file(*path);
         if (!file) throw std::runtime_error("Could not create driver-analysis JSON");

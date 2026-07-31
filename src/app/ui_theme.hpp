@@ -49,7 +49,7 @@ struct FontLoadResult {
 
 // Load a readable installed Windows UI font. The embedded ImGui vector font is
 // always installed as the final fallback, so startup never depends on an asset.
-FontLoadResult load_windows_ui_font(ImGuiIO& io, float base_size_pixels = 15.0F);
+FontLoadResult load_windows_ui_font(ImGuiIO& io, float base_size_pixels = 18.0F);
 
 // Rebuild both styles from unscaled base values. Passing zero retains the last
 // known DPI scale, which makes theme switches safe and prevents cumulative

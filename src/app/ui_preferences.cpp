@@ -49,6 +49,7 @@ UiWorkspace workspace_or(const Json& object, UiWorkspace fallback) {
     if (name == "analysis") return UiWorkspace::Analysis;
     if (name == "compare") return UiWorkspace::Compare;
     if (name == "sectors") return UiWorkspace::Sectors;
+    if (name == "race_day") return UiWorkspace::RaceDay;
     return fallback;
 }
 
@@ -61,6 +62,7 @@ const char* workspace_name(UiWorkspace workspace) {
         case UiWorkspace::Analysis: return "analysis";
         case UiWorkspace::Compare: return "compare";
         case UiWorkspace::Sectors: return "sectors";
+        case UiWorkspace::RaceDay: return "race_day";
         case UiWorkspace::Overview: return "overview";
     }
     return "overview";
@@ -95,6 +97,8 @@ UiPreferencesLoadResult load_ui_preferences(const std::filesystem::path& path) n
         preferences.show_map_grid = boolean_or(value, "show_map_grid", preferences.show_map_grid);
         preferences.map_grid_spacing_m = grid_spacing_or(value, preferences.map_grid_spacing_m);
         preferences.separate_compare_maps = boolean_or(value, "separate_compare_maps", preferences.separate_compare_maps);
+        preferences.analysis_aligned_map_traces = boolean_or(
+            value, "analysis_aligned_map_traces", preferences.analysis_aligned_map_traces);
 
         result.source_layout_version = layout_version_or(value, 0);
         preferences.layout_version = result.source_layout_version;
@@ -164,6 +168,7 @@ bool save_ui_preferences_atomic(const std::filesystem::path& path, const UiPrefe
             {"show_map_grid", preferences.show_map_grid},
             {"map_grid_spacing_m", std::clamp(preferences.map_grid_spacing_m, 5.0F, 25.0F)},
             {"separate_compare_maps", preferences.separate_compare_maps},
+            {"analysis_aligned_map_traces", preferences.analysis_aligned_map_traces},
             {"layout_version", std::max(0, preferences.layout_version)},
             {"telemetry_plot_order", std::move(plot_order)},
             {"workspace",

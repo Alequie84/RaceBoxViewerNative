@@ -1,5 +1,6 @@
 #pragma once
 
+#include "racebox/insight_evidence.hpp"
 #include "racebox/session.hpp"
 
 #include <array>
@@ -13,7 +14,7 @@
 
 namespace racebox::driver_analysis {
 
-inline constexpr std::string_view kFormulaVersion{"driver-analysis-v1"};
+inline constexpr std::string_view kFormulaVersion{"driver-analysis-v2"};
 
 enum class ComparisonSlot : std::uint8_t { CompareA, CompareB };
 enum class ConfidenceBand : std::uint8_t { Suppressed, WeakSignal, Actionable };
@@ -97,6 +98,7 @@ struct AnalysisRules {
     float full_throttle_percent{90.0F};
     float steering_correction_percent{20.0F};
     double turn_in_curvature_per_m{0.006};
+    insight_evidence::Parameters evidence{};
 };
 
 struct NavigationTarget {
@@ -121,13 +123,18 @@ struct DetectedEvent {
 };
 
 struct LineTranslation {
-    // East/north offsets added only to comparison coordinates during line analysis.
-    // Session telemetry and rendered traces are never changed.
+    // East/north offsets used by line analysis and, when explicitly enabled, a
+    // derived display overlay. Session telemetry is never changed.
     double east_m{};
     double north_m{};
     double magnitude_m{};
     double residual_rms_m{};
-    bool applied_to_metrics_only{true};
+    bool preserves_raw_telemetry{true};
+};
+
+struct TranslatedCoordinate {
+    double latitude{};
+    double longitude{};
 };
 
 struct ConfidenceBreakdown {
@@ -196,6 +203,21 @@ struct Insight {
     Severity severity{Severity::Low};
     int confidence{};
     ConfidenceBand confidence_band{ConfidenceBand::Suppressed};
+    insight_evidence::Outcome outcome{insight_evidence::Outcome::DataLimited};
+    insight_evidence::Reliability reliability{insight_evidence::Reliability::Unproven};
+    insight_evidence::Recommendation recommendation{insight_evidence::Recommendation::None};
+    double prior_phase_effect_s{};
+    double local_effect_s{};
+    double retained_effect_s{};
+    double time_noise_floor_s{};
+    double retained_gain_s{};
+    std::optional<double> downstream_payback_fraction;
+    std::size_t comparable_laps{};
+    std::size_t supporting_laps{};
+    std::optional<double> median_retained_effect_s;
+    std::optional<double> retained_interval_low_s;
+    std::optional<double> retained_interval_high_s;
+    std::vector<insight_evidence::Reason> evidence_reasons;
     NavigationTarget navigation;
 };
 
@@ -215,6 +237,8 @@ struct AnalysisResult {
 [[nodiscard]] Severity classify_severity(double threshold_multiple, double absolute_time_effect_s) noexcept;
 [[nodiscard]] std::string_view event_name(EventType type) noexcept;
 [[nodiscard]] std::string_view metric_name(MetricKind kind) noexcept;
+[[nodiscard]] TranslatedCoordinate apply_line_translation(
+    double latitude, double longitude, const LineTranslation& translation) noexcept;
 
 // Suggests deterministic, editable normalized corner boundaries from the reference path,
 // steering, curvature, and speed troughs. Empty input or an invalid lap yields no corners.
