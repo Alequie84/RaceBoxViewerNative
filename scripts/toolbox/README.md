@@ -36,11 +36,13 @@ powershell -ExecutionPolicy Bypass -File C:\CodexProjects\RaceBoxViewerNative\sc
 
 The root `VERSION` file is the single release-version source. Version 2 starts at `2.0.0.001` and keeps a three-digit release suffix (`2.0.0.002`, `2.0.0.003`, ...); `scripts\bump-version.ps1` advances it, and packaging retains earlier numbered ZIPs.
 
-Interactive **File > Import session** is intentionally different from the
-toolbox launcher. It asks whether a loaded recording was Practice, Qualifying,
-or Race and adds it to Race Day with the detected UTC time and local event
-date. Each selection is self-contained and cannot reuse a file from the
-previously opened run. The toolbox passes
+Interactive **File > Add recording to Race Day** enters the Race Day workspace,
+loads only the newly selected recording, asks whether it was Practice,
+Qualifying, or Race, and adds it with the detected UTC time and local event
+date. Session then exposes an always-visible Race Day run selector; direct
+command-line/demo files are clearly labelled as not linked to Race Day. Each
+selection is self-contained and cannot reuse a file from the previously opened
+run. The toolbox passes
 the golden files on the command line, which remains non-interactive so startup
 and automated review are never blocked by the classification prompt.
 
@@ -55,7 +57,7 @@ After editing C++ code, always build/test first and finish by running `Start-Nat
 
 ## What native validation covers
 
-Windows CTest currently reports 13 tests:
+Windows CTest currently reports 14 tests:
 
 - `racebox_core_golden`: parser/alignment golden values, three Google anchor reprojections and equal map-axis scale, archive round trips, and corruption rejection;
 - `racebox_driver_analysis`: sustained event detectors, thresholds, confidence gates, severity bands, positive feedback, corner metrics, analysis-only GPS translation, and the raw-lap-7/R6 regression;

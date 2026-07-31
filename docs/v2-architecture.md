@@ -9,19 +9,21 @@ calibration, IMU analysis, or deterministic insight formulas.
 The Windows release is `RaceBoxTelemetryViewer.exe`. Its guided shell exposes
 five driver-facing workspaces:
 
-1. **Race Day** — isolated unified session import and Practice/Qualifying/Race
+1. **Race Day** — unified session import and Practice/Qualifying/Race
    classification, canonical UTC recording time plus its local event date,
    persistent bounded folder discovery, confirmed Sanwa removable-drive
    discovery, browser-managed official RaceBox cloud export, responsive
-   Runs/Selected Run/Compare Runs navigation, per-run source management,
+   Runs/Selected Run/Crew Chief navigation, per-run source management,
    pre-run checklist, setup and conditions, post-run notes, tire history, and
-   previous/current setup analysis.
+   previous/current setup analysis through the primary Crew Chief workflow.
 2. **Session** — the normal map, playback, lap list, telemetry, events, sectors,
-   notes, and annotations.
+   notes, and annotations, with a visible Race Day run selector that identifies
+   and loads the displayed recording.
 3. **Compare** — Reference plus Compare A, with optional Compare B and an
    independent Playback lap.
-4. **Crew Chief** — deterministic insights, disclosed rules, optional private
-   Crew Chief chat, and developer notes.
+4. **Analysis** — deterministic insights, disclosed rules/formulas, and
+   developer notes. The private Crew Chief is intentionally kept in Race Day
+   beside the setup and run context it analyzes.
 5. **Reports** — session summary, lap table, theoretical sectors,
    deterministic findings, and the existing export actions.
 
@@ -93,10 +95,14 @@ work should implement adapters behind the existing contracts instead of adding
 - Race Day version 3 stores privacy-bounded source identities beside local
   relative paths. The identity contains basename, size, timestamp, and an
   optional algorithm-tagged fingerprint—never telemetry contents.
-- A run also stores its detected UTC recording time. Interactive session import
-  classifies the loaded recording and assigns it to a Race Day slot; source
+- A run also stores its detected UTC recording time. Every interactive file,
+  folder, or USB import enters Race Day, classifies the loaded recording, and
+  assigns it to a Race Day slot; source
   updates are validated and staged atomically so duplicate types, mixed
   archives, or a failed replacement cannot partially alter the event book.
+- Session stores the displayed Race Day run as a stable in-memory run ID only
+  after a verified load succeeds. Changing or opening an event book clears that
+  association, so unrelated demo or command-line telemetry cannot be mislabeled.
 - Source repair distinguishes **Exact**, **Probable**, **Ambiguous**, and
   **Missing**. Only one unique exact fingerprint may relink automatically;
   probable or ambiguous choices require the driver to confirm.

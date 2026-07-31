@@ -58,7 +58,7 @@ public:
 private:
     enum class WorkspaceSection { Session, Compare, CrewChief, Reports, RaceDay };
     enum class TelemetryTab { Telemetry, Imu, Events, Sectors };
-    enum class InsightsTab { Insights, Rules, CrewChief, DevNotes };
+    enum class InsightsTab { Insights, Rules, DevNotes };
 
     struct PlotData {
         std::vector<double> time;
@@ -131,6 +131,7 @@ private:
     void draw_annotations();
     void draw_crew_chief();
     void draw_race_day();
+    void draw_session_run_selector();
     void draw_session_import_popup();
     void draw_import_discovery_popups();
     void draw_reports();
@@ -139,7 +140,10 @@ private:
     void draw_sectors_tab();
     void poll_loader();
     void poll_import_discovery();
-    void begin_load(const std::vector<std::filesystem::path>& files);
+    void begin_load(
+        const std::vector<std::filesystem::path>& files,
+        std::string race_day_run_id = {});
+    void open_race_day_run_in_viewer(std::size_t run_index);
     void start_session_import(int preferred_run = -1);
     void start_session_import_files(
         const std::vector<std::filesystem::path>& files,
@@ -202,6 +206,8 @@ private:
     std::filesystem::path pending_sanwa_csv_;
     std::vector<std::filesystem::path> active_load_files_;
     std::vector<std::filesystem::path> current_session_source_files_;
+    std::string displayed_race_day_run_id_;
+    std::string pending_displayed_race_day_run_id_;
     std::vector<std::filesystem::path> session_import_files_;
     bool session_import_requested_{};
     int session_import_preferred_run_{-1};

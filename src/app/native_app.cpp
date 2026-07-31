@@ -1319,8 +1319,12 @@ std::pair<std::size_t, std::size_t> NativeApp::active_range() const {
     return {0, session_->telemetry.size() - 1};
 }
 
-void NativeApp::begin_load(const std::vector<std::filesystem::path>& files) {
+void NativeApp::begin_load(
+    const std::vector<std::filesystem::path>& files,
+    std::string race_day_run_id) {
     if (files.empty() || loading_) return;
+    pending_displayed_race_day_run_id_ =
+        std::move(race_day_run_id);
     active_load_files_.clear();
     pending_vbo_.clear();
     pending_racebox_csv_.clear();
@@ -1393,6 +1397,7 @@ void NativeApp::begin_load(const std::vector<std::filesystem::path>& files) {
     LoadRequest request{pending_vbo_, pending_racebox_csv_, pending_sanwa_csv_, {}};
     if (request.vbo.empty() && request.racebox_csv.empty()) {
         active_load_files_.clear();
+        pending_displayed_race_day_run_id_.clear();
         error_.clear();
         status_ = request.sanwa_csv.empty() ? "No supported telemetry file was selected" :
             "Sanwa controls need a RaceBox CSV, VBO, or GPX recording in the same selection.";
@@ -1453,6 +1458,7 @@ void NativeApp::start_session_import(int preferred_run) {
         status_ = session_import_error_;
         return;
     }
+    workspace_section_ = WorkspaceSection::RaceDay;
     const auto files = open_telemetry_files(
         window_, telemetry_watch_folder_);
     if (files.empty()) return;
@@ -1474,6 +1480,7 @@ void NativeApp::start_session_import_files(
         status_ = session_import_error_;
         return;
     }
+    workspace_section_ = WorkspaceSection::RaceDay;
     session_import_error_.clear();
     if (files.empty()) return;
     std::vector<race_day::TelemetrySourceKind> selected_kinds;
@@ -1549,6 +1556,9 @@ void NativeApp::start_session_import_files(
         }
         const auto invalidated =
             invalidate_setup_knowledge_for_run(race_day_, run.id);
+        if (displayed_race_day_run_id_ == run.id) {
+            displayed_race_day_run_id_.clear();
+        }
         race_day_dirty_ = true;
         race_day_report_.reset();
         race_day_pending_knowledge_.reset();
@@ -1584,6 +1594,7 @@ void NativeApp::start_folder_import(int preferred_run) {
         status_ = "The import folder is already being scanned.";
         return;
     }
+    workspace_section_ = WorkspaceSection::RaceDay;
     if (telemetry_watch_folder_.empty()) {
         const auto selected = choose_telemetry_folder(window_);
         if (!selected) return;
@@ -1715,6 +1726,9 @@ void NativeApp::poll_loader() {
         session_ = std::move(loaded.session);
         imu_analysis_ = std::move(loaded.imu_analysis);
         current_session_source_files_ = active_load_files_;
+        displayed_race_day_run_id_ =
+            std::move(pending_displayed_race_day_run_id_);
+        pending_displayed_race_day_run_id_.clear();
         auto average_track = build_average_track_profile(*session_);
         average_track_latitude_ = std::move(average_track.latitude);
         average_track_longitude_ = std::move(average_track.longitude);
@@ -1771,7 +1785,7 @@ void NativeApp::poll_loader() {
             workspace_section_ = WorkspaceSection::Session;
         }
         if (workspace_section_ == WorkspaceSection::CrewChief) {
-            requested_insights_tab_ = InsightsTab::CrewChief;
+            requested_insights_tab_ = InsightsTab::Insights;
             insights_tab_request_pending_ = true;
         } else if (workspace_section_ == WorkspaceSection::Reports) {
             requested_telemetry_tab_ = TelemetryTab::Sectors;
@@ -1834,6 +1848,7 @@ void NativeApp::poll_loader() {
         session_import_requested_ = false;
         session_import_preferred_run_ = -1;
         session_import_files_.clear();
+        pending_displayed_race_day_run_id_.clear();
         error_ = exception.what();
         if (import_failed) session_import_error_ = error_;
         status_ = "Load failed";
@@ -1968,6 +1983,76 @@ bool NativeApp::build_guided_layout(ImGuiID dockspace, ImVec2 origin, ImVec2 siz
         ImGui::DockBuilderGetNode(right) && ImGui::DockBuilderGetNode(playback) && ImGui::DockBuilderGetNode(insights);
 }
 
+void NativeApp::draw_session_run_selector() {
+    const race_day::Run* displayed_run = nullptr;
+    if (!displayed_race_day_run_id_.empty()) {
+        const auto found = std::find_if(
+            race_day_.runs.begin(), race_day_.runs.end(),
+            [&](const race_day::Run& run) {
+                return run.id == displayed_race_day_run_id_;
+            });
+        if (found != race_day_.runs.end()) displayed_run = &*found;
+    }
+
+    const auto preview = displayed_run
+        ? displayed_run->label
+        : session_
+        ? std::string{"Current files (not linked to Race Day)"}
+        : std::string{"Choose a Race Day run..."};
+
+    ImGui::TextDisabled("RACE DAY RUN");
+    ImGui::SetNextItemWidth(-1.0F);
+    if (!ImGui::BeginCombo(
+            "##session-race-day-run", preview.c_str())) {
+        return;
+    }
+
+    if (race_day_.runs.empty()) {
+        ImGui::TextDisabled(
+            "No Race Day runs yet. Add a recording in Race Day first.");
+    }
+    for (std::size_t index = 0;
+         index < race_day_.runs.size(); ++index) {
+        const auto& run = race_day_.runs[index];
+        const auto composition =
+            race_day::validate_telemetry_source_composition(
+                run, true);
+        auto sources_available = !run.telemetry_files.empty();
+        for (std::size_t source_index = 0;
+             source_index < run.telemetry_files.size();
+             ++source_index) {
+            sources_available =
+                sources_available &&
+                race_day::telemetry_source_state(
+                    run, source_index) ==
+                    race_day::TelemetrySourceState::Available;
+        }
+        const auto ready = composition.ok &&
+            composition.has_primary && sources_available;
+        const auto state = run.telemetry_files.empty()
+            ? "NO DATA"
+            : !composition.ok
+            ? "NEEDS REPAIR"
+            : !sources_available
+            ? "NEEDS FILE"
+            : composition.has_primary
+            ? "READY"
+            : "CONTROLS ONLY";
+        const auto label = std::format(
+            "{}  |  {}##session-run-{}",
+            run.label, state, index);
+        const auto selected =
+            displayed_race_day_run_id_ == run.id;
+        ImGui::BeginDisabled(!ready || loading_);
+        if (ImGui::Selectable(label.c_str(), selected)) {
+            open_race_day_run_in_viewer(index);
+        }
+        ImGui::EndDisabled();
+        if (selected) ImGui::SetItemDefaultFocus();
+    }
+    ImGui::EndCombo();
+}
+
 void NativeApp::draw_app_header() {
     const auto* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos, ImGuiCond_Always);
@@ -2017,7 +2102,9 @@ void NativeApp::draw_app_header() {
         ImGui::TextColored(ImVec4(0.34F, 0.72F, 0.92F, 1.0F), "v%s", RACEBOX_VERSION_STRING);
         ImGui::Separator();
     if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("Import session...", "Ctrl+O")) start_session_import();
+        if (ImGui::MenuItem("Add recording to Race Day...", "Ctrl+O")) {
+            start_session_import();
+        }
         if (ImGui::MenuItem(
                 "Scan saved import folder...", nullptr, false,
                 !folder_scan_busy_)) {
@@ -2082,6 +2169,8 @@ void NativeApp::draw_app_header() {
             pending_vbo_.clear(); pending_racebox_csv_.clear(); pending_sanwa_csv_.clear();
             active_load_files_.clear();
             current_session_source_files_.clear();
+            displayed_race_day_run_id_.clear();
+            pending_displayed_race_day_run_id_.clear();
             session_import_files_.clear();
             session_import_requested_ = false;
             session_import_preferred_run_ = -1;
@@ -2174,8 +2263,9 @@ void NativeApp::draw_app_header() {
                         insights_tab_request_pending_ = true;
                     }
                     if (section == WorkspaceSection::CrewChief) {
-                        requested_insights_tab_ = InsightsTab::CrewChief;
+                        requested_insights_tab_ = InsightsTab::Insights;
                         insights_tab_request_pending_ = true;
+                        show_analysis_panel_ = true;
                     }
                     if (section == WorkspaceSection::Reports) {
                         requested_telemetry_tab_ = TelemetryTab::Sectors;
@@ -2197,7 +2287,7 @@ void NativeApp::draw_app_header() {
         workspace_button("RACE DAY", WorkspaceSection::RaceDay);
         workspace_button("SESSION", WorkspaceSection::Session);
         workspace_button("COMPARE", WorkspaceSection::Compare);
-        workspace_button("CREW CHIEF", WorkspaceSection::CrewChief);
+        workspace_button("ANALYSIS", WorkspaceSection::CrewChief);
         workspace_button("REPORTS", WorkspaceSection::Reports);
 
         const auto renderer = software_renderer_ ? "WARP" : "DX11";
@@ -2287,7 +2377,15 @@ void NativeApp::draw_app_header() {
         ImGui::TableSetupColumn("Active comparison", ImGuiTableColumnFlags_WidthStretch, 1.9F);
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
-        context_field("SESSION", session_ ? session_->name.c_str() : "No session loaded");
+        if (workspace_section_ == WorkspaceSection::Session) {
+            draw_session_run_selector();
+        } else {
+            context_field(
+                "SESSION",
+                session_
+                    ? session_->name.c_str()
+                    : "No session loaded");
+        }
         ImGui::TableNextColumn();
         const auto recorded = friendly_recorded_time_label(
             recorded_time_iso8601(session_ ? &*session_ : nullptr));
@@ -4837,13 +4935,6 @@ void NativeApp::draw_annotations() {
             if (rules_changed) { driver_analysis_dirty_ = true; refresh_driver_analysis(); }
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem("Crew Chief", nullptr, tab_flags(InsightsTab::CrewChief))) {
-            if (insights_tab_request_pending_ && requested_insights_tab_ == InsightsTab::CrewChief) {
-                insights_tab_request_pending_ = false;
-            }
-            draw_crew_chief();
-            ImGui::EndTabItem();
-        }
         if (ImGui::BeginTabItem("Dev Notes", nullptr, tab_flags(InsightsTab::DevNotes))) {
             if (insights_tab_request_pending_ && requested_insights_tab_ == InsightsTab::DevNotes) {
                 insights_tab_request_pending_ = false;
@@ -4884,8 +4975,8 @@ void NativeApp::draw_crew_chief() {
     }
 
     ImGui::TextWrapped(
-        "Tell the Crew Chief exactly what setup, tire, repair, or driving change you made. "
-        "It compares the selected before and after laps using measured telemetry and the deterministic insight rules.");
+        "Advanced lap-only check for the run currently displayed in Session. "
+        "Use the Race Day Crew Chief comparison above for setup changes between two recorded runs.");
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.30F, 0.78F, 0.95F, 1.0F));
     ImGui::TextWrapped(
         "The AI receives calculated evidence, not graph screenshots or your telemetry files. "
@@ -4964,7 +5055,9 @@ void NativeApp::draw_crew_chief() {
         after->phase == LapPhase::Complete && crew_chief_setup_change_.front() != '\0' &&
         crew_chief_question_.front() != '\0' && crew_chief_endpoint_.front() != '\0' && !crew_chief_busy_;
     ImGui::BeginDisabled(!can_send);
-    if (ImGui::Button("Ask Crew Chief", ImVec2(-1, 34.0F))) {
+    if (ImGui::Button(
+            "Ask about selected laps",
+            ImVec2(-1, 34.0F))) {
         refresh_driver_analysis(true);
         const auto evidence = crew_chief::build_evidence_packet(
             *session_, *before, *after, driver_analysis_, crew_chief_after_slot_, &imu_analysis_);
@@ -5088,6 +5181,8 @@ void NativeApp::new_race_day() {
     pending_race_day_relink_.reset();
     selected_setup_knowledge_record_ = -1;
     race_day_relevant_history_count_ = 0;
+    displayed_race_day_run_id_.clear();
+    pending_displayed_race_day_run_id_.clear();
     race_day_error_.clear();
     race_day_dirty_ = true;
     workspace_section_ = WorkspaceSection::RaceDay;
@@ -5123,6 +5218,8 @@ void NativeApp::open_race_day() {
     selected_setup_knowledge_record_ = race_day_.setup_knowledge.empty()
         ? -1 : static_cast<int>(race_day_.setup_knowledge.size()) - 1;
     race_day_relevant_history_count_ = 0;
+    displayed_race_day_run_id_.clear();
+    pending_displayed_race_day_run_id_.clear();
     race_day_error_.clear();
     race_day_dirty_ = false;
     workspace_section_ = WorkspaceSection::RaceDay;
@@ -5154,6 +5251,42 @@ void NativeApp::attach_race_day_telemetry(std::size_t run_index) {
     if (run_index >= race_day_.runs.size()) return;
     selected_race_day_run_ = static_cast<int>(run_index);
     start_session_import(selected_race_day_run_);
+}
+
+void NativeApp::open_race_day_run_in_viewer(
+    std::size_t run_index) {
+    if (run_index >= race_day_.runs.size() || loading_) return;
+    const auto& run = race_day_.runs[run_index];
+    const auto composition =
+        race_day::validate_telemetry_source_composition(
+            run, true);
+    if (!composition.ok) {
+        race_day_error_ = composition.error;
+        error_ = std::format(
+            "{} cannot be opened: {}",
+            run.label, composition.error);
+        return;
+    }
+    for (std::size_t source_index = 0;
+         source_index < run.telemetry_files.size();
+         ++source_index) {
+        if (race_day::telemetry_source_state(
+                run, source_index, true) !=
+            race_day::TelemetrySourceState::Available) {
+            race_day_error_ =
+                "An attached telemetry file no longer matches the "
+                "saved recording. Review or replace it in Race Day "
+                "before loading this run.";
+            error_ = race_day_error_;
+            return;
+        }
+    }
+    race_day_error_.clear();
+    selected_race_day_run_ = static_cast<int>(run_index);
+    workspace_section_ = WorkspaceSection::Session;
+    status_ = std::format(
+        "Loading {} from Race Day...", run.label);
+    begin_load(run.telemetry_files, run.id);
 }
 
 void NativeApp::use_open_session_for_race_day_run(std::size_t run_index) {
@@ -5285,6 +5418,9 @@ void NativeApp::commit_session_import() {
 
     race_day_ = std::move(updated);
     selected_race_day_run_ = static_cast<int>(destination);
+    displayed_race_day_run_id_ =
+        race_day_.runs[destination].id;
+    pending_displayed_race_day_run_id_.clear();
     race_day_current_run_ = selected_race_day_run_;
     if (race_day_previous_run_ == race_day_current_run_ &&
         race_day_.runs.size() > 1) {
@@ -6904,6 +7040,9 @@ void NativeApp::draw_race_day() {
                         const auto invalidated =
                             invalidate_setup_knowledge_for_run(
                                 race_day_, run.id);
+                        if (displayed_race_day_run_id_ == run.id) {
+                            displayed_race_day_run_id_.clear();
+                        }
                         pending_race_day_relink_.reset();
                         race_day_dirty_ = true;
                         race_day_report_.reset();
@@ -6922,27 +7061,9 @@ void NativeApp::draw_race_day() {
                 if (ImGui::Button(
                         "OPEN THIS RUN IN TELEMETRY VIEWER",
                         ImVec2(-1.0F, 38.0F))) {
-                    auto content_verified = true;
-                    for (std::size_t source_index = 0;
-                         source_index < run.telemetry_files.size();
-                         ++source_index) {
-                        content_verified =
-                            content_verified &&
-                            race_day::telemetry_source_state(
-                                run, source_index, true) ==
-                                race_day::TelemetrySourceState::Available;
-                    }
-                    if (content_verified) {
-                        const auto files = run.telemetry_files;
-                        workspace_section_ =
-                            WorkspaceSection::Session;
-                        begin_load(files);
-                    } else {
-                        race_day_error_ =
-                            "An attached telemetry file no longer "
-                            "matches the saved recording. Review it "
-                            "before loading.";
-                    }
+                    open_race_day_run_in_viewer(
+                        static_cast<std::size_t>(
+                            selected_race_day_run_));
                 }
                 ImGui::EndDisabled();
                 ImGui::BeginDisabled(
@@ -6966,6 +7087,9 @@ void NativeApp::draw_race_day() {
                             invalidate_setup_knowledge_for_run(
                                 race_day_, run.id);
                         race_day::clear_telemetry_sources(run);
+                        if (displayed_race_day_run_id_ == run.id) {
+                            displayed_race_day_run_id_.clear();
+                        }
                         pending_race_day_relink_.reset();
                         race_day_dirty_ = true;
                         race_day_report_.reset();
@@ -7080,10 +7204,11 @@ void NativeApp::draw_race_day() {
 
     if (!compact_race_day) ImGui::SameLine();
     const auto analysis_open =
-        !compact_race_day || ImGui::BeginTabItem("Compare Runs");
+        !compact_race_day || ImGui::BeginTabItem("Crew Chief");
     if (analysis_open) {
     ImGui::BeginChild("race-day-analysis", ImVec2(0.0F, -1.0F), ImGuiChildFlags_Borders);
-    ImGui::SeparatorText("PREVIOUS RUN -> CURRENT RUN");
+    ImGui::SeparatorText(
+        "CREW CHIEF: PREVIOUS RUN -> CURRENT RUN");
     ImGui::TextWrapped(
         "The deterministic analytics layer compares the two complete recordings first. "
         "The Crew Chief then explains those calculated results with your setup, checklist, tire, temperature, and driver notes.");
@@ -7162,7 +7287,11 @@ void NativeApp::draw_race_day() {
         run_sources_ready(race_day_previous_run_) &&
         run_sources_ready(race_day_current_run_);
     ImGui::BeginDisabled(!can_analyze);
-    if (ImGui::Button("Analyze previous vs current", ImVec2(-1.0F, 38.0F))) analyze_race_day_runs();
+    if (ImGui::Button(
+            "ASK CREW CHIEF ABOUT THESE RUNS",
+            ImVec2(-1.0F, 42.0F))) {
+        analyze_race_day_runs();
+    }
     ImGui::EndDisabled();
     if (!can_analyze) {
         if (race_day_previous_run_ == race_day_current_run_) {
@@ -7434,6 +7563,12 @@ void NativeApp::draw_race_day() {
             if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
+    }
+    ImGui::SeparatorText("ADVANCED LAP CHECK");
+    const auto lap_check_open = ImGui::CollapsingHeader(
+        "Ask about laps inside the run currently shown in Session");
+    if (lap_check_open || crew_chief_busy_) {
+        draw_crew_chief();
     }
     ImGui::EndChild();
     if (compact_race_day) ImGui::EndTabItem();

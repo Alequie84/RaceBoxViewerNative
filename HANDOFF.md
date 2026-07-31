@@ -88,7 +88,7 @@ Outputs:
 - portable folder: `package\RaceBoxTelemetryViewer`
 - portable ZIP: `out\RaceBoxTelemetryViewer-<VERSION>-win64.zip`
 
-The executable accepts VBO, RaceBox CSV, and Sanwa CSV paths on its command line or through **File > Import session**. The interactive importer loads only the newly selected files, asks whether the recording was Practice, Qualifying, or Race, preserves its canonical UTC timestamp, derives the event's local calendar date from that recording, and offers the next empty matching Race Day slot or an existing slot. A persistent import folder defaults to Windows Downloads. **Scan saved import folder** searches it on a worker with bounded depth/count, recognizes CSVs by RaceBox/Sanwa headers, and selects only the newest primary as a starting point; the driver explicitly chooses any companion files. **Open official RaceBox cloud export** launches `https://www.racebox.pro/webapp/login` in the default browser. The app does not collect credentials, reuse browser cookies, call an undocumented API, or scrape the account. **Auto-detect Sanwa on USB** polls only filesystem-mounted removable volumes, proposes the newest recognized Sanwa CSV when a volume appears, and never attaches it without confirmation. MTP-only devices have no stable filesystem path and are not supported by this detector. Command-line loading remains non-interactive for development/demo launchers. Version 2 packages install all three golden files under `demo`, plus `Start RaceBox Demo.cmd`. When launched without file arguments, the packaged executable auto-loads that demo only if all three files exist; explicit user paths always take priority. Ordinary development builds have no adjacent `demo` folder and therefore still start empty unless the toolbox launcher supplies the three golden files.
+The executable accepts VBO, RaceBox CSV, and Sanwa CSV paths on its command line or through **File > Add recording to Race Day**. Every interactive file/folder/USB import enters Race Day, loads only the newly selected files, asks whether the recording was Practice, Qualifying, or Race, preserves its canonical UTC timestamp, derives the event's local calendar date from that recording, and offers the next empty matching Race Day slot or an existing slot. Session exposes an always-visible **Race Day Run** selector that loads only data-ready runs, identifies the displayed run by stable run ID after a successful load, and labels command-line/demo telemetry as not linked to Race Day. A persistent import folder defaults to Windows Downloads. **Scan saved import folder** searches it on a worker with bounded depth/count, recognizes CSVs by RaceBox/Sanwa headers, and selects only the newest primary as a starting point; the driver explicitly chooses any companion files. **Open official RaceBox cloud export** launches `https://www.racebox.pro/webapp/login` in the default browser. The app does not collect credentials, reuse browser cookies, call an undocumented API, or scrape the account. **Auto-detect Sanwa on USB** polls only filesystem-mounted removable volumes, proposes the newest recognized Sanwa CSV when a volume appears, and never attaches it without confirmation. MTP-only devices have no stable filesystem path and are not supported by this detector. Command-line loading remains non-interactive for development/demo launchers. Version 2 packages install all three golden files under `demo`, plus `Start RaceBox Demo.cmd`. When launched without file arguments, the packaged executable auto-loads that demo only if all three files exist; explicit user paths always take priority. Ordinary development builds have no adjacent `demo` folder and therefore still start empty unless the toolbox launcher supplies the three golden files.
 
 ## Architecture and source ownership
 
@@ -293,9 +293,10 @@ build\release\racebox_cli.exe golden\session.vbo golden\session.csv golden\sanwa
 | Gated vehicle-yaw estimate and cautious jump/impact/rotation indicators | Implemented |
 | IMU/GNSS fused derived position trace with uncertainty | Deferred |
 | Deterministic events, corner metrics, rules, confidence, severity, and gains | Implemented |
-| Evidence-constrained Crew Chief chat over private Tailscale/OpenClaw lane | Implemented; optional connection |
-| Race Day event book, run checklist/conditions/tire history, and previous/current Crew Chief analysis | Implemented; optional connection |
-| Insights / Rules / Crew Chief / Dev Notes and Telemetry / Events / Sectors | Implemented |
+| Evidence-constrained Crew Chief chat over private Tailscale/OpenClaw lane | Implemented inside Race Day; optional connection |
+| Race Day event book, run checklist/conditions/tire history, and previous/current Crew Chief analysis | Implemented; primary Crew Chief workflow |
+| Insights / Rules / Dev Notes and Telemetry / Events / Sectors | Implemented in Analysis/Session |
+| Session Race Day run selector with explicit unlinked-demo state | Implemented |
 | Reorderable persistent plots and stable annotation attachment | Implemented |
 | Three-point triangulated Richmond aerial with direct drag/lock/reset | Implemented |
 | Placeable/persisted start-finish line and auto-numbered map turns | Implemented |
@@ -358,9 +359,12 @@ references. **Import Session Data** unifies normal telemetry loading with this
 event book: after parsing, it asks Practice/Qualifying/Race and assigns the
 recording to the next matching empty slot or a selected slot. The selected
 run's **Run Data** tab can also reuse the telemetry currently open or load that
-run back into the normal viewer.
+run back into the normal viewer. Session's header selector lists every run and
+its readiness, verifies the saved source identity before loading, and changes
+the displayed run label only after the load succeeds.
 
-Race-day **Analyze previous vs current** is an explicit higher-disclosure action:
+The primary Crew Chief is now part of Race Day beside the run context it uses.
+**Ask Crew Chief About These Runs** is an explicit higher-disclosure action:
 the app loads both runs on a worker, produces two bounded
 `racebox-session-analytics-csv-v1` documents, and sends those plus the entered
 context to the private Tailscale gateway. Original files/paths are not sent and
@@ -390,6 +394,6 @@ analysis and ordinary Crew Chief chat. The live lane benchmark uses Sol-xhigh
 as the trusted setup-memory baseline and tests lower lanes against the same
 packet before allowing them to handle that task class.
 
-The always-visible native header displays `v<VERSION>` from the same generated version header used by the executable metadata and portable ZIP. It exposes the persistent **THEME: DARK / THEME: LIGHT** switch beside the top workspace navigation at normal widths; at 130-150% text or narrow widths, Theme, Layout, Annotation, and renderer status collapse into **TOOLS** so every workspace remains reachable. Keep the version tied to the root `VERSION` source; never hard-code a separate UI version string.
+The always-visible native header displays `v<VERSION>` from the same generated version header used by the executable metadata and portable ZIP. The five top workspaces are **Race Day / Session / Compare / Analysis / Reports**; Crew Chief is intentionally inside Race Day, while Analysis contains the deterministic Insights, Rules / Formula, and Dev Notes tabs. The header exposes the persistent **THEME: DARK / THEME: LIGHT** switch beside the top workspace navigation at normal widths; at 130-150% text or narrow widths, Theme, Layout, Annotation, and renderer status collapse into **TOOLS** so every workspace remains reachable. Keep the version tied to the root `VERSION` source; never hard-code a separate UI version string.
 
 Before changing parser, timing, lap, radio, map, or analysis logic, read the golden and driver-analysis tests. Preserve the current C++ architecture, original telemetry, and both map-image backups. Treat browser files as read-only history. Update this handoff and the README whenever behavior changes.

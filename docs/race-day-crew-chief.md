@@ -30,15 +30,18 @@ Every run stores:
 - battery pack/ID and optional voltage;
 - references to VBO, RaceBox CSV, Sanwa CSV, GPX, or native session archives.
 
-The analysis action always names one **Previous / baseline** run and one
+The Crew Chief lives in Race Day beside the notes and conditions it needs. Its
+primary action always names one **Previous / baseline** run and one
 **Current / changed** run. Both are loaded on a worker thread only for the
 analysis, converted to the canonical aligned CSV, and released afterward.
+Session has a separate Race Day run selector for choosing which recording is
+displayed on the map and graphs.
 
 ## Disclosure and transport
 
-Ordinary lap-to-lap Crew Chief chat remains evidence-only. Race-day analysis is
-a separate explicit-disclosure action. When the user clicks **Analyze previous
-vs current**, the native app sends:
+The collapsed advanced lap-to-lap Crew Chief check remains evidence-only.
+Race-day analysis is a separate explicit-disclosure action. When the user
+clicks **Ask Crew Chief About These Runs**, the native app sends:
 
 - two generated `racebox-session-analytics-csv-v1` documents;
 - the entered event/run labels, conditions, checklist, and notes;
