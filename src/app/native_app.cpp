@@ -9,6 +9,7 @@
 #include <implot.h>
 #include <nlohmann/json.hpp>
 #include <psapi.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <chrono>
@@ -786,6 +787,11 @@ NativeApp::NativeApp(HWND window, ID3D11Device* device, bool software_renderer)
     separate_compare_maps_ = preferences.separate_compare_maps;
     compare_b_enabled_ = preferences.workspace.compare_b_enabled;
     show_analysis_aligned_traces_ = preferences.analysis_aligned_map_traces;
+    telemetry_watch_folder_ = preferences.telemetry_import_folder;
+    if (telemetry_watch_folder_.empty()) {
+        telemetry_watch_folder_ = default_telemetry_download_folder();
+    }
+    auto_detect_sanwa_usb_ = preferences.auto_detect_sanwa_usb;
     text_scale_ = preferences.text_scale;
     customize_layout_ = preferences.workspace.customize_layout;
     telemetry_plot_order_ = preferences.telemetry_plot_order;
@@ -825,6 +831,8 @@ NativeApp::~NativeApp() {
     preferences.map_grid_spacing_m = map_grid_spacing_m_;
     preferences.separate_compare_maps = separate_compare_maps_;
     preferences.analysis_aligned_map_traces = show_analysis_aligned_traces_;
+    preferences.telemetry_import_folder = telemetry_watch_folder_;
+    preferences.auto_detect_sanwa_usb = auto_detect_sanwa_usb_;
     preferences.text_scale = text_scale_;
     preferences.layout_version = loaded_layout_version_;
     preferences.telemetry_plot_order = telemetry_plot_order_;
@@ -1445,8 +1453,28 @@ void NativeApp::start_session_import(int preferred_run) {
         status_ = session_import_error_;
         return;
     }
+    const auto files = open_telemetry_files(
+        window_, telemetry_watch_folder_);
+    if (files.empty()) return;
+    start_session_import_files(files, preferred_run);
+}
+
+void NativeApp::start_session_import_files(
+    const std::vector<std::filesystem::path>& files,
+    int preferred_run) {
+    if (loading_) {
+        session_import_error_ =
+            "Finish loading the current session before importing another run.";
+        status_ = session_import_error_;
+        return;
+    }
+    if (race_day_busy_ && preferred_run >= 0) {
+        session_import_error_ =
+            "Wait for the current run comparison to finish before changing its data.";
+        status_ = session_import_error_;
+        return;
+    }
     session_import_error_.clear();
-    auto files = open_telemetry_files(window_);
     if (files.empty()) return;
     std::vector<race_day::TelemetrySourceKind> selected_kinds;
     selected_kinds.reserve(files.size());
@@ -1548,6 +1576,131 @@ void NativeApp::start_session_import(int preferred_run) {
             "A run needs a RaceBox CSV, VBO, GPX, or session archive. "
             "Select the Sanwa file together with one of those recordings.";
         error_ = session_import_error_;
+    }
+}
+
+void NativeApp::start_folder_import(int preferred_run) {
+    if (folder_scan_busy_) {
+        status_ = "The import folder is already being scanned.";
+        return;
+    }
+    if (telemetry_watch_folder_.empty()) {
+        const auto selected = choose_telemetry_folder(window_);
+        if (!selected) return;
+        telemetry_watch_folder_ = *selected;
+    }
+    folder_import_preferred_run_ = preferred_run;
+    discovered_files_.clear();
+    discovered_file_selected_.clear();
+    folder_scan_busy_ = true;
+    const auto folder = telemetry_watch_folder_;
+    status_ = "Scanning the saved import folder for telemetry...";
+    folder_scan_future_ = std::async(
+        std::launch::async,
+        [folder] {
+            return scan_telemetry_folder(folder);
+        });
+}
+
+void NativeApp::open_racebox_cloud_export() {
+    constexpr auto url =
+        L"https://www.racebox.pro/webapp/login";
+    const auto result = reinterpret_cast<std::intptr_t>(
+        ShellExecuteW(
+            window_, L"open", url, nullptr, nullptr,
+            SW_SHOWNORMAL));
+    if (result <= 32) {
+        error_ =
+            "Windows could not open the official RaceBox sign-in page.";
+        return;
+    }
+    status_ =
+        "RaceBox sign-in opened in your browser. Export CSV or VBO, "
+        "then scan the saved import folder here.";
+}
+
+void NativeApp::poll_import_discovery() {
+    using namespace std::chrono_literals;
+    if (folder_scan_busy_ && folder_scan_future_.valid() &&
+        folder_scan_future_.wait_for(0ms) ==
+            std::future_status::ready) {
+        folder_scan_busy_ = false;
+        auto scan = folder_scan_future_.get();
+        if (!scan.error.empty()) {
+            error_ = std::move(scan.error);
+        } else {
+            discovered_files_ = std::move(scan.files);
+            discovered_file_selected_.assign(
+                discovered_files_.size(), false);
+            const auto primary = std::find_if(
+                discovered_files_.begin(),
+                discovered_files_.end(),
+                [](const auto& file) {
+                    return file.kind !=
+                        race_day::TelemetrySourceKind::SanwaCsv;
+                });
+            if (primary != discovered_files_.end()) {
+                discovered_file_selected_[
+                    static_cast<std::size_t>(
+                        std::distance(
+                            discovered_files_.begin(), primary))] =
+                    true;
+            }
+            discovered_files_popup_open_ = true;
+            status_ = discovered_files_.empty()
+                ? "No supported RaceBox, VBO, GPX, archive, or Sanwa files were found."
+                : std::format(
+                    "Found {} supported telemetry file(s) in the import folder{}.",
+                    discovered_files_.size(),
+                    scan.truncated
+                        ? " (bounded scan; choose a narrower folder for more)"
+                        : "");
+        }
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (auto_detect_sanwa_usb_ && now >= next_usb_poll_) {
+        next_usb_poll_ = now + 3s;
+        const auto roots = removable_drive_roots();
+        std::unordered_set<std::wstring> current;
+        for (const auto& root : roots) {
+            auto key = root.wstring();
+            std::transform(
+                key.begin(), key.end(), key.begin(), ::towlower);
+            current.insert(key);
+            if (!known_removable_roots_.contains(key)) {
+                pending_usb_scan_roots_.push_back(root);
+            }
+        }
+        known_removable_roots_ = std::move(current);
+    }
+
+    if (!usb_scan_busy_ && !pending_usb_scan_roots_.empty()) {
+        const auto root = pending_usb_scan_roots_.front();
+        pending_usb_scan_roots_.pop_front();
+        usb_scan_busy_ = true;
+        usb_scan_future_ = std::async(
+            std::launch::async,
+            [root] {
+                return scan_telemetry_folder(
+                    root, true, 8'000, 6);
+            });
+    }
+    if (usb_scan_busy_ && usb_scan_future_.valid() &&
+        usb_scan_future_.wait_for(0ms) ==
+            std::future_status::ready) {
+        usb_scan_busy_ = false;
+        auto scan = usb_scan_future_.get();
+        if (!scan.error.empty()) {
+            write_log(scan.error);
+        } else if (!scan.files.empty()) {
+            detected_usb_sanwa_ = std::move(scan.files.front());
+            detected_usb_popup_open_ = true;
+            status_ = std::format(
+                "Detected Sanwa telemetry on USB: {}",
+                path_utf8(
+                    detected_usb_sanwa_->path.filename()));
+        }
     }
 }
 
@@ -1690,6 +1843,7 @@ void NativeApp::poll_loader() {
 
 bool NativeApp::render() {
     poll_loader();
+    poll_import_discovery();
     ImGui::GetStyle().FontScaleMain = text_scale_;
     hover_seen_this_frame_ = false;
     annotation_click_consumed_ = false;
@@ -1864,6 +2018,22 @@ void NativeApp::draw_app_header() {
         ImGui::Separator();
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Import session...", "Ctrl+O")) start_session_import();
+        if (ImGui::MenuItem(
+                "Scan saved import folder...", nullptr, false,
+                !folder_scan_busy_)) {
+            start_folder_import();
+        }
+        if (ImGui::MenuItem("Choose import folder...")) {
+            const auto selected = choose_telemetry_folder(
+                window_, telemetry_watch_folder_);
+            if (selected) {
+                telemetry_watch_folder_ = *selected;
+                status_ = "Telemetry import folder updated.";
+            }
+        }
+        if (ImGui::MenuItem("Open official RaceBox cloud export...")) {
+            open_racebox_cloud_export();
+        }
         ImGui::SeparatorText("Race day");
         if (ImGui::MenuItem("New race day")) {
             if (race_day_dirty_) {
@@ -2160,6 +2330,7 @@ void NativeApp::draw_app_header() {
         ImGui::EndTable();
     }
     draw_session_import_popup();
+    draw_import_discovery_popups();
     draw_global_notification();
     ImGui::End();
     ImGui::PopStyleVar(3);
@@ -5385,6 +5556,301 @@ void NativeApp::draw_session_import_popup() {
     ImGui::EndPopup();
 }
 
+void NativeApp::draw_import_discovery_popups() {
+    if (discovered_files_popup_open_) {
+        ImGui::OpenPopup("Import from saved folder");
+        discovered_files_popup_open_ = false;
+    }
+    ImGui::SetNextWindowSize(
+        ImVec2(860.0F, 620.0F), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal(
+            "Import from saved folder", nullptr,
+            ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::TextWrapped(
+            "Choose the files that belong to one recording. The newest "
+            "primary file is selected as a starting point, but optional "
+            "RaceBox/VBO/Sanwa pairing is never guessed.");
+        ImGui::TextDisabled(
+            "Folder: %s",
+            path_utf8(telemetry_watch_folder_).c_str());
+        if (ImGui::Button("Change folder...")) {
+            const auto selected = choose_telemetry_folder(
+                window_, telemetry_watch_folder_);
+            if (selected) {
+                telemetry_watch_folder_ = *selected;
+                ImGui::CloseCurrentPopup();
+                start_folder_import(folder_import_preferred_run_);
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Scan again")) {
+            ImGui::CloseCurrentPopup();
+            start_folder_import(folder_import_preferred_run_);
+        }
+
+        ImGui::Separator();
+        if (discovered_files_.empty()) {
+            ImGui::TextDisabled(
+                "No supported telemetry files were found. RaceBox CSV "
+                "files must contain Latitude, Longitude, and Speed; Sanwa "
+                "CSV files must contain REC TIME, ST(%%), and TH(%%).");
+        } else {
+            ImGui::BeginChild(
+                "folder-discovery-files", ImVec2(0.0F, -80.0F),
+                ImGuiChildFlags_Borders);
+            ImGuiListClipper clipper;
+            clipper.Begin(
+                static_cast<int>(discovered_files_.size()),
+                58.0F);
+            while (clipper.Step()) {
+                for (int row = clipper.DisplayStart;
+                     row < clipper.DisplayEnd; ++row) {
+                    const auto index =
+                        static_cast<std::size_t>(row);
+                    const auto& file = discovered_files_[index];
+                    ImGui::PushID(row);
+                    bool selected =
+                        discovered_file_selected_[index];
+                    const auto label = std::format(
+                        "{} | {}",
+                        race_day::telemetry_source_kind_name(
+                            file.kind),
+                        path_utf8(file.path.filename()));
+                    if (ImGui::Checkbox(
+                            label.c_str(), &selected)) {
+                        if (selected) {
+                            if (file.kind ==
+                                race_day::TelemetrySourceKind::
+                                    NativeArchive) {
+                                std::fill(
+                                    discovered_file_selected_.begin(),
+                                    discovered_file_selected_.end(),
+                                    false);
+                            } else {
+                                for (std::size_t other = 0;
+                                     other <
+                                         discovered_files_.size();
+                                     ++other) {
+                                    if (other == index) continue;
+                                    const auto other_kind =
+                                        discovered_files_[other].kind;
+                                    const auto duplicate =
+                                        other_kind == file.kind;
+                                    const auto archive =
+                                        other_kind ==
+                                        race_day::
+                                            TelemetrySourceKind::
+                                                NativeArchive;
+                                    const auto gpx_conflict =
+                                        (file.kind ==
+                                             race_day::
+                                                 TelemetrySourceKind::
+                                                     Gpx &&
+                                         (other_kind ==
+                                              race_day::
+                                                  TelemetrySourceKind::
+                                                      Vbo ||
+                                          other_kind ==
+                                              race_day::
+                                                  TelemetrySourceKind::
+                                                      RaceBoxCsv)) ||
+                                        (other_kind ==
+                                             race_day::
+                                                 TelemetrySourceKind::
+                                                     Gpx &&
+                                         (file.kind ==
+                                              race_day::
+                                                  TelemetrySourceKind::
+                                                      Vbo ||
+                                          file.kind ==
+                                              race_day::
+                                                  TelemetrySourceKind::
+                                                      RaceBoxCsv));
+                                    if (duplicate || archive ||
+                                        gpx_conflict) {
+                                        discovered_file_selected_[
+                                            other] = false;
+                                    }
+                                }
+                            }
+                        }
+                        discovered_file_selected_[index] =
+                            selected;
+                    }
+                    ImGui::TextDisabled(
+                        "%s | %.1f MB | %s",
+                        discovered_file_time_label(
+                            file.modified_at).c_str(),
+                        static_cast<double>(file.size_bytes) /
+                            (1024.0 * 1024.0),
+                        path_utf8(
+                            file.path.parent_path()).c_str());
+                    ImGui::Separator();
+                    ImGui::PopID();
+                }
+            }
+            ImGui::EndChild();
+        }
+
+        std::vector<std::filesystem::path> selected_files;
+        for (std::size_t index = 0;
+             index < discovered_files_.size(); ++index) {
+            if (discovered_file_selected_[index]) {
+                selected_files.push_back(
+                    discovered_files_[index].path);
+            }
+        }
+        ImGui::BeginDisabled(selected_files.empty());
+        if (ImGui::Button(
+                "IMPORT SELECTED FILES",
+                ImVec2(250.0F, 42.0F))) {
+            start_session_import_files(
+                selected_files,
+                folder_import_preferred_run_);
+            if (session_import_error_.empty()) {
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(100.0F, 42.0F))) {
+            ImGui::CloseCurrentPopup();
+        }
+        if (!session_import_error_.empty()) {
+            ImGui::TextColored(
+                ui::color(ui::ColorToken::Warning),
+                "%s", session_import_error_.c_str());
+        }
+        ImGui::EndPopup();
+    }
+
+    if (detected_usb_popup_open_) {
+        ImGui::OpenPopup("Sanwa telemetry detected on USB");
+        detected_usb_popup_open_ = false;
+    }
+    if (ImGui::BeginPopupModal(
+            "Sanwa telemetry detected on USB", nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize)) {
+        const auto available = detected_usb_sanwa_ &&
+            std::filesystem::exists(
+                detected_usb_sanwa_->path);
+        ImGui::TextWrapped(
+            "A removable drive contains a Sanwa CSV. Nothing has been "
+            "attached automatically, so an older or unrelated run cannot "
+            "be mixed in by mistake.");
+        if (detected_usb_sanwa_) {
+            ImGui::Separator();
+            ImGui::Text(
+                "%s",
+                path_utf8(
+                    detected_usb_sanwa_->path.filename()).c_str());
+            ImGui::TextDisabled(
+                "%s | %.1f MB",
+                discovered_file_time_label(
+                    detected_usb_sanwa_->modified_at).c_str(),
+                static_cast<double>(
+                    detected_usb_sanwa_->size_bytes) /
+                    (1024.0 * 1024.0));
+            ImGui::TextWrapped(
+                "%s",
+                path_utf8(
+                    detected_usb_sanwa_->path.parent_path()).c_str());
+        }
+        if (!available) {
+            ImGui::TextColored(
+                ui::color(ui::ColorToken::Warning),
+                "The removable drive is no longer available.");
+        }
+
+        const auto valid_run =
+            !race_day_.runs.empty() &&
+            selected_race_day_run_ >= 0 &&
+            selected_race_day_run_ <
+                static_cast<int>(race_day_.runs.size());
+        const auto run_has_primary =
+            valid_run &&
+            race_day::has_primary_telemetry(
+                race_day_.runs[
+                    static_cast<std::size_t>(
+                        selected_race_day_run_)]);
+        ImGui::BeginDisabled(
+            !available || !run_has_primary);
+        const auto run_label = valid_run
+            ? race_day_.runs[
+                  static_cast<std::size_t>(
+                      selected_race_day_run_)].label
+            : std::string("selected run");
+        if (ImGui::Button(
+                std::format(
+                    "ADD SANWA TO {}",
+                    run_label).c_str(),
+                ImVec2(320.0F, 38.0F))) {
+            start_session_import_files(
+                {detected_usb_sanwa_->path},
+                selected_race_day_run_);
+            if (session_import_error_.empty()) {
+                detected_usb_sanwa_.reset();
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndDisabled();
+        if (!run_has_primary) {
+            ImGui::TextDisabled(
+                "Select a Race Day run that already has RaceBox/VBO "
+                "telemetry, or import matching files together.");
+        }
+
+        ImGui::BeginDisabled(!available);
+        if (ImGui::Button(
+                "IMPORT WITH MATCHING FILES...",
+                ImVec2(320.0F, 38.0F))) {
+            auto files = open_telemetry_files(
+                window_, telemetry_watch_folder_);
+            const auto has_sanwa = std::any_of(
+                files.begin(), files.end(),
+                [](const auto& path) {
+                    return race_day::telemetry_source_kind(
+                        path) ==
+                        race_day::TelemetrySourceKind::SanwaCsv;
+                });
+            if (!files.empty() && !has_sanwa) {
+                files.push_back(
+                    detected_usb_sanwa_->path);
+            }
+            if (!files.empty()) {
+                start_session_import_files(
+                    files,
+                    valid_run
+                        ? selected_race_day_run_ : -1);
+                if (session_import_error_.empty()) {
+                    detected_usb_sanwa_.reset();
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+        }
+        ImGui::EndDisabled();
+
+        if (detected_usb_sanwa_ && ImGui::Button(
+                "Use this folder for imports")) {
+            telemetry_watch_folder_ =
+                detected_usb_sanwa_->path.parent_path();
+            status_ =
+                "Sanwa USB folder saved as the telemetry import folder.";
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Ignore")) {
+            detected_usb_sanwa_.reset();
+            ImGui::CloseCurrentPopup();
+        }
+        if (!session_import_error_.empty()) {
+            ImGui::TextColored(
+                ui::color(ui::ColorToken::Warning),
+                "%s", session_import_error_.c_str());
+        }
+        ImGui::EndPopup();
+    }
+}
+
 void NativeApp::begin_race_day_source_relink(
     std::size_t source_index) {
     if (race_day_.runs.empty()) return;
@@ -6041,15 +6507,50 @@ void NativeApp::draw_race_day() {
     ImGui::PushStyleColor(
         ImGuiCol_ButtonHovered, ImVec4(0.82F, 0.08F, 0.18F, 1.0F));
     if (ImGui::Button(
-            "IMPORT SESSION DATA...", ImVec2(245.0F, 42.0F))) {
+            "IMPORT FILES...", ImVec2(190.0F, 42.0F))) {
         start_session_import();
     }
     ImGui::PopStyleColor(2);
     if (!compact_race_day) ImGui::SameLine();
+    ImGui::BeginDisabled(folder_scan_busy_);
+    if (ImGui::Button(
+            folder_scan_busy_
+                ? "SCANNING FOLDER..."
+                : "SCAN SAVED FOLDER",
+            ImVec2(205.0F, 42.0F))) {
+        start_folder_import();
+    }
+    ImGui::EndDisabled();
+    if (!compact_race_day) ImGui::SameLine();
+    if (ImGui::Button(
+            "RACEBOX CLOUD EXPORT...",
+            ImVec2(230.0F, 42.0F))) {
+        open_racebox_cloud_export();
+    }
+    ImGui::TextDisabled("IMPORT FOLDER");
+    ImGui::SameLine();
     ImGui::TextWrapped(
-        "Select the RaceBox/VBO and Sanwa files together. "
-        "After loading, choose Practice, Qualifying, or Race; "
-        "the recording date is detected automatically.");
+        "%s",
+        telemetry_watch_folder_.empty()
+            ? "Not selected"
+            : path_utf8(telemetry_watch_folder_).c_str());
+    if (ImGui::SmallButton("Choose import folder...")) {
+        const auto selected = choose_telemetry_folder(
+            window_, telemetry_watch_folder_);
+        if (selected) {
+            telemetry_watch_folder_ = *selected;
+            status_ = "Telemetry import folder updated.";
+        }
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox(
+        "Auto-detect Sanwa on USB",
+        &auto_detect_sanwa_usb_);
+    ImGui::TextWrapped(
+        "RaceBox cloud opens the official website in your browser; the "
+        "viewer never receives your password. Export CSV or VBO into the "
+        "saved folder, then scan it. USB detection only proposes a Sanwa "
+        "file and waits for you to confirm the matching run.");
 
     ImGui::Separator();
     const auto available = ImGui::GetContentRegionAvail();
@@ -6265,6 +6766,17 @@ void NativeApp::draw_race_day() {
                 }
                 ImGui::EndDisabled();
                 ImGui::PopStyleColor();
+                ImGui::BeginDisabled(
+                    race_day_busy_ || folder_scan_busy_);
+                if (ImGui::Button(
+                        folder_scan_busy_
+                            ? "SCANNING IMPORT FOLDER..."
+                            : "ADD FROM SAVED IMPORT FOLDER...",
+                        ImVec2(-1.0F, 34.0F))) {
+                    start_folder_import(
+                        selected_race_day_run_);
+                }
+                ImGui::EndDisabled();
                 ImGui::BeginDisabled(
                     race_day_busy_ ||
                     !session_ ||

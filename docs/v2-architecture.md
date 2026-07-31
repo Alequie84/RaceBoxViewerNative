@@ -11,7 +11,9 @@ five driver-facing workspaces:
 
 1. **Race Day** — isolated unified session import and Practice/Qualifying/Race
    classification, canonical UTC recording time plus its local event date,
-   responsive Runs/Selected Run/Compare Runs navigation, per-run source management,
+   persistent bounded folder discovery, confirmed Sanwa removable-drive
+   discovery, browser-managed official RaceBox cloud export, responsive
+   Runs/Selected Run/Compare Runs navigation, per-run source management,
    pre-run checklist, setup and conditions, post-run notes, tire history, and
    previous/current setup analysis.
 2. **Session** — the normal map, playback, lap list, telemetry, events, sectors,
@@ -100,6 +102,10 @@ work should implement adapters behind the existing contracts instead of adding
   probable or ambiguous choices require the driver to confirm.
 - UI layout version 4 migrates older layouts once, preserves a pre-v4 backup,
   and starts with the guided layout locked.
+- Local UI preferences retain the telemetry import folder and Sanwa USB
+  auto-detect toggle. Folder and removable-drive scans stay in the Windows app
+  adapter, are bounded and read-only, recognize CSV sources by header, and
+  never infer that optional source files belong to the same run.
 
 Raw GPS and telemetry remain immutable. Display alignment, stationary IMU zero,
 corner analysis, and other derived corrections remain disclosed,

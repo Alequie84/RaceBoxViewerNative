@@ -27,7 +27,7 @@ powershell -ExecutionPolicy Bypass -File C:\CodexProjects\RaceBoxViewerNative\sc
 | --- | --- |
 | `Project-Paths.ps1` | Shared paths, tool discovery, and process helpers. |
 | `Get-ProjectState.ps1` | Read-only status for source, artifacts, map hashes, server port, and running demo. |
-| `Build-Test-Native.ps1` | Configure, compile, and run all 13 Windows CTest targets with the Visual Studio developer environment. Add `-Package` for install and the portable ZIP. |
+| `Build-Test-Native.ps1` | Configure, compile, and run all 14 Windows CTest targets with the Visual Studio developer environment. Add `-Package` for install and the portable ZIP. |
 | `Test-BrowserReference.ps1` | Historical frozen-browser validation; do not run unless the user explicitly reopens browser development. |
 | `Start-NativeDemo.ps1` | Launch the C++ UI with the golden VBO, RaceBox CSV, and Sanwa CSV. It quotes paths as one argument line so filenames containing spaces and parentheses work. |
 | `Start-BrowserReference.ps1` | Historical frozen-browser launcher; not part of current development. |
@@ -67,6 +67,7 @@ Windows CTest currently reports 13 tests:
 - `racebox_application_state`: portable workspaces, lap roles, playback, jobs, and notifications;
 - `racebox_source_identity`: deterministic exact/probable/ambiguous/missing source repair;
 - `racebox_ui_preferences`: guided workspaces, optional Compare B, text size, layout lock, malformed-file recovery, atomic saving, and one-time layout-v4 backup;
+- `racebox_import_discovery`: bounded saved-folder scans, strict RaceBox/Sanwa CSV header recognition, unrelated-file rejection, and Sanwa-only removable-drive filtering;
 - `racebox_imu_analysis`: first-stationary-block zero calibration, IMU availability, mounting-independent yaw calibration, sustained low-load/landing detection, high-load and rapid-rotation gates, and empty legacy channels.
 - `racebox_crew_chief`: bounded private-gateway report and evidence contracts.
 - `racebox_race_day`: event/run persistence, pre-run checklist and tire history, golden multi-source loading, canonical analytics CSV, setup-analytics-v3 straight-speed attribution, brake-response indicators, overdriving/tire-scrub risk, chassis-roll amount, and roll-rate math.

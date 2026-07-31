@@ -169,6 +169,7 @@ if(RACEBOX_BUILD_WINDOWS_APP)
     src/app/ui_preferences.cpp
     src/app/ui_theme.cpp
     src/app/file_dialog.cpp
+    src/app/import_discovery.cpp
     src/app/texture_loader.cpp
     resources/RaceBoxViewer.rc)
   target_include_directories(RaceBoxViewer PRIVATE include src/app "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -245,6 +246,15 @@ if(BUILD_TESTING)
     target_compile_definitions(racebox_ui_preferences_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     racebox_configure_cpp_target(racebox_ui_preferences_tests)
     add_test(NAME racebox_ui_preferences COMMAND racebox_ui_preferences_tests)
+
+    add_executable(racebox_import_discovery_tests
+      tests/import_discovery_tests.cpp
+      src/app/import_discovery.cpp)
+    target_include_directories(racebox_import_discovery_tests PRIVATE include src/app)
+    target_link_libraries(racebox_import_discovery_tests PRIVATE racebox_core)
+    target_compile_definitions(racebox_import_discovery_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    racebox_configure_cpp_target(racebox_import_discovery_tests)
+    add_test(NAME racebox_import_discovery COMMAND racebox_import_discovery_tests)
 
     add_executable(racebox_crew_chief_tests tests/crew_chief_tests.cpp)
     target_link_libraries(racebox_crew_chief_tests PRIVATE racebox_core)

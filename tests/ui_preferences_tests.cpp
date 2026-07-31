@@ -63,6 +63,10 @@ int main() {
     passed &= expect(missing.preferences.show_turn_numbers, "turn numbers default visible");
     passed &= expect(missing.preferences.analysis_aligned_map_traces,
                      "analysis-aligned comparison traces default visible");
+    passed &= expect(missing.preferences.telemetry_import_folder.empty(),
+                     "fresh import folder is resolved by the platform shell");
+    passed &= expect(missing.preferences.auto_detect_sanwa_usb,
+                     "Sanwa USB discovery defaults on");
 
     {
         std::ofstream legacy(preferences_path);
@@ -136,6 +140,9 @@ int main() {
     saved.workspace.utility_panels.altitude = true;
     saved.workspace.utility_panels.theoretical_analysis = true;
     saved.analysis_aligned_map_traces = false;
+    saved.telemetry_import_folder =
+        temporary.path() / "RaceBox downloads";
+    saved.auto_detect_sanwa_usb = false;
     saved.text_scale = 1.29F;
     saved.telemetry_plot_order = {TelemetryPlotId::Steering, TelemetryPlotId::Speed};
     std::string save_error;
@@ -160,6 +167,11 @@ int main() {
     passed &= expect(!round_trip.preferences.show_turn_numbers, "turn-number visibility round trips");
     passed &= expect(!round_trip.preferences.analysis_aligned_map_traces,
                      "analysis-aligned trace visibility round trips");
+    passed &= expect(
+        round_trip.preferences.telemetry_import_folder ==
+            saved.telemetry_import_folder &&
+            !round_trip.preferences.auto_detect_sanwa_usb,
+        "import folder and Sanwa USB preference round trip");
     passed &= expect(round_trip.preferences.telemetry_plot_order.front() == TelemetryPlotId::Steering &&
                          round_trip.preferences.telemetry_plot_order[1] == TelemetryPlotId::Speed &&
                          round_trip.preferences.telemetry_plot_order.size() == kDefaultTelemetryPlotOrder.size(),

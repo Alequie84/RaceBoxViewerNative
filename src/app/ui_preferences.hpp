@@ -52,6 +52,8 @@ struct UiPreferences {
     float map_grid_spacing_m{10.0F};
     bool separate_compare_maps{};
     bool analysis_aligned_map_traces{true};
+    std::filesystem::path telemetry_import_folder;
+    bool auto_detect_sanwa_usb{true};
     float text_scale{1.0F};
     int layout_version{kCurrentUiLayoutVersion};
     std::vector<TelemetryPlotId> telemetry_plot_order{default_telemetry_plot_order()};

@@ -5,16 +5,20 @@
 #include "racebox/driver_analysis.hpp"
 #include "racebox/race_day.hpp"
 #include "racebox/telemetry_plot_order.hpp"
+#include "import_discovery.hpp"
 
 #include <d3d11.h>
 #include <imgui.h>
 #include <windows.h>
 
 #include <array>
+#include <chrono>
+#include <deque>
 #include <future>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace racebox::app {
@@ -27,7 +31,13 @@ struct Texture {
     void reset();
 };
 
-std::vector<std::filesystem::path> open_telemetry_files(HWND owner);
+std::vector<std::filesystem::path> open_telemetry_files(
+    HWND owner,
+    const std::filesystem::path& initial_folder = {});
+std::optional<std::filesystem::path> choose_telemetry_folder(
+    HWND owner,
+    const std::filesystem::path& initial_folder = {});
+std::filesystem::path default_telemetry_download_folder();
 std::optional<std::filesystem::path> open_race_day_file(HWND owner);
 std::optional<std::filesystem::path> open_annotation_file(HWND owner);
 std::optional<std::filesystem::path> open_image_file(HWND owner);
@@ -122,13 +132,20 @@ private:
     void draw_crew_chief();
     void draw_race_day();
     void draw_session_import_popup();
+    void draw_import_discovery_popups();
     void draw_reports();
     void draw_dev_notes();
     void draw_events_tab();
     void draw_sectors_tab();
     void poll_loader();
+    void poll_import_discovery();
     void begin_load(const std::vector<std::filesystem::path>& files);
     void start_session_import(int preferred_run = -1);
+    void start_session_import_files(
+        const std::vector<std::filesystem::path>& files,
+        int preferred_run = -1);
+    void start_folder_import(int preferred_run = -1);
+    void open_racebox_cloud_export();
     void save_session();
     void save_active_lap();
     void export_active_lap();
@@ -190,6 +207,21 @@ private:
     int session_import_preferred_run_{-1};
     std::optional<PendingSessionImport> pending_session_import_;
     std::string session_import_error_;
+    std::filesystem::path telemetry_watch_folder_;
+    bool auto_detect_sanwa_usb_{true};
+    std::future<TelemetryFolderScan> folder_scan_future_;
+    bool folder_scan_busy_{};
+    int folder_import_preferred_run_{-1};
+    std::vector<DiscoveredTelemetryFile> discovered_files_;
+    std::vector<bool> discovered_file_selected_;
+    bool discovered_files_popup_open_{};
+    std::future<TelemetryFolderScan> usb_scan_future_;
+    bool usb_scan_busy_{};
+    std::deque<std::filesystem::path> pending_usb_scan_roots_;
+    std::unordered_set<std::wstring> known_removable_roots_;
+    std::optional<DiscoveredTelemetryFile> detected_usb_sanwa_;
+    bool detected_usb_popup_open_{};
+    std::chrono::steady_clock::time_point next_usb_poll_{};
     std::optional<Session> session_;
     std::string status_{"Open any VBO, RaceBox CSV, GPX, session archive, or Sanwa file."};
     std::string error_;

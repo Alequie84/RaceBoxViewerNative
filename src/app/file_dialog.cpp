@@ -1,5 +1,6 @@
 #include "native_app.hpp"
 
+#include <shlobj.h>
 #include <shobjidl.h>
 
 #include <iterator>
@@ -15,9 +16,24 @@ std::optional<std::filesystem::path> shell_path(IShellItem* item) {
     return path;
 }
 
+void set_initial_folder(
+    IFileDialog* dialog,
+    const std::filesystem::path& initial_folder) {
+    if (!dialog || initial_folder.empty()) return;
+    IShellItem* folder = nullptr;
+    if (SUCCEEDED(SHCreateItemFromParsingName(
+            initial_folder.c_str(), nullptr,
+            IID_PPV_ARGS(&folder)))) {
+        dialog->SetFolder(folder);
+        folder->Release();
+    }
+}
+
 }  // namespace
 
-std::vector<std::filesystem::path> open_telemetry_files(HWND owner) {
+std::vector<std::filesystem::path> open_telemetry_files(
+    HWND owner,
+    const std::filesystem::path& initial_folder) {
     std::vector<std::filesystem::path> paths;
     IFileOpenDialog* dialog = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&dialog)))) return paths;
@@ -26,6 +42,7 @@ std::vector<std::filesystem::path> open_telemetry_files(HWND owner) {
     dialog->SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
     const COMDLG_FILTERSPEC filters[] = {{L"Telemetry files", L"*.vbo;*.csv;*.gpx;*.rbxsession;*.rbxlap"}, {L"All files", L"*.*"}};
     dialog->SetFileTypes(static_cast<UINT>(std::size(filters)), filters);
+    set_initial_folder(dialog, initial_folder);
     if (SUCCEEDED(dialog->Show(owner))) {
         IShellItemArray* items = nullptr;
         if (SUCCEEDED(dialog->GetResults(&items))) {
@@ -43,6 +60,45 @@ std::vector<std::filesystem::path> open_telemetry_files(HWND owner) {
     }
     dialog->Release();
     return paths;
+}
+
+std::optional<std::filesystem::path> choose_telemetry_folder(
+    HWND owner,
+    const std::filesystem::path& initial_folder) {
+    IFileOpenDialog* dialog = nullptr;
+    if (FAILED(CoCreateInstance(
+            CLSID_FileOpenDialog, nullptr, CLSCTX_ALL,
+            IID_PPV_ARGS(&dialog)))) {
+        return std::nullopt;
+    }
+    dialog->SetTitle(L"Choose RaceBox import folder");
+    DWORD options = 0;
+    dialog->GetOptions(&options);
+    dialog->SetOptions(
+        options | FOS_PICKFOLDERS | FOS_PATHMUSTEXIST |
+        FOS_FORCEFILESYSTEM);
+    set_initial_folder(dialog, initial_folder);
+    std::optional<std::filesystem::path> result;
+    if (SUCCEEDED(dialog->Show(owner))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&item))) {
+            result = shell_path(item);
+            item->Release();
+        }
+    }
+    dialog->Release();
+    return result;
+}
+
+std::filesystem::path default_telemetry_download_folder() {
+    PWSTR raw = nullptr;
+    if (FAILED(SHGetKnownFolderPath(
+            FOLDERID_Downloads, KF_FLAG_DEFAULT, nullptr, &raw))) {
+        return {};
+    }
+    std::filesystem::path result(raw);
+    CoTaskMemFree(raw);
+    return result;
 }
 
 std::optional<std::filesystem::path> open_race_day_file(HWND owner) {

@@ -22,6 +22,25 @@ bool boolean_or(const Json& object, const char* key, bool fallback) {
     return value != object.end() && value->is_boolean() ? value->get<bool>() : fallback;
 }
 
+std::filesystem::path path_or(
+    const Json& object,
+    const char* key,
+    const std::filesystem::path& fallback) {
+    const auto value = object.find(key);
+    if (value == object.end() || !value->is_string()) return fallback;
+    const auto& encoded = value->get_ref<const std::string&>();
+    if (encoded.empty() || encoded.size() > 8'192) return {};
+    return std::filesystem::u8path(encoded);
+}
+
+std::string path_utf8(const std::filesystem::path& path) {
+    const auto encoded = path.generic_u8string();
+    return {
+        reinterpret_cast<const char*>(encoded.data()),
+        encoded.size(),
+    };
+}
+
 float grid_spacing_or(const Json& object, float fallback) {
     const auto value = object.find("map_grid_spacing_m");
     if (value == object.end() || !value->is_number()) return fallback;
@@ -115,6 +134,12 @@ UiPreferencesLoadResult load_ui_preferences(const std::filesystem::path& path) n
         preferences.separate_compare_maps = boolean_or(value, "separate_compare_maps", preferences.separate_compare_maps);
         preferences.analysis_aligned_map_traces = boolean_or(
             value, "analysis_aligned_map_traces", preferences.analysis_aligned_map_traces);
+        preferences.telemetry_import_folder = path_or(
+            value, "telemetry_import_folder",
+            preferences.telemetry_import_folder);
+        preferences.auto_detect_sanwa_usb = boolean_or(
+            value, "auto_detect_sanwa_usb",
+            preferences.auto_detect_sanwa_usb);
         preferences.text_scale = text_scale_or(value, preferences.text_scale);
 
         result.source_layout_version = layout_version_or(value, 0);
@@ -190,6 +215,10 @@ bool save_ui_preferences_atomic(const std::filesystem::path& path, const UiPrefe
             {"map_grid_spacing_m", std::clamp(preferences.map_grid_spacing_m, 5.0F, 25.0F)},
             {"separate_compare_maps", preferences.separate_compare_maps},
             {"analysis_aligned_map_traces", preferences.analysis_aligned_map_traces},
+            {"telemetry_import_folder",
+             path_utf8(preferences.telemetry_import_folder)},
+            {"auto_detect_sanwa_usb",
+             preferences.auto_detect_sanwa_usb},
             {"text_scale", normalize_text_scale(preferences.text_scale)},
             {"layout_version", std::max(0, preferences.layout_version)},
             {"telemetry_plot_order", std::move(plot_order)},
