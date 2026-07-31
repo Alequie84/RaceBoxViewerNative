@@ -33,12 +33,27 @@
         "RACEBOX_BUILD_CLI": "ON",
         "BUILD_TESTING": "ON"
       }
+    },
+    {
+      "name": "macos-release",
+      "displayName": "macOS Apple Silicon native preview",
+      "generator": "Xcode",
+      "binaryDir": "${sourceDir}/build/macos-release",
+      "cacheVariables": {
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "13.0",
+        "RACEBOX_BUILD_WINDOWS_APP": "OFF",
+        "RACEBOX_BUILD_MACOS_APP": "ON",
+        "RACEBOX_BUILD_CLI": "ON",
+        "BUILD_TESTING": "ON"
+      }
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "windows-release" },
     { "name": "debug", "configurePreset": "windows-debug" },
-    { "name": "portable-core-release", "configurePreset": "portable-core-release" }
+    { "name": "portable-core-release", "configurePreset": "portable-core-release" },
+    { "name": "macos-release", "configurePreset": "macos-release", "configuration": "Release" }
   ],
   "testPresets": [
     { "name": "release", "configurePreset": "windows-release", "output": { "outputOnFailure": true } },
@@ -46,6 +61,12 @@
     {
       "name": "portable-core-release",
       "configurePreset": "portable-core-release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "macos-release",
+      "configurePreset": "macos-release",
+      "configuration": "Release",
       "output": { "outputOnFailure": true }
     }
   ]

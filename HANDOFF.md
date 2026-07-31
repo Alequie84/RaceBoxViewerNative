@@ -1,6 +1,6 @@
 # RaceBox Telemetry Viewer 2 Handoff
 
-Last updated: 2026-07-21
+Last updated: 2026-07-31
 
 The protected `0.1.0.029` implementation is checkpointed on `main` and tagged
 `v0.1.0.029`. Version 2 is developed side-by-side on branch `v2`; the first
@@ -8,7 +8,7 @@ release version is `2.0.0.001`. The golden telemetry engine and its raw-data
 rules remain authoritative.
 
 The current v2 architecture, guided workspaces, persistence migrations, and
-future macOS adapter boundary are described in
+first macOS adapter milestone are described in
 [`docs/v2-architecture.md`](docs/v2-architecture.md).
 
 ## Start here
@@ -76,8 +76,12 @@ Current Windows CTest targets:
 14. `racebox_import_discovery` - bounded recursive folder scanning, strict RaceBox/Sanwa CSV header recognition, unrelated/empty file rejection, and Sanwa-only removable-drive filtering.
 
 The `portable-core-release` preset builds only the domain, application state,
-CLI, and seven portable tests. It is the dependency-boundary check for a later
-SDL3/Metal macOS shell; it does not claim that a Mac app bundle exists yet.
+CLI, and seven portable tests. `macos-release` now configures an Apple Silicon
+SDL3/Metal application bundle. The first Mac shell is a read-only preview that
+loads VBO/RaceBox/Sanwa data, shows selected-lap telemetry, GPS and IMU, and
+accepts Finder drag/drop. Build and packaging instructions are in
+[`docs/macos-build.md`](docs/macos-build.md). It must still be compiled and run
+on a registered Mac with Xcode before anyone calls the `.app` verified.
 
 Current validation is native-only. `Verify-Project.ps1` is a legacy combined workflow and must not be used while the browser remains frozen. After every C++ edit, build and test with `Build-Test-Native.ps1`, then use `Start-NativeDemo.ps1`; do not leave an older executable open for review.
 

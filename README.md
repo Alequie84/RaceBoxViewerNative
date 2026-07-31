@@ -1,8 +1,8 @@
 # RaceBox Telemetry Viewer 2
 
-Windows-native RaceBox and Sanwa telemetry analysis using C++20, DirectX 11, Dear ImGui docking, and ImPlot. Version 2 retains the proven telemetry engine behind a guided five-workspace interface and portable application/service boundaries for a later Apple Silicon macOS shell. Processing is local and the portable application does not require an internet connection, Chromium, or Node.js.
+Native RaceBox and Sanwa telemetry analysis using C++20, Dear ImGui, and ImPlot. Windows uses DirectX 11; the first Apple Silicon preview uses SDL3 and Metal over the same portable telemetry, lap, alignment, and IMU core. Processing is local and neither native shell requires Chromium or Node.js.
 
-The v2 architecture and macOS boundary are documented in [docs/v2-architecture.md](docs/v2-architecture.md). Developer continuation notes are in [HANDOFF.md](HANDOFF.md). Codex startup guidance is in [AGENTS.md](AGENTS.md), and reusable developer commands are in [scripts/toolbox/README.md](scripts/toolbox/README.md). The React/Vite prototype is frozen history and is not built or tested as part of v2.
+The v2 architecture and platform boundary are documented in [docs/v2-architecture.md](docs/v2-architecture.md), with Mac build instructions in [docs/macos-build.md](docs/macos-build.md). Developer continuation notes are in [HANDOFF.md](HANDOFF.md). Codex startup guidance is in [AGENTS.md](AGENTS.md), and reusable developer commands are in [scripts/toolbox/README.md](scripts/toolbox/README.md). The React/Vite prototype is frozen history and is not built or tested as part of v2.
 
 ## Version 2 guided workflow
 
@@ -29,6 +29,10 @@ The always-visible application header shows the exact packaged release number fr
 The portable package is judge-ready: double-click `RaceBoxTelemetryViewer.exe` or `Start RaceBox Demo.cmd` and the bundled Richmond VBO, RaceBox CSV, and Sanwa CSV load automatically. The executable uses the demo only when all three files are present beside the packaged app and no user files were supplied. **File > Add recording to Race Day** opens the Race Day import flow, asks whether the recording was Practice, Qualifying, or Race, detects its recording date, and offers the next matching Race Day slot. **Scan saved import folder** searches a bounded directory tree and lists only recognized RaceBox, VBO, GPX, native archive, and Sanwa files. Passing paths on the command line remains the non-interactive launch path and overrides the demo.
 
 The known Richmond fixture automatically loads the bundled clean aerial; the same native-rate Sanwa data is merged whether the files are opened from the menu, the command line, or the demo launcher.
+
+### macOS preview
+
+The source now includes a native Apple Silicon application bundle target. It automatically loads the same three demo files and can accept a VBO, RaceBox CSV, and optional Sanwa CSV by Finder drag/drop. Its initial read-only workspaces show the session summary, lap GPS trace, telemetry and controls, lap table, and calibrated IMU data. Build it on a Mac with `./scripts/build-macos.sh`; the script runs the portable tests and creates an unsigned ZIP. Race Day persistence, annotations, the aerial texture, Crew Chief networking, signing, and notarization remain Windows-only until their Mac adapters are completed.
 
 The dockable workspace includes Track Map, Playback, Telemetry, Laps and Sectors, Radio Alignment, Analysis, G-G, Altitude, Insights, and Diagnostics. V2 stores its layout, preferences, cache, logs, and crash reports in `%LOCALAPPDATA%\RaceBoxTelemetryViewer\2`. On first launch it copies only the old preferences/layout when available; `.029` keeps its own folder unchanged.
 

@@ -38,12 +38,28 @@ endif()
 option(RACEBOX_BUILD_WINDOWS_APP
   "Build the Win32/DX11 app, Windows storage/network integrations, and portable package"
   ${RACEBOX_WINDOWS_APP_DEFAULT})
+set(RACEBOX_MACOS_APP_DEFAULT OFF)
+if(APPLE)
+  set(RACEBOX_MACOS_APP_DEFAULT ON)
+endif()
+option(RACEBOX_BUILD_MACOS_APP
+  "Build the macOS SDL3/Metal application bundle"
+  ${RACEBOX_MACOS_APP_DEFAULT})
 option(RACEBOX_BUILD_CLI "Build the platform-neutral telemetry CLI" ON)
 
 if(RACEBOX_BUILD_WINDOWS_APP AND NOT WIN32)
   message(FATAL_ERROR
     "RACEBOX_BUILD_WINDOWS_APP requires Windows. Configure with "
     "-DRACEBOX_BUILD_WINDOWS_APP=OFF for the portable domain/application/CLI targets.")
+endif()
+
+if(RACEBOX_BUILD_MACOS_APP AND NOT APPLE)
+  message(FATAL_ERROR
+    "RACEBOX_BUILD_MACOS_APP requires macOS and Xcode. Configure this option only on a Mac.")
+endif()
+
+if(RACEBOX_BUILD_MACOS_APP)
+  enable_language(OBJCXX)
 endif()
 
 if(RACEBOX_BUILD_CLI OR RACEBOX_BUILD_WINDOWS_APP)
@@ -54,7 +70,7 @@ if(RACEBOX_BUILD_CLI OR RACEBOX_BUILD_WINDOWS_APP)
   FetchContent_MakeAvailable(json)
 endif()
 
-if(RACEBOX_BUILD_WINDOWS_APP)
+if(RACEBOX_BUILD_WINDOWS_APP OR RACEBOX_BUILD_MACOS_APP)
   FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
     GIT_TAG v1.92.8-docking
@@ -62,10 +78,18 @@ if(RACEBOX_BUILD_WINDOWS_APP)
   FetchContent_Declare(implot
     GIT_REPOSITORY https://github.com/epezent/implot.git
     GIT_TAG d65a2bef53d32502407de3a4be80f191e2f412d7)
-  FetchContent_Declare(miniz_src
-    GIT_REPOSITORY https://github.com/richgel999/miniz.git
-    GIT_TAG 77d0dce8627735138c51770d1799a1ef48f2117d)
-  FetchContent_MakeAvailable(imgui implot miniz_src)
+  FetchContent_MakeAvailable(imgui implot)
+
+  if(RACEBOX_BUILD_WINDOWS_APP)
+    FetchContent_Declare(miniz_src
+      GIT_REPOSITORY https://github.com/richgel999/miniz.git
+      GIT_TAG 77d0dce8627735138c51770d1799a1ef48f2117d)
+    FetchContent_MakeAvailable(miniz_src)
+  endif()
+
+endif()
+
+if(RACEBOX_BUILD_WINDOWS_APP)
 
   add_library(imgui_native STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
@@ -82,7 +106,7 @@ if(RACEBOX_BUILD_WINDOWS_APP)
     ${implot_SOURCE_DIR}/implot_items.cpp)
   target_include_directories(implot_native PUBLIC ${implot_SOURCE_DIR})
   target_link_libraries(implot_native PUBLIC imgui_native)
-else()
+elseif(NOT RACEBOX_BUILD_MACOS_APP)
   message(STATUS
     "RaceBox portable core-only build: Win32/DX11 UI, storage, Crew Chief transport, "
     "Windows-only tests, and portable packaging are disabled.")
@@ -177,6 +201,91 @@ if(RACEBOX_BUILD_WINDOWS_APP)
   target_compile_definitions(RaceBoxViewer PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX IMGUI_DEFINE_MATH_OPERATORS)
   racebox_configure_cpp_target(RaceBoxViewer)
   set_target_properties(RaceBoxViewer PROPERTIES OUTPUT_NAME RaceBoxTelemetryViewer)
+endif()
+
+if(RACEBOX_BUILD_MACOS_APP)
+  set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+  set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+  set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+  set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+  set(SDL_STATIC ON CACHE BOOL "" FORCE)
+  FetchContent_Declare(sdl3
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+    GIT_TAG release-3.4.10
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(sdl3)
+
+  add_library(imgui_macos STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_metal.mm)
+  target_include_directories(imgui_macos PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+  target_link_libraries(imgui_macos PUBLIC SDL3::SDL3 PRIVATE "-framework Metal" "-framework QuartzCore")
+  target_compile_definitions(imgui_macos PUBLIC IMGUI_ENABLE_DOCKING IMGUI_DEFINE_MATH_OPERATORS)
+
+  add_library(implot_macos STATIC
+    ${implot_SOURCE_DIR}/implot.cpp
+    ${implot_SOURCE_DIR}/implot_items.cpp)
+  target_include_directories(implot_macos PUBLIC ${implot_SOURCE_DIR})
+  target_link_libraries(implot_macos PUBLIC imgui_macos)
+
+  set(RACEBOX_MAC_RESOURCES
+    golden/session.vbo
+    golden/session.csv
+    golden/sanwa.csv
+    assets/rrr-map.png
+    VERSION
+    README.md
+    docs/macos-build.md
+    ${sdl3_SOURCE_DIR}/LICENSE.txt
+    ${imgui_SOURCE_DIR}/LICENSE.txt
+    ${implot_SOURCE_DIR}/LICENSE)
+  set_source_files_properties(
+    golden/session.vbo golden/session.csv golden/sanwa.csv
+    PROPERTIES MACOSX_PACKAGE_LOCATION "Resources/demo")
+  set_source_files_properties(assets/rrr-map.png
+    PROPERTIES MACOSX_PACKAGE_LOCATION "Resources/assets")
+  set_source_files_properties(VERSION README.md docs/macos-build.md
+    PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+  set_source_files_properties(${sdl3_SOURCE_DIR}/LICENSE.txt
+    PROPERTIES MACOSX_PACKAGE_LOCATION "Resources/licenses/SDL3")
+  set_source_files_properties(${imgui_SOURCE_DIR}/LICENSE.txt
+    PROPERTIES MACOSX_PACKAGE_LOCATION "Resources/licenses/DearImGui")
+  set_source_files_properties(${implot_SOURCE_DIR}/LICENSE
+    PROPERTIES MACOSX_PACKAGE_LOCATION "Resources/licenses/ImPlot")
+
+  configure_file(resources/macos/Info.plist.in generated/Info.plist @ONLY)
+  add_executable(RaceBoxViewerMac MACOSX_BUNDLE
+    src/app/mac/main.mm
+    src/app/mac/mac_app.cpp
+    ${RACEBOX_MAC_RESOURCES})
+  target_include_directories(RaceBoxViewerMac PRIVATE
+    include src/app/mac "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  target_link_libraries(RaceBoxViewerMac PRIVATE
+    racebox_domain racebox_application imgui_macos implot_macos SDL3::SDL3
+    "-framework Cocoa" "-framework Metal" "-framework QuartzCore")
+  target_compile_definitions(RaceBoxViewerMac PRIVATE IMGUI_DEFINE_MATH_OPERATORS)
+  racebox_configure_cpp_target(RaceBoxViewerMac)
+  set_target_properties(RaceBoxViewerMac PROPERTIES
+    OUTPUT_NAME RaceBoxTelemetryViewer
+    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/generated/Info.plist"
+    XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.alequie.raceboxtelemetryviewer"
+    XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO"
+    XCODE_ATTRIBUTE_MACOSX_DEPLOYMENT_TARGET "13.0")
+endif()
+
+if(RACEBOX_BUILD_WINDOWS_APP)
+  # Compile the portable C++ portion of the Mac shell on every Windows release.
+  # Objective-C++ and Metal still require Xcode, but this catches UI/core drift early.
+  add_library(racebox_macos_ui_compilecheck OBJECT src/app/mac/mac_app.cpp)
+  target_include_directories(racebox_macos_ui_compilecheck PRIVATE
+    include src/app/mac "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    ${imgui_SOURCE_DIR} ${implot_SOURCE_DIR})
+  target_compile_definitions(racebox_macos_ui_compilecheck PRIVATE IMGUI_DEFINE_MATH_OPERATORS)
+  racebox_configure_cpp_target(racebox_macos_ui_compilecheck)
 endif()
 
 if(BUILD_TESTING)
@@ -281,6 +390,7 @@ if(RACEBOX_BUILD_WINDOWS_APP)
   install(FILES HANDOFF.md DESTINATION .)
   install(FILES docs/race-day-crew-chief.md DESTINATION docs)
   install(FILES docs/v2-architecture.md DESTINATION docs)
+  install(FILES docs/macos-build.md DESTINATION docs)
   install(FILES "Start RaceBox Demo.cmd" DESTINATION .)
   install(FILES assets/rrr-map.png assets/rrr-map-original.png DESTINATION assets)
   install(FILES golden/session.vbo golden/session.csv golden/sanwa.csv DESTINATION demo)
@@ -288,4 +398,8 @@ if(RACEBOX_BUILD_WINDOWS_APP)
   install(FILES ${implot_SOURCE_DIR}/LICENSE DESTINATION licenses RENAME implot-LICENSE.txt)
   install(FILES ${miniz_src_SOURCE_DIR}/LICENSE DESTINATION licenses RENAME miniz-LICENSE.txt)
   install(FILES ${json_SOURCE_DIR}/LICENSE.MIT DESTINATION licenses RENAME nlohmann-json-LICENSE.MIT)
+endif()
+
+if(RACEBOX_BUILD_MACOS_APP)
+  install(TARGETS RaceBoxViewerMac BUNDLE DESTINATION .)
 endif()

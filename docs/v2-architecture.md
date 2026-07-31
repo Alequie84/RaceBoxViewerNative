@@ -44,7 +44,7 @@ racebox_application
         |
   +-----+---------------------+
   |                           |
-Windows adapters          future macOS adapters
+Windows adapters          macOS preview / adapters
 Win32/DX11/WARP           SDL3/Metal
 WinHTTP                   native/portable HTTP transport
 Windows file dialogs      asynchronous SDL/native file dialogs
@@ -69,13 +69,14 @@ saving telemetry must continue to work offline.
 
 Windows presets continue to build the complete app. A portable preset configures
 only targets that have no Win32, DirectX, WinHTTP, shell, registry, or WIC
-dependency. It is an architecture check, not a claim that the macOS window is
-already implemented.
+dependency. The `macos-release` preset now builds the first Apple Silicon shell:
+SDL3 owns its window, high-DPI input and drag/drop, while Metal renders Dear
+ImGui and ImPlot. It reads the bundled demo and user-supplied VBO/RaceBox/Sanwa
+files through the shared domain target.
 
-The eventual Apple Silicon shell should add:
+The next Apple Silicon milestones should add:
 
-- SDL3 window, input, DPI, clipboard, and asynchronous file-dialog adapters;
-- a Metal renderer for Dear ImGui and ImPlot;
+- an asynchronous native file-dialog adapter beyond the current Finder drop;
 - macOS Application Support, Caches, and Logs directory adapters;
 - a Keychain-backed optional secret provider;
 - a macOS HTTP transport for the optional Crew Chief connection;
