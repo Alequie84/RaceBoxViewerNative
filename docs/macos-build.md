@@ -20,7 +20,8 @@ notarization remain disabled until their macOS service adapters are completed.
 ## Requirements
 
 - Apple Silicon Mac running macOS 13 or newer.
-- Xcode with the command-line tools selected.
+- Apple Command Line Tools (`xcode-select --install`). The full Xcode app is
+  not required for this preview.
 - CMake 3.25 or newer.
 - Internet access for the first configure so CMake can fetch the pinned SDL3,
   Dear ImGui, ImPlot and JSON source dependencies.
@@ -36,7 +37,7 @@ The script configures, compiles, runs the seven platform-neutral tests, and
 creates an unsigned ZIP under `out/`. To run without packaging:
 
 ```bash
-open build/macos-release/Release/RaceBoxTelemetryViewer.app
+open build/macos-release/RaceBoxTelemetryViewer.app
 ```
 
 An unsigned local build may need Control-click, Open on its first launch. A

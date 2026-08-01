@@ -36,10 +36,11 @@
     },
     {
       "name": "macos-release",
-      "displayName": "macOS Apple Silicon native preview",
-      "generator": "Xcode",
+      "displayName": "macOS Apple Silicon native preview (Command Line Tools)",
+      "generator": "Unix Makefiles",
       "binaryDir": "${sourceDir}/build/macos-release",
       "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_OSX_ARCHITECTURES": "arm64",
         "CMAKE_OSX_DEPLOYMENT_TARGET": "13.0",
         "RACEBOX_BUILD_WINDOWS_APP": "OFF",
@@ -53,7 +54,7 @@
     { "name": "release", "configurePreset": "windows-release" },
     { "name": "debug", "configurePreset": "windows-debug" },
     { "name": "portable-core-release", "configurePreset": "portable-core-release" },
-    { "name": "macos-release", "configurePreset": "macos-release", "configuration": "Release" }
+    { "name": "macos-release", "configurePreset": "macos-release" }
   ],
   "testPresets": [
     { "name": "release", "configurePreset": "windows-release", "output": { "outputOnFailure": true } },
@@ -66,7 +67,6 @@
     {
       "name": "macos-release",
       "configurePreset": "macos-release",
-      "configuration": "Release",
       "output": { "outputOnFailure": true }
     }
   ]
