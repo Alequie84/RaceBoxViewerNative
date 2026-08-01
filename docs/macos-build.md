@@ -43,3 +43,12 @@ open build/macos-release/RaceBoxTelemetryViewer.app
 An unsigned local build may need Control-click, Open on its first launch. A
 publicly distributed build will require an Apple Developer ID, signing,
 notarization and a clean-machine Gatekeeper test.
+
+## Hosted build fallback
+
+If Apple Software Update does not offer Command Line Tools and Apple Developer
+downloads are temporarily unavailable, the manual GitHub Actions workflow
+`.github/workflows/macos-preview.yml` builds on a fresh Apple-silicon
+`macos-15` runner. It runs the same portable tests, validates the application
+bundle and bundled demo inputs, and uploads an unsigned ZIP plus its SHA256 as
+a private workflow artifact. It never publishes a GitHub release automatically.

@@ -1,0 +1,56 @@
+name: Build macOS preview
+
+on:
+  push:
+    branches:
+      - v2
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos-preview:
+    name: Apple Silicon build and portable tests
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Record hosted toolchain
+        run: |
+          set -euo pipefail
+          uname -a
+          sw_vers
+          xcodebuild -version
+          cmake --version | head -n 1
+          clang++ --version | head -n 1
+
+      - name: Build, test, and package native preview
+        run: ./scripts/build-macos.sh
+
+      - name: Verify bundle and archive
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          app="build/macos-release/RaceBoxTelemetryViewer.app"
+          archive="out/RaceBoxTelemetryViewer-${version}-macos-arm64-unsigned.zip"
+          test -x "$app/Contents/MacOS/RaceBoxTelemetryViewer"
+          test -f "$app/Contents/Resources/demo/session.vbo"
+          test -f "$app/Contents/Resources/demo/session.csv"
+          test -f "$app/Contents/Resources/demo/sanwa.csv"
+          plutil -lint "$app/Contents/Info.plist"
+          file "$app/Contents/MacOS/RaceBoxTelemetryViewer"
+          shasum -a 256 "$archive" | tee out/macos-preview-sha256.txt
+
+      - name: Upload unsigned Mac preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: RaceBoxTelemetryViewer-macos-arm64-unsigned
+          path: |
+            out/RaceBoxTelemetryViewer-*-macos-arm64-unsigned.zip
+            out/macos-preview-sha256.txt
+          if-no-files-found: error
+          retention-days: 14
