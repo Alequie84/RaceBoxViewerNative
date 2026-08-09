@@ -18,9 +18,29 @@ $installRoot = Join-Path $packageRoot $(if ($Configuration -eq 'Release') {
 })
 $outRoot = Join-Path $root 'out'
 $zipPath = Join-Path $outRoot ($packageName + '.zip')
-$developerShell = 'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat'
+$developerShellCandidates = @()
+$vsWhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+if (Test-Path -LiteralPath $vsWhere) {
+    $installationPath = (& $vsWhere -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath | Select-Object -First 1)
+    if ($installationPath) {
+        $developerShellCandidates += Join-Path $installationPath 'Common7\Tools\VsDevCmd.bat'
+    }
+}
+$developerShellCandidates += @(
+    'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat',
+    'C:\Program Files\Microsoft Visual Studio\2022\Professional\Common7\Tools\VsDevCmd.bat',
+    'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat',
+    'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat'
+)
+$developerShell = $developerShellCandidates |
+    Where-Object { Test-Path -LiteralPath $_ } |
+    Select-Object -First 1
 
-if (-not (Test-Path -LiteralPath $developerShell)) { throw 'Visual Studio 2022 Community developer shell was not found.' }
+if (-not $developerShell) {
+    throw 'A Visual Studio 2022 installation with the C++ build tools was not found.'
+}
 $resolvedRoot = [IO.Path]::GetFullPath($root)
 $resolvedPackage = [IO.Path]::GetFullPath($packageRoot)
 $resolvedInstall = [IO.Path]::GetFullPath($installRoot)
