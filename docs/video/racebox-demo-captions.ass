@@ -1,0 +1,20 @@
+[Script Info]
+Title: RaceBox Telemetry Viewer Devpost Demo
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1008
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Chapter,Segoe UI Semibold,38,&H00FFFFFF,&H000000FF,&H00130B0B,&HC8000000,-1,0,0,0,100,100,0,0,3,2,0,2,80,80,28,1
+Style: Title,Segoe UI Semibold,54,&H00FFFFFF,&H000000FF,&H00130B0B,&HD0000000,-1,0,0,0,100,100,0,0,3,2,0,2,80,80,34,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:05.00,Title,,0,0,0,,RACEBOX TELEMETRY VIEWER\NNative C++20 racing analysis
+Dialogue: 0,0:00:05.00,0:00:18.00,Chapter,,0,0,0,,PRELOADED REAL TELEMETRY  •  RACEBOX + VBO + SANWA
+Dialogue: 0,0:00:18.00,0:00:35.00,Chapter,,0,0,0,,THREE LAPS  •  ONE DISTANCE-SYNCHRONIZED CURSOR
+Dialogue: 0,0:00:35.00,0:00:57.00,Chapter,,0,0,0,,DETERMINISTIC EVENTS, SECTORS, RULES, AND INSIGHTS
+Dialogue: 0,0:00:57.00,0:01:20.00,Chapter,,0,0,0,,BUILT WITH CODEX + GPT-5.6  •  PORTABLE  •  OFFLINE

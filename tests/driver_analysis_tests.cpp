@@ -220,13 +220,21 @@ int main() {
                    insight.recommendation == insight_evidence::Recommendation::None;
         }), "A recovery/compensation card produced a driving recommendation");
         require(std::all_of(result.insights.begin(), result.insights.end(), [](const Insight& insight) {
-            return insight.detail.find("compared with the reference lap") != std::string::npos &&
-                   insight.title.find("delta") == std::string::npos;
+            return insight.detail.find("than on the reference lap") != std::string::npos &&
+                   insight.title.find("delta") == std::string::npos && !insight.coaching.empty();
         }), "Insight cards did not use the plain-English driver wording");
         require(std::any_of(result.insights.begin(), result.insights.end(), [](const Insight& insight) {
-            return insight.metric == MetricKind::BrakePointDelta && insight.detail.find("Braked") != std::string::npos &&
-                   insight.detail.find("(brake point)") != std::string::npos;
-        }), "Brake insight did not pair plain English with the motorsport term");
+            return insight.metric == MetricKind::TurnInDelta &&
+                   insight.detail.find("began turning") != std::string::npos &&
+                   insight.detail.find("Started steering") == std::string::npos &&
+                   insight.detail.find("(turn-in)") == std::string::npos &&
+                   insight.detail.find("Turn 1:") != std::string::npos &&
+                   !insight.turn_direction.empty();
+        }), "Turn-in insight did not explain the driver's corner action naturally");
+        require(std::all_of(result.insights.begin(), result.insights.end(), [](const Insight& insight) {
+            return insight.coaching.find("steering") != std::string::npos &&
+                   insight.coaching.find("throttle") != std::string::npos;
+        }), "Driver coaching did not include both steering and throttle guidance");
 
         auto disabled_brake_rule = rules;
         for (auto& setting : disabled_brake_rule.metrics) {

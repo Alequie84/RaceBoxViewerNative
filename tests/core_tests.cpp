@@ -22,6 +22,79 @@ void close_to(double actual, double expected, double tolerance, const char* mess
 
 double seconds(racebox::Timestamp value) { return static_cast<double>(value) / 1'000'000.0; }
 
+std::pair<racebox::TelemetrySeries, racebox::RadioSeries>
+make_launch_alignment_fixture() {
+    constexpr racebox::Timestamp kSecond = 1'000'000;
+    constexpr racebox::Timestamp kCoarseAnchor = 10 * kSecond;
+    constexpr racebox::Timestamp kTrueCorrection = 8 * kSecond;
+    constexpr racebox::Timestamp kResponse = 180'000;
+    constexpr std::int64_t kAbsoluteStart = 1'786'000'000'000'000LL;
+
+    const auto trigger_at = [](racebox::Timestamp elapsed) {
+        if (elapsed < 5 * kSecond) return 0.0F;
+        const auto phase = (elapsed - 5 * kSecond) % (4 * kSecond);
+        return phase < 2 * kSecond ? 70.0F : -50.0F;
+    };
+    const auto steering_at = [](racebox::Timestamp elapsed) {
+        return static_cast<float>(55.0 * std::sin(
+            seconds(elapsed) * 1.7));
+    };
+
+    racebox::RadioSeries radio;
+    for (racebox::Timestamp elapsed = 0; elapsed <= 40 * kSecond;
+         elapsed += 10'000) {
+        radio.elapsed_us.push_back(elapsed);
+        radio.steering_percent.push_back(steering_at(elapsed));
+        radio.trigger_percent.push_back(trigger_at(elapsed));
+        radio.voltage.push_back(7.4F);
+    }
+    radio.filename_time_us = kAbsoluteStart + kCoarseAnchor;
+
+    racebox::TelemetrySeries telemetry;
+    double heading = 0.0;
+    for (racebox::Timestamp time = 0; time <= 60 * kSecond;
+         time += 40'000) {
+        const auto radio_elapsed =
+            time - kCoarseAnchor - kTrueCorrection - kResponse;
+        const auto trigger = radio_elapsed >= 0
+            ? trigger_at(radio_elapsed)
+            : 0.0F;
+        const auto steering = radio_elapsed >= 0
+            ? steering_at(radio_elapsed)
+            : 0.0F;
+        const auto moving = radio_elapsed >= 5 * kSecond;
+        const auto handling = time < 5 * kSecond;
+        const auto speed = handling ? 4.0F
+            : !moving ? 0.0F
+                : trigger > 0.0F ? 30.0F : 4.0F;
+        const auto altitude = handling
+            ? static_cast<float>(10.0 - seconds(time))
+            : 5.0F;
+        heading += static_cast<double>(steering) * 0.04 * 0.12;
+        while (heading >= 360.0) heading -= 360.0;
+        while (heading < 0.0) heading += 360.0;
+
+        telemetry.time_us.push_back(time);
+        telemetry.absolute_time_us.push_back(kAbsoluteStart + time);
+        telemetry.latitude.push_back(49.184);
+        telemetry.longitude.push_back(-123.145);
+        telemetry.speed_kmh.push_back(speed);
+        telemetry.heading_deg.push_back(static_cast<float>(heading));
+        telemetry.altitude_m.push_back(altitude);
+        telemetry.longitudinal_g.push_back(-trigger / 100.0F * 0.6F);
+        telemetry.lateral_g.push_back(0.0F);
+        telemetry.vertical_g.push_back(1.0F);
+        telemetry.gyro_x_dps.push_back(0.0F);
+        telemetry.gyro_y_dps.push_back(0.0F);
+        telemetry.gyro_z_dps.push_back(steering * 0.12F);
+        telemetry.satellites.push_back(12);
+        telemetry.raw_lap.push_back(0);
+    }
+    telemetry.validate();
+    radio.validate();
+    return {std::move(telemetry), std::move(radio)};
+}
+
 }  // namespace
 
 int main() {
@@ -106,6 +179,58 @@ int main() {
             std::filesystem::remove(temporary);
         }
         {
+            const auto temporary = std::filesystem::temp_directory_path() /
+                L"racebox-expanded-export.csv";
+            std::ofstream file(temporary);
+            file << "Format,RaceBox CSV\n"
+                 << "Data Source,RaceBox 123\n"
+                 << "Date UTC,2026-08-02T01:16:08+00:00\n"
+                 << "Laps,1\n"
+                 << "Record,Time,Latitude,Longitude,Altitude,Speed,GForceX,GForceY,GForceZ,Lap,GyroX,GyroY,GyroZ\n"
+                 << "1,2026-08-02T01:16:08.240Z,49.1839609,-123.1451008,6.8,0.25,0.031,-0.038,0.997,0,-0.56,-0.68,-2.78\n"
+                 << "2,2026-08-02T01:16:08.280Z,49.1839610,-123.1451008,6.8,0.32,0.016,-0.064,1.000,1,-0.43,-1.11,-5.39\n";
+            file.close();
+            std::vector<std::string> diagnostics;
+            const auto parsed = racebox::parse_racebox_csv(
+                temporary, diagnostics);
+            require(parsed.size() == 2,
+                "Expanded RaceBox CSV metadata prevented parsing");
+            close_to(seconds(parsed.time_us[1]), 0.04, 0.001,
+                "Expanded RaceBox CSV time interval changed");
+            close_to(parsed.longitude[0], -123.1451008, 1e-8,
+                "Expanded RaceBox CSV lost signed longitude");
+            require(parsed.raw_lap[1] == 1,
+                "Expanded RaceBox CSV lap column was not retained");
+            require(std::any_of(
+                        diagnostics.begin(), diagnostics.end(),
+                        [](const std::string& diagnostic) {
+                            return diagnostic.find("metadata rows") !=
+                                std::string::npos;
+                        }),
+                "Expanded RaceBox CSV metadata handling was not disclosed");
+            std::filesystem::remove(temporary);
+        }
+        {
+            const auto temporary = std::filesystem::temp_directory_path() /
+                L"racebox-empty-sanwa.csv";
+            {
+                std::ofstream file(
+                    temporary, std::ios::binary | std::ios::trunc);
+            }
+            std::vector<std::string> diagnostics;
+            std::string rejection;
+            try {
+                (void)racebox::parse_sanwa_csv(
+                    temporary, diagnostics);
+            } catch (const std::runtime_error& exception) {
+                rejection = exception.what();
+            }
+            require(
+                rejection.find("empty (0 bytes)") != std::string::npos,
+                "Empty Sanwa CSV did not produce a specific diagnostic");
+            std::filesystem::remove(temporary);
+        }
+        {
             const auto temporary = std::filesystem::temp_directory_path() / L"racebox-native-test.gpx";
             std::ofstream file(temporary);
             file << "<gpx><trk><trkseg>"
@@ -118,6 +243,92 @@ int main() {
             require(parsed.size() == 2, "GPX parser did not retain track points");
             require(parsed.speed_kmh[1] > 1.0F, "GPX speed derivation failed");
             std::filesystem::remove(temporary);
+        }
+        {
+            auto [telemetry, radio] = make_launch_alignment_fixture();
+            const auto alignment = racebox::align_radio(telemetry, radio);
+            require(alignment.compatible,
+                "Launch-alignment fixture was rejected");
+            require(alignment.used_end_anchor,
+                "Launch-alignment fixture trusted its manual filename clock");
+            close_to(seconds(alignment.radio_anchor_us), 20.0, 0.001,
+                "Launch-alignment recording-end fallback changed");
+            close_to(seconds(alignment.fine_correction_us), -2.0, 0.35,
+                "First trigger did not self-align to first GPS movement");
+            require(alignment.trigger_sign == 1,
+                "Launch self-alignment inverted the forward trigger");
+            require(alignment.launch_cue_used && alignment.altitude_supported,
+                "Launch/placement evidence was not exposed in diagnostics");
+            require(alignment.reason.find(
+                        "first sustained forward trigger") !=
+                    std::string::npos,
+                "Launch-based self-alignment was not disclosed");
+            require(alignment.reason.find(
+                        "downward RaceBox altitude trend") !=
+                    std::string::npos,
+                "Relative downward placement altitude was not retained as supporting evidence");
+
+            auto brake_first_radio = radio;
+            for (std::size_t index = 0; index < brake_first_radio.size(); ++index) {
+                const auto elapsed = brake_first_radio.elapsed_us[index];
+                if (elapsed >= 3'000'000 && elapsed < 3'200'000) {
+                    brake_first_radio.trigger_percent[index] = -60.0F;
+                }
+            }
+            const auto brake_first_alignment = racebox::align_radio(
+                telemetry, brake_first_radio);
+            require(brake_first_alignment.compatible &&
+                    brake_first_alignment.trigger_sign == 1 &&
+                    std::abs(brake_first_alignment.fine_correction_us -
+                        alignment.fine_correction_us) <= 350'000,
+                "A brake-first pull replaced the first real forward launch");
+
+            auto reversed_trigger_radio = radio;
+            for (auto& trigger : reversed_trigger_radio.trigger_percent) {
+                trigger = -trigger;
+            }
+            const auto reversed_trigger_alignment = racebox::align_radio(
+                telemetry, reversed_trigger_radio);
+            require(reversed_trigger_alignment.compatible &&
+                    reversed_trigger_alignment.trigger_sign == -1,
+                "Reversed Sanwa trigger polarity was not detected independently");
+
+            auto reversed_steering_radio = radio;
+            for (auto& steering : reversed_steering_radio.steering_percent) {
+                steering = -steering;
+            }
+            const auto reversed_steering_alignment = racebox::align_radio(
+                telemetry, reversed_steering_radio);
+            require(reversed_steering_alignment.compatible &&
+                    reversed_steering_alignment.steering_sign == -1,
+                "Reversed left/right steering polarity was not corrected");
+
+            auto no_altitude = telemetry;
+            std::fill(no_altitude.altitude_m.begin(), no_altitude.altitude_m.end(), 0.0F);
+            for (std::size_t index = 0; index < no_altitude.vertical_g.size(); ++index) {
+                no_altitude.vertical_g[index] = index % 2 == 0 ? 0.6F : 1.4F;
+            }
+            const auto no_altitude_alignment = racebox::align_radio(
+                no_altitude, radio);
+            require(no_altitude_alignment.compatible &&
+                    no_altitude_alignment.launch_cue_used &&
+                    !no_altitude_alignment.altitude_supported,
+                "Noisy/missing altitude incorrectly blocked the physical launch cue");
+
+            auto weak_radio = radio;
+            std::fill(weak_radio.trigger_percent.begin(),
+                weak_radio.trigger_percent.end(), 0.0F);
+            std::fill(weak_radio.steering_percent.begin(),
+                weak_radio.steering_percent.end(), 0.0F);
+            const auto weak_alignment =
+                racebox::align_radio(telemetry, weak_radio);
+            require(!weak_alignment.compatible,
+                "Controls with no physical response evidence were trusted");
+            require(weak_alignment.confidence == "low",
+                "Weak alignment did not report low confidence");
+            require(weak_alignment.reason.find("controls are withheld") !=
+                    std::string::npos,
+                "Weak Sanwa controls were not explicitly withheld");
         }
         const std::filesystem::path golden = GOLDEN_DIR;
         const auto loaded = racebox::load_session({golden / L"session.vbo", golden / L"session.csv", golden / L"sanwa.csv"});
@@ -144,9 +355,69 @@ int main() {
         require(session.start_finish_line.has_value(), "VBO start/finish line was not retained");
         close_to(seconds(session.alignment.radio_anchor_us), 123.780, 0.002, "Radio anchor changed");
         close_to(static_cast<double>(session.alignment.fine_correction_us) / 1000.0, -399.0, 3.0, "Fine correction changed");
+        close_to(seconds(session.alignment.radio_anchor_us +
+                     session.alignment.fine_correction_us),
+                 123.381, 0.003,
+                 "Golden effective Sanwa-to-RaceBox offset changed");
         require(session.alignment.trigger_correlation > 0.32, "Trigger correlation is too weak");
-        require(std::abs(session.alignment.steering_yaw_correlation) > 0.55, "Steering/yaw correlation is too weak");
+        require(session.alignment.steering_yaw_source == "gps_path" &&
+                    session.alignment.steering_yaw_correlation > 0.55,
+                "Steering was not validated against GPS path yaw");
+        require(session.alignment.steering_sign == -1,
+                "Golden Sanwa left/right polarity changed");
+        require(session.alignment.heading_gps_yaw_correlation > 0.80,
+                "RaceBox heading and signed GPS path yaw no longer agree");
         require(session.alignment.lap_steering_correlation > 0.70, "Lap steering correlation is too weak");
+        {
+            auto synchronized_radio = session.radio;
+            synchronized_radio.filename_time_us =
+                session.telemetry.absolute_time_us.front() +
+                123'381'000LL;
+            const auto synchronized_alignment = racebox::align_radio(
+                session.telemetry, synchronized_radio);
+            require(synchronized_alignment.compatible,
+                "A filename-timestamped Sanwa recording was rejected");
+            require(synchronized_alignment.used_end_anchor,
+                "A manually set Sanwa filename time influenced alignment");
+            close_to(seconds(synchronized_alignment.radio_anchor_us),
+                123.780, 0.002,
+                "Manual-clock fallback anchor changed");
+            close_to(
+                static_cast<double>(
+                    synchronized_alignment.fine_correction_us) / 1000.0,
+                -399.0, 3.0,
+                "Manual filename time changed the known signal correction");
+            require(synchronized_alignment.reason.find(
+                        "filename time was ignored") !=
+                    std::string::npos,
+                "Manual Sanwa filename time was not disclosed as ignored");
+
+            auto stale_clock_radio = session.radio;
+            stale_clock_radio.filename_time_us =
+                session.telemetry.absolute_time_us.front() -
+                40LL * 24LL * 3600LL * 1'000'000LL;
+            stale_clock_radio.file_modified_time_us =
+                session.telemetry.absolute_time_us.front() +
+                2LL * 3600LL * 1'000'000LL;
+            const auto stale_clock_alignment = racebox::align_radio(
+                session.telemetry, stale_clock_radio);
+            require(stale_clock_alignment.compatible,
+                "A stale Sanwa transmitter clock overrode a matching file date");
+            require(stale_clock_alignment.reason.find(
+                        "Manually set Sanwa filename time was ignored") !=
+                    std::string::npos,
+                "Stale Sanwa transmitter clock fallback was not disclosed");
+
+            stale_clock_radio.file_modified_time_us =
+                session.telemetry.absolute_time_us.front() -
+                40LL * 24LL * 3600LL * 1'000'000LL;
+            const auto unrelated_alignment = racebox::align_radio(
+                session.telemetry, stale_clock_radio);
+            require(unrelated_alignment.compatible,
+                "A manually set Sanwa clock rejected otherwise alignable controls");
+            require(unrelated_alignment.used_end_anchor,
+                "An unusable manual Sanwa clock remained the rough anchor");
+        }
         const auto lap_17 = std::find_if(session.laps.begin(), session.laps.end(), [](const racebox::LapInfo& lap) { return lap.raw_lap == 17; });
         require(lap_17 != session.laps.end(), "Raw lap 17 missing");
         close_to(seconds(lap_17->duration_us), 16.280, 0.002, "16.280 lap changed");

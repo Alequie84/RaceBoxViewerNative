@@ -11,6 +11,18 @@
 namespace racebox {
 namespace {
 
+struct SettingsProfileState {
+    std::mutex mutex;
+    bool initialized{};
+    bool demo{};
+    std::filesystem::path directory;
+};
+
+SettingsProfileState& settings_profile_state() {
+    static SettingsProfileState state;
+    return state;
+}
+
 std::filesystem::path local_app_data_root() {
     PWSTR raw_path = nullptr;
     std::filesystem::path path;
@@ -54,16 +66,32 @@ void migrate_legacy_settings_once(
 
 }  // namespace
 
+bool configure_settings_profile(bool demo_profile) noexcept {
+    auto& state = settings_profile_state();
+    std::scoped_lock lock(state.mutex);
+    if (state.initialized) return state.demo == demo_profile;
+    state.demo = demo_profile;
+    return true;
+}
+
+bool demo_settings_profile() noexcept {
+    auto& state = settings_profile_state();
+    std::scoped_lock lock(state.mutex);
+    return state.demo;
+}
+
 std::filesystem::path settings_directory() {
-    static std::once_flag initialize;
-    static std::filesystem::path path;
-    std::call_once(initialize, [] {
+    auto& state = settings_profile_state();
+    std::scoped_lock lock(state.mutex);
+    if (!state.initialized) {
         const auto root = local_app_data_root();
-        path = root / L"RaceBoxTelemetryViewer" / L"2";
-        std::filesystem::create_directories(path);
-        migrate_legacy_settings_once(root, path);
-    });
-    return path;
+        state.directory = root / L"RaceBoxTelemetryViewer" /
+            (state.demo ? L"2-demo" : L"2");
+        std::filesystem::create_directories(state.directory);
+        if (!state.demo) migrate_legacy_settings_once(root, state.directory);
+        state.initialized = true;
+    }
+    return state.directory;
 }
 
 std::filesystem::path log_directory() {

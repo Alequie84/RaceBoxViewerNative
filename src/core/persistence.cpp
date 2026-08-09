@@ -184,10 +184,16 @@ json manifest_for(const Session& session, std::string_view format) {
             {"correction_us", session.alignment.fine_correction_us}, {"trigger_sign", session.alignment.trigger_sign},
             {"steering_sign", session.alignment.steering_sign}, {"steering_response_us", session.alignment.steering_response_us},
             {"throttle_response_us", session.alignment.throttle_response_us},
+            {"launch_cue_used", session.alignment.launch_cue_used},
+            {"altitude_supported", session.alignment.altitude_supported},
+            {"steering_yaw_source", session.alignment.steering_yaw_source},
             {"merge_confidence", session.alignment.merge_confidence},
             {"trigger_correlation", session.alignment.trigger_correlation},
             {"direction_agreement", session.alignment.direction_agreement},
             {"steering_yaw_correlation", session.alignment.steering_yaw_correlation},
+            {"steering_heading_correlation", session.alignment.steering_heading_correlation},
+            {"heading_gps_yaw_correlation", session.alignment.heading_gps_yaw_correlation},
+            {"gps_yaw_samples", session.alignment.gps_yaw_samples},
             {"lap_steering_correlation", session.alignment.lap_steering_correlation},
             {"confidence", session.alignment.confidence}, {"reason", session.alignment.reason}}},
         {"map", {{"offset_x", session.map_background.offset_x}, {"offset_y", session.map_background.offset_y},
@@ -563,12 +569,22 @@ bool load_session_archive(const std::filesystem::path& source, Session& session,
         session.alignment.fine_correction_us = alignment.value("correction_us", 0LL);
         session.alignment.trigger_sign = alignment.value("trigger_sign", 1);
         session.alignment.steering_sign = alignment.value("steering_sign", 1);
+        session.alignment.launch_cue_used = alignment.value("launch_cue_used", false);
+        session.alignment.altitude_supported = alignment.value("altitude_supported", false);
+        session.alignment.steering_yaw_source = alignment.value(
+            "steering_yaw_source", std::string{"none"});
         session.alignment.throttle_response_us = alignment.value("throttle_response_us", 180000LL);
         session.alignment.steering_response_us = alignment.value("steering_response_us", 220000LL);
         session.alignment.merge_confidence = alignment.value("merge_confidence", 0.0);
         session.alignment.trigger_correlation = alignment.value("trigger_correlation", 0.0);
         session.alignment.direction_agreement = alignment.value("direction_agreement", 0.0);
         session.alignment.steering_yaw_correlation = alignment.value("steering_yaw_correlation", 0.0);
+        session.alignment.steering_heading_correlation = alignment.value(
+            "steering_heading_correlation", 0.0);
+        session.alignment.heading_gps_yaw_correlation = alignment.value(
+            "heading_gps_yaw_correlation", 0.0);
+        session.alignment.gps_yaw_samples = alignment.value(
+            "gps_yaw_samples", std::size_t{});
         session.alignment.lap_steering_correlation = alignment.value("lap_steering_correlation", 0.0);
         session.alignment.confidence = alignment.value("confidence", "none");
         session.alignment.reason = alignment.value("reason", "Loaded archive");

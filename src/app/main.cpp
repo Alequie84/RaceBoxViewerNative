@@ -1,5 +1,9 @@
 #include "native_app.hpp"
+#include "ui_preferences.hpp"
 #include "ui_theme.hpp"
+#if defined(RACEBOX_ENABLE_CODEX_REVIEW)
+#include "codex_review.hpp"
+#endif
 
 #include <d3d11.h>
 #include <dbghelp.h>
@@ -11,8 +15,11 @@
 #include <imgui_impl_win32.h>
 #include <implot.h>
 
+#include <algorithm>
+#include <cwctype>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <shellapi.h>
 #include <string>
 #include <string_view>
@@ -28,6 +35,7 @@ IDXGISwapChain* g_swap_chain{};
 ID3D11RenderTargetView* g_render_target{};
 bool g_software_renderer{};
 float g_pending_dpi_scale{};
+racebox::app::NativeApp* g_app{};
 
 std::vector<std::filesystem::path> bundled_demo_files() {
     wchar_t executable_path[MAX_PATH]{};
@@ -42,6 +50,19 @@ std::vector<std::filesystem::path> bundled_demo_files() {
         if (!std::filesystem::is_regular_file(file)) return {};
     }
     return files;
+}
+
+std::vector<std::filesystem::path> remembered_session_files(
+    const racebox::app::UiPreferences& preferences) {
+    if (preferences.recent_session_files.empty()) return {};
+    for (const auto& file : preferences.recent_session_files) {
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(file, error) || error ||
+            std::filesystem::file_size(file, error) == 0 || error) {
+            return {};
+        }
+    }
+    return preferences.recent_session_files;
 }
 
 void release_render_target() {
@@ -139,6 +160,28 @@ LRESULT WINAPI window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lpar
             g_pending_dpi_scale = static_cast<float>(HIWORD(wparam)) / 96.0F;
             return 0;
         }
+        case WM_CLOSE:
+            if (g_app) {
+                g_app->request_close();
+                return 0;
+            }
+            break;
+        case WM_DROPFILES: {
+            const auto drop = reinterpret_cast<HDROP>(wparam);
+            const auto count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+            std::vector<std::filesystem::path> files;
+            files.reserve(count);
+            for (UINT index = 0; index < count; ++index) {
+                const auto length = DragQueryFileW(drop, index, nullptr, 0);
+                std::wstring path(length + 1, L'\0');
+                DragQueryFileW(drop, index, path.data(), length + 1);
+                path.resize(length);
+                files.emplace_back(std::move(path));
+            }
+            DragFinish(drop);
+            if (g_app && !files.empty()) g_app->drop_files(files);
+            return 0;
+        }
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
@@ -154,17 +197,63 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
     bool force_warp = false;
     bool soak_mode = false;
+    bool demo_profile = false;
+#if defined(RACEBOX_ENABLE_CODEX_REVIEW)
+    bool capture_review_once = false;
+#endif
     std::vector<std::filesystem::path> startup_files;
+    std::optional<std::filesystem::path> startup_race_day;
     int argument_count = 0;
     if (auto** arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count)) {
         for (int index = 1; index < argument_count; ++index) {
             if (std::wstring_view(arguments[index]) == L"--warp") force_warp = true;
             else if (std::wstring_view(arguments[index]) == L"--soak") soak_mode = true;
-            else startup_files.emplace_back(arguments[index]);
+            else if (std::wstring_view(arguments[index]) == L"--demo-profile") demo_profile = true;
+#if defined(RACEBOX_ENABLE_CODEX_REVIEW)
+            else if (std::wstring_view(arguments[index]) == L"--capture-review-once") capture_review_once = true;
+#endif
+            else {
+                std::filesystem::path candidate(arguments[index]);
+                auto extension = candidate.extension().wstring();
+                std::transform(extension.begin(), extension.end(), extension.begin(), ::towlower);
+                if (extension == L".rbxday") startup_race_day = std::move(candidate);
+                else startup_files.emplace_back(std::move(candidate));
+            }
         }
         LocalFree(arguments);
     }
-    if (startup_files.empty()) startup_files = bundled_demo_files();
+    if (!racebox::configure_settings_profile(demo_profile)) {
+        CoUninitialize();
+        return 1;
+    }
+
+    const auto instance_name = demo_profile
+        ? L"Local\\RaceBoxTelemetryViewer-v2-demo"
+        : L"Local\\RaceBoxTelemetryViewer-v2-normal";
+    HANDLE instance_mutex = CreateMutexW(nullptr, FALSE, instance_name);
+    if (!instance_mutex) {
+        CoUninitialize();
+        return 1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        const auto title = demo_profile
+            ? L"RaceBox Telemetry Viewer 2 [Demo]"
+            : L"RaceBox Telemetry Viewer 2";
+        if (const auto existing = FindWindowW(L"RaceBoxTelemetryViewerWindow", title)) {
+            if (IsIconic(existing)) ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+        }
+        CloseHandle(instance_mutex);
+        CoUninitialize();
+        return 0;
+    }
+    const auto startup_preferences = racebox::app::load_ui_preferences(
+        racebox::settings_directory() / L"preferences.json");
+    if (startup_files.empty() && demo_profile) {
+        startup_files = remembered_session_files(
+            startup_preferences.preferences);
+    }
+    if (startup_files.empty() && demo_profile) startup_files = bundled_demo_files();
 
     auto large_icon = LoadIconW(instance, MAKEINTRESOURCEW(101));
     auto small_icon = LoadIconW(instance, MAKEINTRESOURCEW(101));
@@ -174,13 +263,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
         large_icon, nullptr, nullptr, nullptr,
         L"RaceBoxTelemetryViewerWindow", small_icon};
     RegisterClassExW(&window_class);
-    const auto window = CreateWindowW(window_class.lpszClassName, L"RaceBox Telemetry Viewer 2",
+    const auto window_title = demo_profile
+        ? L"RaceBox Telemetry Viewer 2 [Demo]"
+        : L"RaceBox Telemetry Viewer 2";
+    const auto window = CreateWindowW(window_class.lpszClassName, window_title,
         WS_OVERLAPPEDWINDOW, 80, 60, 1600, 950, nullptr, nullptr, instance, nullptr);
     if (!window) {
         UnregisterClassW(window_class.lpszClassName, instance);
+        CloseHandle(instance_mutex);
         CoUninitialize();
         return 1;
     }
+    DragAcceptFiles(window, TRUE);
 
     if (force_warp || !create_device(window, D3D_DRIVER_TYPE_HARDWARE)) {
         g_software_renderer = true;
@@ -189,6 +283,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
                         L"RaceBox Telemetry Viewer 2", MB_ICONERROR);
             DestroyWindow(window);
             UnregisterClassW(window_class.lpszClassName, instance);
+            CloseHandle(instance_mutex);
             CoUninitialize();
             return 1;
         }
@@ -207,15 +302,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
     io.IniFilename = ini_path.c_str();
     const auto font = racebox::app::ui::load_windows_ui_font(io);
     racebox::write_log(std::string("UI font: ") + font.family);
-    racebox::app::ui::apply_theme(racebox::app::ui::ThemeMode::Dark,
+    racebox::app::ui::apply_theme(
+        startup_preferences.preferences.light_theme
+            ? racebox::app::ui::ThemeMode::Light
+            : racebox::app::ui::ThemeMode::Dark,
         racebox::app::ui::dpi_scale_for_window(window));
     ImGui_ImplWin32_Init(window);
     ImGui_ImplDX11_Init(g_device, g_context);
 
     racebox::app::NativeApp app(window, g_device, g_software_renderer);
+    g_app = &app;
     if (soak_mode) app.enable_soak_mode();
-    if (!startup_files.empty()) app.open_files(startup_files);
+    if (startup_race_day) app.open_race_day_document(*startup_race_day);
+    else if (!startup_files.empty()) app.open_files(startup_files);
     bool running = true;
+#if defined(RACEBOX_ENABLE_CODEX_REVIEW)
+    int capture_review_countdown = capture_review_once ? 120 : -1;
+#endif
     while (running) {
         MSG message{};
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
@@ -233,6 +336,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
+#if defined(RACEBOX_ENABLE_CODEX_REVIEW)
+        if (capture_review_countdown > 0) --capture_review_countdown;
+        else if (capture_review_countdown == 0) {
+            app.request_codex_review();
+            capture_review_countdown = -1;
+        }
+#endif
         if (!app.render()) running = false;
         ImGui::Render();
 
@@ -241,16 +351,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show_command) {
         g_context->OMSetRenderTargets(1, &g_render_target, nullptr);
         g_context->ClearRenderTargetView(g_render_target, clear_color);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+#if defined(RACEBOX_ENABLE_CODEX_REVIEW)
+        if (app.consume_codex_review_request()) {
+            const auto capture = racebox::app::codex_review::capture(
+                g_device, g_context, g_swap_chain,
+                app.codex_review_context());
+            app.complete_codex_review(capture.ok, capture.error);
+        }
+#endif
         g_swap_chain->Present(1, 0);
     }
 
     ImGui_ImplDX11_Shutdown();
+    g_app = nullptr;
     ImGui_ImplWin32_Shutdown();
     ImPlot::DestroyContext();
     ImGui::DestroyContext();
     release_device();
     DestroyWindow(window);
     UnregisterClassW(window_class.lpszClassName, instance);
+    CloseHandle(instance_mutex);
     CoUninitialize();
     return 0;
 }

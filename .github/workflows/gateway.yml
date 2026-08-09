@@ -1,0 +1,45 @@
+name: Cross-platform gateway
+
+on:
+  push:
+    branches: [v2]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: gateway
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Gateway, mock OpenClaw, setup, startup, and rollback tests
+        run: python -m unittest -v test_gateway.py test_setup_common.py
+      - name: PowerShell helper syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $syntaxTokens = $null
+          $syntaxErrors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path './setup-gateway.ps1'),
+            [ref]$syntaxTokens,
+            [ref]$syntaxErrors)
+          if ($syntaxErrors.Count) { throw ($syntaxErrors | Out-String) }
+          ./setup-gateway.ps1 -TailscaleIp 100.64.10.20 -DryRun
+      - name: Bash helper syntax and dry run
+        if: runner.os == 'Linux'
+        run: |
+          bash -n ./setup-gateway.sh
+          ./setup-gateway.sh --tailscale-ip 100.64.10.20 --dry-run

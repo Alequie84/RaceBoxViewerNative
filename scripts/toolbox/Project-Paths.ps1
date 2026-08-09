@@ -1,7 +1,11 @@
 $ErrorActionPreference = 'Stop'
 
 $script:RaceBoxNativeRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
-$script:RaceBoxBrowserRoot = 'C:\CodexProjects\New project 2'
+$script:RaceBoxBrowserRoot = if ($env:RACEBOX_BROWSER_REFERENCE_ROOT) {
+    [IO.Path]::GetFullPath($env:RACEBOX_BROWSER_REFERENCE_ROOT)
+} else {
+    Join-Path $script:RaceBoxNativeRoot 'reference\browser'
+}
 $script:RaceBoxReleaseDirectory = Join-Path $script:RaceBoxNativeRoot 'build\release'
 $script:RaceBoxExecutable = Join-Path $script:RaceBoxReleaseDirectory 'RaceBoxTelemetryViewer.exe'
 $script:RaceBoxCliExecutable = Join-Path $script:RaceBoxReleaseDirectory 'racebox_cli.exe'

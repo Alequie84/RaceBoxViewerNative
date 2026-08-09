@@ -191,7 +191,9 @@ void apply_imgui_style(float scale) {
     style.SeparatorTextPadding = {16.0F * scale, 4.0F * scale};
     style.DisplayWindowPadding = {18.0F * scale, 18.0F * scale};
     style.DisplaySafeAreaPadding = {3.0F * scale, 3.0F * scale};
-    style.DockingSeparatorSize = 1.0F * scale;
+    // The map/telemetry divider is an everyday control, including while the
+    // rest of the dock layout is locked or annotation mode is active.
+    style.DockingSeparatorSize = 7.0F * scale;
     style.DragDropTargetRounding = 4.0F * scale;
     style.DragDropTargetBorderSize = 2.0F * scale;
     style.DragDropTargetPadding = 3.0F * scale;

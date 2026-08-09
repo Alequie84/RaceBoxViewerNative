@@ -8,3 +8,26 @@ __pycache__/
 *.pyc
 *.user
 *.pdb
+
+# Android local/build state
+/android/.gradle/
+/android/.kotlin/
+/android/local.properties
+/android/**/build/
+
+# Gateway private/runtime state
+/gateway/.env
+/gateway/*.env
+!/gateway/.env.example
+/gateway/*.sqlite3
+/gateway/transcript-backups/
+/gateway/dist/
+
+# Release-only generated media intermediates (keep the final demo video)
+/docs/video/capture-*
+/docs/video/racebox-demo-raw.mp4
+/docs/video/racebox-demo-voice.mp3
+/docs/video/verify-*.png
+
+# Never commit local handoff/recovery scratch files
+/CHAT-RECOVERY-HANDOFF-*.md

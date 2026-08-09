@@ -19,7 +19,9 @@ notarization remain disabled until their macOS service adapters are completed.
 
 ## Requirements
 
-- Apple Silicon Mac running macOS 13 or newer.
+- Apple Silicon Mac running macOS 13.3 or newer. The shared C++20 analysis
+  core uses floating-point `std::format`, whose Apple runtime support begins
+  at macOS 13.3.
 - Apple Command Line Tools (`xcode-select --install`). The full Xcode app is
   not required for this preview.
 - CMake 3.25 or newer.

@@ -20,13 +20,29 @@ enum class TelemetryPlotId {
     Steering,
 };
 
-inline constexpr std::array<TelemetryPlotId, 6> kDefaultTelemetryPlotOrder{
+inline constexpr std::array<TelemetryPlotId, 6> kAllTelemetryPlotIds{
     TelemetryPlotId::RelativeTime,
     TelemetryPlotId::Speed,
     TelemetryPlotId::LateralG,
     TelemetryPlotId::LongitudinalG,
     TelemetryPlotId::Controls,
     TelemetryPlotId::Steering,
+};
+
+inline constexpr std::array<TelemetryPlotId, 4> kPairedTelemetryPlotOrder{
+    TelemetryPlotId::RelativeTime,
+    TelemetryPlotId::Speed,
+    TelemetryPlotId::LateralG,
+    TelemetryPlotId::LongitudinalG,
+};
+
+inline constexpr std::array<TelemetryPlotId, 6> kAllSeparateTelemetryPlotOrder{
+    TelemetryPlotId::RelativeTime,
+    TelemetryPlotId::Speed,
+    TelemetryPlotId::LateralG,
+    TelemetryPlotId::Steering,
+    TelemetryPlotId::LongitudinalG,
+    TelemetryPlotId::Controls,
 };
 
 constexpr std::string_view telemetry_plot_key(TelemetryPlotId id) {
@@ -41,12 +57,14 @@ constexpr std::string_view telemetry_plot_key(TelemetryPlotId id) {
     return "speed";
 }
 
-constexpr std::string_view telemetry_plot_name(TelemetryPlotId id) {
+constexpr std::string_view telemetry_plot_name(TelemetryPlotId id, bool paired = false) {
     switch (id) {
         case TelemetryPlotId::RelativeTime: return "Relative time";
         case TelemetryPlotId::Speed: return "Speed";
-        case TelemetryPlotId::LateralG: return "Lateral G";
-        case TelemetryPlotId::LongitudinalG: return "Longitudinal G";
+        case TelemetryPlotId::LateralG:
+            return paired ? "Lateral G + Steering" : "Lateral G";
+        case TelemetryPlotId::LongitudinalG:
+            return paired ? "Longitudinal G + Throttle / Brake" : "Longitudinal G";
         case TelemetryPlotId::Controls: return "Throttle / Brake";
         case TelemetryPlotId::Steering: return "Steering";
     }
@@ -54,27 +72,34 @@ constexpr std::string_view telemetry_plot_name(TelemetryPlotId id) {
 }
 
 constexpr std::optional<TelemetryPlotId> telemetry_plot_id(std::string_view key) {
-    for (const auto id : kDefaultTelemetryPlotOrder) {
+    for (const auto id : kAllTelemetryPlotIds) {
         if (telemetry_plot_key(id) == key) return id;
     }
     return std::nullopt;
 }
 
-inline std::vector<TelemetryPlotId> normalize_telemetry_plot_order(std::span<const std::string> keys) {
+inline std::vector<TelemetryPlotId> normalize_telemetry_plot_order(
+    std::span<const std::string> keys, bool all_separate = false) {
     std::vector<TelemetryPlotId> result;
-    result.reserve(kDefaultTelemetryPlotOrder.size());
+    result.reserve(kAllTelemetryPlotIds.size());
     for (const auto& key : keys) {
         const auto id = telemetry_plot_id(key);
         if (id && std::find(result.begin(), result.end(), *id) == result.end()) result.push_back(*id);
     }
-    for (const auto id : kDefaultTelemetryPlotOrder) {
+    const auto required = all_separate
+        ? std::span<const TelemetryPlotId>{kAllSeparateTelemetryPlotOrder}
+        : std::span<const TelemetryPlotId>{kPairedTelemetryPlotOrder};
+    for (const auto id : required) {
         if (std::find(result.begin(), result.end(), id) == result.end()) result.push_back(id);
     }
     return result;
 }
 
-inline std::vector<TelemetryPlotId> default_telemetry_plot_order() {
-    return {kDefaultTelemetryPlotOrder.begin(), kDefaultTelemetryPlotOrder.end()};
+inline std::vector<TelemetryPlotId> default_telemetry_plot_order(bool all_separate = true) {
+    if (all_separate) {
+        return {kAllSeparateTelemetryPlotOrder.begin(), kAllSeparateTelemetryPlotOrder.end()};
+    }
+    return {kPairedTelemetryPlotOrder.begin(), kPairedTelemetryPlotOrder.end()};
 }
 
 // target_visible_gap is a gap in the currently visible list: zero is before the

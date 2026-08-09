@@ -1,37 +1,32 @@
 # RaceBox Telemetry Viewer 2 Architecture
 
-Version `2.0.0.001` is a controlled rebuild around the proven native telemetry
+Version 2 is a controlled rebuild around the proven native telemetry
 engine. It is not a rewrite of the parser, clock alignment, lap timing, map
 calibration, IMU analysis, or deterministic insight formulas.
 
 ## Product shell
 
-The Windows release is `RaceBoxTelemetryViewer.exe`. Its guided shell exposes
-five driver-facing workspaces:
+The Windows release is `RaceBoxTelemetryViewer.exe`. Its guided shell has a
+persistent Race Day panel, five center views, and a persistent Crew Chief panel:
 
-1. **Race Day** — unified session import and Practice/Qualifying/Race
-   classification, canonical UTC recording time plus its local event date,
-   persistent bounded folder discovery, confirmed Sanwa removable-drive
-   discovery, browser-managed official RaceBox cloud export, responsive
-   Runs/Selected Run/Crew Chief navigation, per-run source management,
-   pre-run checklist, setup and conditions, post-run notes, tire history, and
-   previous/current setup analysis through the primary Crew Chief workflow.
-2. **Session** — the normal map, playback, lap list, telemetry, events, sectors,
-   notes, and annotations, with a visible Race Day run selector that identifies
-   and loads the displayed recording.
-3. **Compare** — Reference plus Compare A, with optional Compare B and an
-   independent Playback lap.
-4. **Analysis** — deterministic insights, disclosed rules/formulas, and
-   developer notes. The private Crew Chief is intentionally kept in Race Day
-   beside the setup and run context it analyzes.
-5. **Reports** — session summary, lap table, theoretical sectors,
-   deterministic findings, and the existing export actions.
+1. **Race Day panel** — chronological Practice/Qualifying/Race runs, readiness,
+   explicit import/source repair, selected Current run, and automatic/overridden
+   nearest Previous run.
+2. **Run** — one scrollable identity, tire preparation, setup, source-health,
+   comments, and collapsed secondary-details page.
+3. **Telemetry / Compare** — the compact map, inline playback, all-separate
+   channel graphs, optional advanced panels, and distance-aligned comparison roles.
+4. **Findings / Report** — deterministic insights/rules/notes and the existing
+   summaries/exports.
+5. **Crew Chief panel** — one filterable day timeline with explicit Current-only
+   and Previous-to-Current actions. Changing the center view never resets it.
 
-The default dock arrangement is locked to prevent accidental panel moves.
-**Layout: Locked / Custom** deliberately enables panel and splitter editing.
-Text scale, theme, comparison choices, graph order, and layout mode persist.
-Errors and background-job state are shown in the global header instead of being
-hidden inside the Playback panel.
+The default dock arrangement is locked to prevent accidental panel moves. The
+map/graph divider deliberately remains draggable and defaults to 32/68. Side
+panels resize/collapse to rails and become overlays at narrow widths. Text scale,
+theme, center view, side-panel widths/visibility, map ratio, comparison choices,
+graph order, palettes, focus state, and layout mode persist in UI-preferences
+version 6.
 
 ## Target boundaries
 
@@ -93,9 +88,13 @@ work should implement adapters behind the existing contracts instead of adding
 - New archives use manifest version 2 and store the versioned workspace as a
   bounded `workspace.json` entry. Writes use a same-directory temporary file
   and atomic replacement so a failed save does not destroy the previous file.
-- Race Day version 3 stores privacy-bounded source identities beside local
-  relative paths. The identity contains basename, size, timestamp, and an
-  optional algorithm-tagged fingerprint—never telemetry contents.
+- Race Day version 6 stores privacy-bounded source identities, car-profile and
+  setup-revision references plus bounded snapshots, Setup Sheet ON/OFF and
+  known/untracked changes, and up to 2,000 day-level Crew Chief turns with ID,
+  timestamp, role, content, origin, linked run IDs, and comparison ID. Versions
+  1–5 migrate without duplicate legacy turns. Source identity contains basename,
+  size, timestamp, and an optional algorithm-tagged fingerprint—never telemetry
+  contents.
 - A run also stores its detected UTC recording time. Every interactive file,
   folder, or USB import enters Race Day, classifies the loaded recording, and
   assigns it to a Race Day slot; source
@@ -107,8 +106,16 @@ work should implement adapters behind the existing contracts instead of adding
 - Source repair distinguishes **Exact**, **Probable**, **Ambiguous**, and
   **Missing**. Only one unique exact fingerprint may relink automatically;
   probable or ambiguous choices require the driver to confirm.
-- UI layout version 4 migrates older layouts once, preserves a pre-v4 backup,
-  and starts with the guided layout locked.
+- UI-preferences version 6 migrates older layouts, validates dimensions and
+  ratios, and recovers malformed state to the guided three-panel defaults.
+- Normal and `--demo-profile` launches use different LocalAppData roots and
+  different single-instance identities. The normal profile starts with a Race
+  Day choice; the demo profile may load bundled/remembered fixtures without
+  changing normal recents or layout.
+- An unnamed event maintains a local recovery draft. A named `.rbxday` autosaves
+  atomically after one quiet second, immediately on run changes and clean close,
+  and retains five bounded recovery generations. A failed save leaves the event
+  dirty and visible as failed.
 - Local UI preferences retain the telemetry import folder and Sanwa USB
   auto-detect toggle. Folder and removable-drive scans stay in the Windows app
   adapter, are bounded and read-only, recognize CSV sources by header, and
@@ -127,7 +134,8 @@ Every Windows release must:
 3. pass analysis, IMU, Crew Chief, Race Day, archive migration, source matching,
    application-state, UI-preference, WARP, plot-order, and memory tests;
 4. verify the portable package contains the executable, CLI, version, launcher,
-   documentation, and all three demo inputs;
+   documentation, and all three demo inputs, while its executable contains no
+   development Codex Review controls, flag/capture paths, or review contract;
 5. launch the freshly built executable with VBO, RaceBox CSV, and Sanwa data;
 6. visually check all five workspaces at normal and enlarged text sizes.
 

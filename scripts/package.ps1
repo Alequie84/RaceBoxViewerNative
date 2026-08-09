@@ -7,8 +7,8 @@ $releaseVersion = (Get-Content -LiteralPath $versionPath -Raw).Trim()
 if ($releaseVersion -notmatch '^\d+\.\d+\.\d+\.\d{3}$') {
     throw "VERSION must use major.minor.patch.build with a three-digit build number: $releaseVersion"
 }
-$preset = if ($Configuration -eq 'Release') { 'windows-release' } else { 'windows-debug' }
-$buildPreset = if ($Configuration -eq 'Release') { 'release' } else { 'debug' }
+$preset = if ($Configuration -eq 'Release') { 'windows-distribution' } else { 'windows-debug' }
+$buildPreset = if ($Configuration -eq 'Release') { 'distribution' } else { 'debug' }
 $packageName = if ($Configuration -eq 'Release') { "RaceBoxTelemetryViewer-$releaseVersion-win64" } else { "RaceBoxTelemetryViewer-$releaseVersion-debug-win64" }
 $packageRoot = Join-Path $root 'package'
 $installRoot = Join-Path $packageRoot $(if ($Configuration -eq 'Release') {
@@ -31,7 +31,11 @@ if (-not $resolvedInstall.StartsWith($resolvedPackage + [IO.Path]::DirectorySepa
 }
 if (-not $resolvedOut.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Output path escaped the project root.' }
 
-$buildDirectory = Join-Path $root ('build\' + $Configuration.ToLowerInvariant())
+$buildDirectory = Join-Path $root $(if ($Configuration -eq 'Release') {
+    'build\distribution'
+} else {
+    'build\debug'
+})
 function Invoke-DeveloperCommand([string]$Command) {
     $line = 'call "' + $developerShell + '" -arch=x64 >nul && ' + $Command
     cmd.exe /d /c $line
@@ -71,14 +75,19 @@ try {
 
     $requiredPackageFiles = @(
         'RaceBoxTelemetryViewer.exe',
+        'pdfium.dll',
         'racebox_cli.exe',
         'VERSION',
         'README.md',
         'HANDOFF.md',
+        'LICENSE',
+        'THIRD-PARTY-NOTICES.md',
         'Start RaceBox Demo.cmd',
         'assets\rrr-map.png',
         'assets\rrr-map-original.png',
         'docs\race-day-crew-chief.md',
+        'docs\public-connection-guide.md',
+        'docs\codex-review.md',
         'docs\v2-architecture.md',
         'demo\session.vbo',
         'demo\session.csv',
@@ -86,7 +95,9 @@ try {
         'licenses\imgui-LICENSE.txt',
         'licenses\implot-LICENSE.txt',
         'licenses\miniz-LICENSE.txt',
-        'licenses\nlohmann-json-LICENSE.MIT'
+        'licenses\nlohmann-json-LICENSE.MIT',
+        'licenses\pdfium-LICENSE.txt',
+        'licenses\qrcodegen-LICENSE-AND-README.md'
     )
     foreach ($relativePath in $requiredPackageFiles) {
         $requiredPath = Join-Path $resolvedInstall $relativePath
@@ -97,6 +108,23 @@ try {
     $installedVersion = (Get-Content -LiteralPath (Join-Path $resolvedInstall 'VERSION') -Raw).Trim()
     if ($installedVersion -ne $releaseVersion) {
         throw "Packaged VERSION mismatch: expected $releaseVersion, found $installedVersion"
+    }
+    if ($Configuration -eq 'Release') {
+        $viewerBytes = [IO.File]::ReadAllBytes((Join-Path $resolvedInstall 'RaceBoxTelemetryViewer.exe'))
+        $viewerAscii = [Text.Encoding]::ASCII.GetString($viewerBytes)
+        $viewerUnicode = [Text.Encoding]::Unicode.GetString($viewerBytes)
+        foreach ($forbidden in @(
+            'racebox-codex-review',
+            'active-review.png',
+            'Refresh Codex Review',
+            'ANNOTATE',
+            'racebox-annotation-review',
+            'Annotation mode'
+        )) {
+            if ($viewerAscii.Contains($forbidden) -or $viewerUnicode.Contains($forbidden)) {
+                throw "Distribution contains development-only review text: $forbidden"
+            }
+        }
     }
 
     New-Item -ItemType Directory -Force -Path $outRoot | Out-Null

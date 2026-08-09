@@ -19,10 +19,15 @@ import statistics
 from pathlib import Path
 
 
-SOURCE_ROOTS = (
-    Path(r"C:\Users\aalex\Downloads"),
-    Path(r"C:\Users\aalex\OneDrive\Documentos\datalogger"),
-    Path(r"C:\Users\aalex\OneDrive\Documentos\race box"),
+_configured_roots = os.environ.get("RACEBOX_AUDIT_SOURCE_ROOTS", "").strip()
+SOURCE_ROOTS = tuple(
+    Path(item).expanduser()
+    for item in _configured_roots.split(os.pathsep)
+    if item.strip()
+) or (
+    Path.home() / "Downloads",
+    Path.home() / "Documents" / "datalogger",
+    Path.home() / "Documents" / "race box",
 )
 
 

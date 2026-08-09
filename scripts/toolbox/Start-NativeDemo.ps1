@@ -24,8 +24,11 @@ Assert-RaceBoxPath -LiteralPath $Vbo -Description 'VBO fixture'
 Assert-RaceBoxPath -LiteralPath $RaceBoxCsv -Description 'RaceBox CSV fixture'
 Assert-RaceBoxPath -LiteralPath $SanwaCsv -Description 'Sanwa CSV fixture'
 
-$quotedArguments = @($Vbo, $RaceBoxCsv, $SanwaCsv) |
-    ForEach-Object { ConvertTo-RaceBoxArgument ([IO.Path]::GetFullPath($_)) }
+$quotedArguments = @('--demo-profile') + @($Vbo, $RaceBoxCsv, $SanwaCsv) |
+    ForEach-Object {
+        if ($_ -eq '--demo-profile') { $_ }
+        else { ConvertTo-RaceBoxArgument ([IO.Path]::GetFullPath($_)) }
+    }
 $argumentLine = [string]::Join(' ', $quotedArguments)
 
 $process = Start-Process -FilePath $RaceBoxExecutable -WorkingDirectory $RaceBoxNativeRoot -ArgumentList $argumentLine -PassThru

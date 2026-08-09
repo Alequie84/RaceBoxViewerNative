@@ -5,6 +5,7 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <span>
@@ -15,10 +16,66 @@
 namespace racebox::race_day {
 
 inline constexpr std::string_view kFileFormat{"racebox-race-day"};
-inline constexpr int kFileVersion = 3;
+inline constexpr int kFileVersion = 6;
 inline constexpr std::string_view kAnalyticsCsvVersion{"racebox-session-analytics-csv-v1"};
 inline constexpr std::string_view kSetupAnalyticsVersion{"racebox-setup-analytics-v3"};
 inline constexpr std::size_t kMaximumSetupKnowledgeRecords = 200;
+inline constexpr std::size_t kMaximumSessionChatTurns = 2'000;
+
+struct SessionChatTurn {
+    std::string role;
+    std::string content;
+    std::string id;
+    std::int64_t created_at{};
+    std::string origin;
+    // Version 6 keeps one chronological Race Day conversation. A turn can
+    // describe one run or a controlled Previous -> Current comparison.
+    std::vector<std::string> linked_run_ids;
+    std::string comparison_id;
+};
+
+struct CarProfileSnapshot {
+    std::string id;
+    std::string name;
+    std::string brand;
+    std::string model;
+    std::string chassis;
+    std::string motor;
+    std::string esc;
+    std::string servo;
+    std::string receiver;
+    std::string radio;
+    std::string gearing;
+    std::string notes;
+};
+
+struct SetupFieldValue {
+    std::string key;
+    std::string label;
+    std::string section;
+    std::string value;
+    std::string unit;
+    int page{};
+    double left{};
+    double top{};
+    double right{};
+    double bottom{};
+    int confidence{};
+    bool confirmed{};
+};
+
+struct SetupSheetSnapshot {
+    std::string template_id;
+    std::string revision_id;
+    std::string parent_revision_id;
+    std::string display_name;
+    std::string source_sha256;
+    std::string rendered_sha256;
+    bool partially_known{};
+    bool needs_reconciliation{};
+    std::string untracked_changes;
+    std::vector<SetupFieldValue> fields;
+};
 
 enum class RunKind {
     Practice,
@@ -69,6 +126,11 @@ struct Run {
     std::string setup_changes;
     std::string post_run_notes;
     Conditions conditions;
+    bool setup_sheet_enabled{};
+    SetupSheetSnapshot setup_sheet;
+    // Per-run Crew Chief conversation. The Race Day file stores a bounded
+    // transcript so follow-up questions survive run switching and restarts.
+    std::vector<SessionChatTurn> session_chat;
 };
 
 struct SetupKnowledgeEvidence {
@@ -200,9 +262,18 @@ struct Day {
     std::string event_name;
     std::string track_name;
     std::string date;
+    std::string car_profile_id;
+    CarProfileSnapshot car_profile;
     std::vector<Run> runs;
+    // Canonical v6 conversation. Per-run session_chat remains populated for
+    // backward compatibility with the phone/viewer v5 rollout.
+    std::vector<SessionChatTurn> conversation;
     std::vector<SetupKnowledgeRecord> setup_knowledge;
 };
+
+// Rebuilds the canonical chronological conversation from legacy per-run
+// transcripts, de-duplicates stable IDs, and back-fills run links.
+void normalize_day_conversation(Day& day);
 
 [[nodiscard]] std::vector<ChecklistItem> default_pre_run_checklist();
 [[nodiscard]] Day standard_day(bool include_q4 = false, bool triple_a_main = false);

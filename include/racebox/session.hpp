@@ -43,6 +43,7 @@ struct RadioSeries {
     std::vector<float> voltage;
     std::string filename;
     std::optional<std::int64_t> filename_time_us;
+    std::optional<std::int64_t> file_modified_time_us;
 
     [[nodiscard]] std::size_t size() const noexcept { return elapsed_us.size(); }
     [[nodiscard]] bool empty() const noexcept { return elapsed_us.empty(); }
@@ -93,10 +94,16 @@ struct AlignmentResult {
     Timestamp steering_response_us{220000};
     int trigger_sign{1};
     int steering_sign{1};
+    bool launch_cue_used{};
+    bool altitude_supported{};
+    std::string steering_yaw_source{"none"};
     double merge_confidence{};
     double trigger_correlation{};
     double direction_agreement{};
     double steering_yaw_correlation{};
+    double steering_heading_correlation{};
+    double heading_gps_yaw_correlation{};
+    std::size_t gps_yaw_samples{};
     double lap_steering_correlation{};
     std::string confidence{"none"};
     std::string reason;

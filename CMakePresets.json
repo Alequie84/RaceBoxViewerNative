@@ -10,7 +10,17 @@
         "CMAKE_INSTALL_PREFIX": "${sourceDir}/package/RaceBoxTelemetryViewer",
         "RACEBOX_BUILD_WINDOWS_APP": "ON",
         "RACEBOX_BUILD_CLI": "ON",
+        "RACEBOX_ENABLE_CODEX_REVIEW": "ON",
         "BUILD_TESTING": "ON"
+      }
+    },
+    {
+      "name": "windows-distribution",
+      "inherits": "windows-release",
+      "displayName": "Windows distribution (Codex Review compiled out)",
+      "binaryDir": "${sourceDir}/build/distribution",
+      "cacheVariables": {
+        "RACEBOX_ENABLE_CODEX_REVIEW": "OFF"
       }
     },
     {
@@ -42,7 +52,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_OSX_ARCHITECTURES": "arm64",
-        "CMAKE_OSX_DEPLOYMENT_TARGET": "13.0",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "13.3",
         "RACEBOX_BUILD_WINDOWS_APP": "OFF",
         "RACEBOX_BUILD_MACOS_APP": "ON",
         "RACEBOX_BUILD_CLI": "ON",
@@ -52,12 +62,14 @@
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "windows-release" },
+    { "name": "distribution", "configurePreset": "windows-distribution" },
     { "name": "debug", "configurePreset": "windows-debug" },
     { "name": "portable-core-release", "configurePreset": "portable-core-release" },
     { "name": "macos-release", "configurePreset": "macos-release" }
   ],
   "testPresets": [
     { "name": "release", "configurePreset": "windows-release", "output": { "outputOnFailure": true } },
+    { "name": "distribution", "configurePreset": "windows-distribution", "output": { "outputOnFailure": true } },
     { "name": "debug", "configurePreset": "windows-debug", "output": { "outputOnFailure": true } },
     {
       "name": "portable-core-release",

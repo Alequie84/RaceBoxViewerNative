@@ -511,6 +511,26 @@ struct LineDeviation {
     double progress{};
 };
 
+double corner_turn_sign(
+    const LapView& reference,
+    const GeoFrame& frame,
+    const CornerZone& corner) {
+    const auto before = point_at_progress(reference, frame, std::max(corner.start_progress, corner.apex_progress - 0.01));
+    const auto at = point_at_progress(reference, frame, corner.apex_progress);
+    const auto after = point_at_progress(reference, frame, std::min(corner.end_progress, corner.apex_progress + 0.01));
+    const auto cross = (at.east - before.east) * (after.north - at.north) -
+                       (at.north - before.north) * (after.east - at.east);
+    return cross > 1e-5 ? 1.0 : (cross < -1e-5 ? -1.0 : 0.0);
+}
+
+std::string corner_turn_direction(
+    const LapView& reference,
+    const GeoFrame& frame,
+    const CornerZone& corner) {
+    const auto sign = corner_turn_sign(reference, frame, corner);
+    return sign > 0.0 ? "left" : (sign < 0.0 ? "right" : "");
+}
+
 LineDeviation entry_line_deviation(
     const LapView& reference,
     const LapView& comparison,
@@ -518,12 +538,7 @@ LineDeviation entry_line_deviation(
     const CornerZone& corner,
     const LineTranslation& translation) {
     LineDeviation result{0.0, corner.apex_progress};
-    const auto before = point_at_progress(reference, frame, std::max(corner.start_progress, corner.apex_progress - 0.01));
-    const auto at = point_at_progress(reference, frame, corner.apex_progress);
-    const auto after = point_at_progress(reference, frame, std::min(corner.end_progress, corner.apex_progress + 0.01));
-    const auto cross = (at.east - before.east) * (after.north - at.north) -
-                       (at.north - before.north) * (after.east - at.east);
-    const auto turn_sign = cross > 1e-5 ? 1.0 : (cross < -1e-5 ? -1.0 : 0.0);
+    const auto turn_sign = corner_turn_sign(reference, frame, corner);
 
     for (int sample = 0; sample <= 24; ++sample) {
         const auto ratio = static_cast<double>(sample) / 24.0;
@@ -567,30 +582,32 @@ std::string formatted_value(double value, std::string_view unit) {
     return stream.str();
 }
 
-std::string plain_metric_change(MetricKind kind, double value) {
+std::string plain_metric_change(MetricKind kind, double value, std::string_view turn_direction = {}) {
     const auto magnitude = std::abs(value);
     switch (kind) {
     case MetricKind::BrakePointDelta:
-        return std::format("Braked {:.3f} s {} (brake point)", magnitude, value >= 0.0 ? "later" : "earlier");
+        return std::format("you began braking {:.3f} s {}", magnitude, value >= 0.0 ? "later" : "earlier");
     case MetricKind::TurnInDelta:
-        return std::format("Started steering {:.3f} s {} (turn-in)", magnitude, value >= 0.0 ? "later" : "earlier");
+        return std::format("you began turning {}into the corner {:.3f} s {}",
+            turn_direction.empty() ? "" : std::string(turn_direction) + " ", magnitude,
+            value >= 0.0 ? "later" : "earlier");
     case MetricKind::ApexTimingDelta:
-        return std::format("Reached the middle of the corner {:.3f} s {} (apex)", magnitude,
+        return std::format("you reached the middle of the corner {:.3f} s {}", magnitude,
             value >= 0.0 ? "later" : "earlier");
     case MetricKind::MinimumSpeedDelta:
-        return std::format("Slowest corner speed was {:.1f} km/h {}", magnitude, value >= 0.0 ? "higher" : "lower");
+        return std::format("your lowest corner speed was {:.1f} km/h {}", magnitude, value >= 0.0 ? "higher" : "lower");
     case MetricKind::ExitSpeedDelta:
-        return std::format("Exited the corner {:.1f} km/h {}", magnitude, value >= 0.0 ? "faster" : "slower");
+        return std::format("you left the corner {:.1f} km/h {}", magnitude, value >= 0.0 ? "faster" : "slower");
     case MetricKind::ThrottlePickupDelta:
-        return std::format("Got back on throttle {:.3f} s {} (throttle pickup)", magnitude,
+        return std::format("you began feeding in throttle {:.3f} s {}", magnitude,
             value >= 0.0 ? "later" : "sooner");
     case MetricKind::EntryLineDeviation:
-        return std::format("Entered the corner {:.2f} m {} (entry line)", magnitude,
+        return std::format("your entry path was {:.2f} m {}", magnitude,
             value >= 0.0 ? "farther outside" : "farther inside");
     case MetricKind::RelativeTimeChange:
-        return std::format("Took {:.3f} s {} through the corner", magnitude, value >= 0.0 ? "longer" : "less");
+        return std::format("you took {:.3f} s {} through the corner", magnitude, value >= 0.0 ? "longer" : "less");
     }
-    return "Driving input changed";
+    return "your driving input changed";
 }
 
 std::optional<Insight> make_insight(
@@ -598,7 +615,8 @@ std::optional<Insight> make_insight(
     const CornerZone& corner,
     ComparisonSlot slot,
     std::int32_t raw_lap,
-    double time_effect_s) {
+    double time_effect_s,
+    std::string_view turn_direction) {
     if (!metric.triggered || !metric.value || !metric.rule_id || metric.confidence < 40) return std::nullopt;
     const auto* descriptor = descriptor_for(*metric.rule_id);
     if (!descriptor) return std::nullopt;
@@ -606,11 +624,12 @@ std::optional<Insight> make_insight(
     Insight insight;
     insight.id = std::string(slot_id) + "-lap-" + std::to_string(raw_lap) + "-" + corner.id + "-" +
                  std::string(descriptor->stable_id);
-    insight.title = plain_metric_change(metric.kind, *metric.value);
-    insight.detail = corner.name + ": " + descriptor->name.data() + " " + formatted_value(*metric.value, descriptor->unit) +
-                     " vs reference (threshold " + formatted_value(metric.threshold, descriptor->unit) + ")";
+    insight.title = corner.name + ": " + plain_metric_change(metric.kind, *metric.value, turn_direction);
+    insight.detail = corner.name + ": " + plain_metric_change(metric.kind, *metric.value, turn_direction) +
+                     " than on the reference lap.";
     insight.corner_id = corner.id;
     insight.corner_name = corner.name;
+    insight.turn_direction = turn_direction;
     insight.comparison = slot;
     insight.comparison_raw_lap = raw_lap;
     insight.metric = metric.kind;
@@ -824,7 +843,8 @@ std::optional<ComparisonAnalysis> analyze_comparison(
         const auto time_effect = metric_value(metrics, MetricKind::RelativeTimeChange).value_or(0.0);
         if (emit_insights) {
             for (const auto& metric : metrics.metrics) {
-                if (auto insight = make_insight(metric, corners[index], slot, comparison_lap->raw_lap, time_effect)) {
+                if (auto insight = make_insight(metric, corners[index], slot, comparison_lap->raw_lap, time_effect,
+                        corner_turn_direction(reference, frame, corners[index]))) {
                     aggregate.insights.push_back(std::move(*insight));
                 }
             }
@@ -927,26 +947,26 @@ bool is_line_metric(MetricKind kind) noexcept {
 
 std::string evidence_title(const insight_evidence::Result& evidence) {
     switch (evidence.outcome) {
-    case insight_evidence::Outcome::DataLimited: return "Not enough data to judge";
+    case insight_evidence::Outcome::DataLimited: return "More clean data needed";
     case insight_evidence::Outcome::Inconclusive: return "No clear time difference";
-    case insight_evidence::Outcome::NetLoss: return "This approach lost time";
-    case insight_evidence::Outcome::Compensation: return "Recovered time, but remained behind";
+    case insight_evidence::Outcome::NetLoss: return "Time lost after this corner";
+    case insight_evidence::Outcome::Compensation: return "Some time recovered, but the lap remained behind";
     case insight_evidence::Outcome::RetainedGain:
         if (evidence.recommendation == insight_evidence::Recommendation::RecommendTechnique) {
-            return "Repeatable improvement";
+            return "Repeatable time gain";
         }
         if (evidence.recommendation == insight_evidence::Recommendation::Validate) {
-            return "Promising improvement - test again";
+            return "Promising time gain - test again";
         }
-        return "Possible improvement - needs more laps";
+        return "Possible time gain - needs more laps";
     case insight_evidence::Outcome::TradeoffGain:
         if (evidence.recommendation == insight_evidence::Recommendation::RecommendSequence) {
-            return "Repeatable whole-corner improvement";
+            return "Repeatable whole-corner gain";
         }
         if (evidence.recommendation == insight_evidence::Recommendation::Validate) {
-            return "Whole-corner improvement - test again";
+            return "Whole-corner gain - test again";
         }
-        return "Possible whole-corner improvement";
+        return "Possible whole-corner gain";
     }
     return "Driving change detected";
 }
@@ -955,7 +975,9 @@ std::string evidence_detail(
     const Insight& insight,
     const insight_evidence::Result& evidence) {
     std::ostringstream stream;
-    stream << plain_metric_change(insight.metric, insight.measured_value) << " compared with the reference lap. ";
+    stream << insight.corner_name << ": "
+           << plain_metric_change(insight.metric, insight.measured_value, insight.turn_direction)
+           << " than on the reference lap. ";
     stream << std::fixed << std::setprecision(3);
     switch (evidence.outcome) {
     case insight_evidence::Outcome::DataLimited:
@@ -966,15 +988,16 @@ std::string evidence_detail(
                << evidence.time_noise_floor_s << " s timing variation.";
         break;
     case insight_evidence::Outcome::NetLoss:
-        stream << "By the next braking or steering decision, this approach was "
-               << std::max(0.0, -evidence.retained_gain_s) << " s slower overall. Do not copy it as an improvement.";
+        stream << "By the next braking or steering decision, the lap was "
+               << std::max(0.0, -evidence.retained_gain_s)
+               << " s slower. This change was associated with that loss; one comparison does not prove it caused it.";
         break;
     case insight_evidence::Outcome::Compensation:
         stream << "This recovered part of the time lost earlier, but the lap was not ahead by the next braking or steering decision.";
         break;
     case insight_evidence::Outcome::RetainedGain:
         stream << "The lap was still " << evidence.retained_gain_s
-               << " s ahead at the next braking or steering decision.";
+               << " s ahead at the next braking or steering decision. This change was associated with the gain; repeat it to verify.";
         break;
     case insight_evidence::Outcome::TradeoffGain:
         stream << "The complete corner approach was still " << evidence.retained_gain_s
@@ -982,6 +1005,88 @@ std::string evidence_detail(
         break;
     }
     return stream.str();
+}
+
+std::string driver_coaching(const Insight& insight, const insight_evidence::Result& evidence) {
+    const std::string prefix = insight.controls_measured
+        ? "Next-lap test: "
+        : "Suggestion to test (no transmitter inputs were recorded): ";
+    const auto turn = insight.turn_direction.empty()
+        ? std::string("into the corner")
+        : std::string(insight.turn_direction) + " into the corner";
+
+    if (evidence.outcome == insight_evidence::Outcome::DataLimited) {
+        return prefix + "record another clean lap, use one smooth steering input to turn " + turn +
+            ", and feed throttle in only as the steering unwinds. Change one thing and compare the next-decision time.";
+    }
+    if (evidence.outcome == insight_evidence::Outcome::Inconclusive) {
+        return prefix + "repeat two clean laps with the same entry. Use one smooth steering input to turn " + turn +
+            ", then feed throttle in as the steering unwinds. The timing change must clear normal variation.";
+    }
+    if (evidence.outcome == insight_evidence::Outcome::Compensation) {
+        return prefix + "do not copy this isolated input. Match the reference entry, use one smooth steering input to turn " + turn +
+            ", and feed throttle in as steering unwinds; judge the whole sequence at the next decision.";
+    }
+
+    const auto repeat_gain = evidence.outcome == insight_evidence::Outcome::RetainedGain ||
+        evidence.outcome == insight_evidence::Outcome::TradeoffGain;
+    const auto desired_change = repeat_gain ? insight.measured_value : -insight.measured_value;
+    const auto magnitude = std::abs(insight.measured_value);
+    std::string instruction;
+    switch (insight.metric) {
+    case MetricKind::TurnInDelta:
+        instruction = std::format(
+            "begin turning {} about {:.3f} s {}. Make one smooth steering input and feed throttle in as the steering unwinds",
+            turn, magnitude, desired_change >= 0.0 ? "later" : "earlier");
+        break;
+    case MetricKind::BrakePointDelta:
+        instruction = std::format(
+            "begin braking about {:.3f} s {} so the car is settled before one smooth steering input to turn {}. Release progressively, then feed throttle in as steering unwinds",
+            magnitude, desired_change >= 0.0 ? "later" : "earlier", turn);
+        break;
+    case MetricKind::ThrottlePickupDelta:
+        instruction = std::format(
+            "begin feeding in throttle about {:.3f} s {}, but only as you unwind the steering after turning {}",
+            magnitude, desired_change >= 0.0 ? "later" : "sooner", turn);
+        break;
+    case MetricKind::MinimumSpeedDelta:
+        if (repeat_gain && insight.measured_value > 0.0) {
+            instruction = "protect the higher minimum speed: use only enough lift or brake to settle the car, use one smooth steering input to turn " +
+                turn + ", then feed throttle in as steering unwinds";
+        } else if (repeat_gain) {
+            instruction = "do not copy the lower middle speed by itself; repeat the complete sequence that retained the time gain. Settle the car, use one smooth steering input to turn " +
+                turn + ", then build throttle as steering unwinds";
+        } else if (insight.measured_value < 0.0) {
+            instruction = "try a small earlier lift and finish the slowing before turning. Use one smooth steering input to turn " + turn +
+                ", carry more speed through the middle, then feed throttle in as steering unwinds";
+        } else {
+            instruction = "do not chase the higher middle speed by itself because the time did not carry forward. Use a small earlier lift to settle the car, turn " +
+                turn + " with one smooth steering input, and feed throttle in as steering unwinds to prioritize the exit";
+        }
+        break;
+    case MetricKind::ExitSpeedDelta:
+        instruction = "prioritize the exit: finish slowing before the middle, use one smooth steering input to turn " + turn +
+            ", and build throttle as steering unwinds";
+        break;
+    case MetricKind::EntryLineDeviation:
+        instruction = "move the entry back toward the reference path, use one smooth steering input to turn " + turn +
+            ", and use throttle only as the steering unwinds";
+        break;
+    case MetricKind::ApexTimingDelta:
+        instruction = std::format(
+            "aim to finish the car's rotation about {:.3f} s {} with one smooth steering input to turn {}, then feed throttle in as steering unwinds",
+            magnitude, desired_change >= 0.0 ? "later" : "earlier", turn);
+        break;
+    case MetricKind::RelativeTimeChange:
+        instruction = "copy the complete entry-to-exit sequence: settle the car, use one smooth steering input to turn " + turn +
+            ", and feed throttle in as the steering unwinds";
+        break;
+    }
+    const auto goal = " Watch minimum speed, exit speed, and whether the time is still better at the next decision.";
+    if (repeat_gain) {
+        return prefix + "repeat what worked: " + instruction + "." + goal;
+    }
+    return prefix + instruction + "." + goal;
 }
 
 void apply_recommendation_evidence(
@@ -1100,9 +1205,13 @@ void apply_recommendation_evidence(
         insight.retained_interval_low_s = candidate.retained_interval_low_s;
         insight.retained_interval_high_s = candidate.retained_interval_high_s;
         insight.evidence_reasons = evidence.reasons;
+        insight.controls_measured = std::any_of(
+            selected_view_value->controls.begin(), selected_view_value->controls.end(),
+            [](const RadioSample& control) { return control.valid; });
         if (descriptor_for(insight.rule)) {
             insight.title = evidence_title(evidence);
             insight.detail = evidence_detail(insight, evidence);
+            insight.coaching = driver_coaching(insight, evidence);
         }
 
         if (evidence.outcome == insight_evidence::Outcome::Compensation) ++compensation_count;

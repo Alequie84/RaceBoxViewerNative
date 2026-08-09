@@ -33,6 +33,24 @@ std::filesystem::path path_or(
     return std::filesystem::u8path(encoded);
 }
 
+std::vector<std::filesystem::path> path_list_or(
+    const Json& object,
+    const char* key,
+    const std::vector<std::filesystem::path>& fallback,
+    std::size_t maximum = 8) {
+    const auto value = object.find(key);
+    if (value == object.end() || !value->is_array()) return fallback;
+    std::vector<std::filesystem::path> result;
+    result.reserve(std::min<std::size_t>(value->size(), maximum));
+    for (const auto& encoded : *value) {
+        if (result.size() >= maximum || !encoded.is_string()) break;
+        const auto& text = encoded.get_ref<const std::string&>();
+        if (text.empty() || text.size() > 8'192) continue;
+        result.push_back(std::filesystem::u8path(text));
+    }
+    return result;
+}
+
 std::string path_utf8(const std::filesystem::path& path) {
     const auto encoded = path.generic_u8string();
     return {
@@ -76,15 +94,61 @@ TelemetryDensity density_or(const Json& object, TelemetryDensity fallback) {
     return fallback;
 }
 
+GraphDisplayMode graph_display_mode_or(
+    const Json& object, const char* key, GraphDisplayMode fallback) {
+    const auto value = object.find(key);
+    if (value == object.end() || !value->is_string()) return fallback;
+    const auto& name = value->get_ref<const std::string&>();
+    if (name == "paired") return GraphDisplayMode::Paired;
+    if (name == "all_separate") return GraphDisplayMode::AllSeparate;
+    return fallback;
+}
+
+const char* graph_display_mode_name(GraphDisplayMode mode) {
+    return mode == GraphDisplayMode::AllSeparate ? "all_separate" : "paired";
+}
+
+GraphColor graph_color_or(
+    const Json& object, const char* key, GraphColor fallback) {
+    const auto value = object.find(key);
+    if (value == object.end() || !value->is_array() || value->size() != 4) return fallback;
+    GraphColor parsed;
+    auto* channels = &parsed.red;
+    for (std::size_t index = 0; index < 4; ++index) {
+        if (!(*value)[index].is_number()) return fallback;
+        const auto component = (*value)[index].get<float>();
+        if (!std::isfinite(component)) return fallback;
+        channels[index] = std::clamp(component, 0.0F, 1.0F);
+    }
+    return parsed;
+}
+
+Json graph_color_json(GraphColor color) {
+    return Json::array({color.red, color.green, color.blue, color.alpha});
+}
+
+std::vector<TelemetryPlotId> plot_order_or(
+    const Json& object, const char* key,
+    const std::vector<TelemetryPlotId>& fallback, bool all_separate) {
+    const auto value = object.find(key);
+    if (value == object.end() || !value->is_array()) return fallback;
+    std::vector<std::string> keys;
+    keys.reserve(value->size());
+    for (const auto& entry : *value) {
+        if (entry.is_string()) keys.push_back(entry.get<std::string>());
+    }
+    return normalize_telemetry_plot_order(keys, all_separate);
+}
+
 UiWorkspace workspace_or(const Json& object, UiWorkspace fallback) {
     const auto value = object.find("active");
     if (value == object.end() || !value->is_string()) return fallback;
     const auto& name = value->get_ref<const std::string&>();
-    if (name == "session" || name == "overview") return UiWorkspace::Session;
+    if (name == "run" || name == "race_day") return UiWorkspace::Run;
+    if (name == "telemetry" || name == "session" || name == "overview") return UiWorkspace::Telemetry;
     if (name == "compare") return UiWorkspace::Compare;
-    if (name == "crew_chief" || name == "analysis") return UiWorkspace::CrewChief;
-    if (name == "reports" || name == "sectors") return UiWorkspace::Reports;
-    if (name == "race_day") return UiWorkspace::RaceDay;
+    if (name == "findings" || name == "crew_chief" || name == "analysis") return UiWorkspace::Findings;
+    if (name == "report" || name == "reports" || name == "sectors") return UiWorkspace::Report;
     return fallback;
 }
 
@@ -94,13 +158,21 @@ const char* density_name(TelemetryDensity density) {
 
 const char* workspace_name(UiWorkspace workspace) {
     switch (workspace) {
-        case UiWorkspace::Session: return "session";
+        case UiWorkspace::Run: return "run";
+        case UiWorkspace::Telemetry: return "telemetry";
         case UiWorkspace::Compare: return "compare";
-        case UiWorkspace::CrewChief: return "crew_chief";
-        case UiWorkspace::Reports: return "reports";
-        case UiWorkspace::RaceDay: return "race_day";
+        case UiWorkspace::Findings: return "findings";
+        case UiWorkspace::Report: return "report";
     }
-    return "session";
+    return "telemetry";
+}
+
+float bounded_float_or(const Json& object, const char* key, float fallback,
+                       float minimum, float maximum) {
+    const auto value = object.find(key);
+    if (value == object.end() || !value->is_number()) return fallback;
+    const auto parsed = value->get<float>();
+    return std::isfinite(parsed) ? std::clamp(parsed, minimum, maximum) : fallback;
 }
 
 std::string windows_error_message(DWORD error) {
@@ -137,6 +209,12 @@ UiPreferencesLoadResult load_ui_preferences(const std::filesystem::path& path) n
         preferences.telemetry_import_folder = path_or(
             value, "telemetry_import_folder",
             preferences.telemetry_import_folder);
+        preferences.recent_session_files = path_list_or(
+            value, "recent_session_files",
+            preferences.recent_session_files);
+        preferences.recent_race_day_files = path_list_or(
+            value, "recent_race_day_files",
+            preferences.recent_race_day_files, 10);
         preferences.auto_detect_sanwa_usb = boolean_or(
             value, "auto_detect_sanwa_usb",
             preferences.auto_detect_sanwa_usb);
@@ -146,13 +224,33 @@ UiPreferencesLoadResult load_ui_preferences(const std::filesystem::path& path) n
         preferences.layout_version = result.source_layout_version;
         result.layout_rebuild_required = result.source_layout_version < kCurrentUiLayoutVersion;
 
-        if (const auto order = value.find("telemetry_plot_order"); order != value.end() && order->is_array()) {
-            std::vector<std::string> keys;
-            keys.reserve(order->size());
-            for (const auto& key : *order) {
-                if (key.is_string()) keys.push_back(key.get<std::string>());
+        preferences.telemetry_plot_order = plot_order_or(
+            value, "telemetry_plot_order", preferences.telemetry_plot_order, true);
+        if (const auto graphs = value.find("graphs"); graphs != value.end() && graphs->is_object()) {
+            preferences.telemetry_graph_mode = graph_display_mode_or(
+                *graphs, "telemetry_mode", preferences.telemetry_graph_mode);
+            preferences.compare_graph_mode = graph_display_mode_or(
+                *graphs, "compare_mode", preferences.compare_graph_mode);
+            preferences.telemetry_plot_order = plot_order_or(
+                *graphs, "telemetry_order", preferences.telemetry_plot_order,
+                preferences.telemetry_graph_mode == GraphDisplayMode::AllSeparate);
+            preferences.compare_plot_order = plot_order_or(
+                *graphs, "compare_order", preferences.compare_plot_order,
+                preferences.compare_graph_mode == GraphDisplayMode::AllSeparate);
+            if (const auto channel = graphs->find("channel_palette");
+                channel != graphs->end() && channel->is_object()) {
+                preferences.channel_palette.speed = graph_color_or(*channel, "speed", preferences.channel_palette.speed);
+                preferences.channel_palette.lateral_g = graph_color_or(*channel, "lateral_g", preferences.channel_palette.lateral_g);
+                preferences.channel_palette.steering = graph_color_or(*channel, "steering", preferences.channel_palette.steering);
+                preferences.channel_palette.longitudinal_g = graph_color_or(*channel, "longitudinal_g", preferences.channel_palette.longitudinal_g);
+                preferences.channel_palette.controls = graph_color_or(*channel, "controls", preferences.channel_palette.controls);
             }
-            preferences.telemetry_plot_order = normalize_telemetry_plot_order(keys);
+            if (const auto comparison = graphs->find("comparison_palette");
+                comparison != graphs->end() && comparison->is_object()) {
+                preferences.comparison_palette.reference = graph_color_or(*comparison, "reference", preferences.comparison_palette.reference);
+                preferences.comparison_palette.compare_a = graph_color_or(*comparison, "compare_a", preferences.comparison_palette.compare_a);
+                preferences.comparison_palette.compare_b = graph_color_or(*comparison, "compare_b", preferences.comparison_palette.compare_b);
+            }
         }
 
         if (const auto workspace = value.find("workspace"); workspace != value.end() && workspace->is_object()) {
@@ -162,6 +260,20 @@ UiPreferencesLoadResult load_ui_preferences(const std::filesystem::path& path) n
                 *workspace, "compare_b_enabled", preferences.workspace.compare_b_enabled);
             preferences.workspace.customize_layout = boolean_or(
                 *workspace, "customize_layout", preferences.workspace.customize_layout);
+            preferences.workspace.race_day_panel_open = boolean_or(
+                *workspace, "race_day_panel_open", preferences.workspace.race_day_panel_open);
+            preferences.workspace.crew_chief_panel_open = boolean_or(
+                *workspace, "crew_chief_panel_open", preferences.workspace.crew_chief_panel_open);
+            preferences.workspace.panel_focus = boolean_or(
+                *workspace, "panel_focus", preferences.workspace.panel_focus);
+            preferences.workspace.graph_focus = boolean_or(
+                *workspace, "graph_focus", preferences.workspace.graph_focus);
+            preferences.workspace.race_day_panel_width = bounded_float_or(
+                *workspace, "race_day_panel_width", preferences.workspace.race_day_panel_width, 280.0F, 420.0F);
+            preferences.workspace.crew_chief_panel_width = bounded_float_or(
+                *workspace, "crew_chief_panel_width", preferences.workspace.crew_chief_panel_width, 320.0F, 520.0F);
+            preferences.workspace.map_height_ratio = bounded_float_or(
+                *workspace, "map_height_ratio", preferences.workspace.map_height_ratio, 0.20F, 0.70F);
             if (const auto panels = workspace->find("utility_panels"); panels != workspace->end() && panels->is_object()) {
                 auto& visibility = preferences.workspace.utility_panels;
                 visibility.radio_alignment = boolean_or(*panels, "radio_alignment", visibility.radio_alignment);
@@ -170,6 +282,13 @@ UiPreferencesLoadResult load_ui_preferences(const std::filesystem::path& path) n
                 visibility.gg_plot = boolean_or(*panels, "gg_plot", visibility.gg_plot);
                 visibility.altitude = boolean_or(*panels, "altitude", visibility.altitude);
             }
+        }
+        if (result.source_layout_version < kCurrentUiLayoutVersion) {
+            // The old guided shell defaulted to the cramped 280 px run panel
+            // and a taller map. Apply the v6 shell defaults once during the
+            // dock rebuild; subsequent v6 adjustments remain user-owned.
+            preferences.workspace.race_day_panel_width = 320.0F;
+            preferences.workspace.map_height_ratio = 0.32F;
         }
         return result;
     } catch (const std::exception& exception) {
@@ -195,14 +314,39 @@ bool save_ui_preferences_atomic(const std::filesystem::path& path, const UiPrefe
     try {
         if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
 
-        auto plot_order = Json::array();
-        const auto normalized_order = [&preferences] {
+        const auto serialize_plot_order = [](const std::vector<TelemetryPlotId>& order,
+                                             bool all_separate) {
+            auto output = Json::array();
             std::vector<std::string> keys;
-            keys.reserve(preferences.telemetry_plot_order.size());
-            for (const auto id : preferences.telemetry_plot_order) keys.emplace_back(telemetry_plot_key(id));
-            return normalize_telemetry_plot_order(keys);
-        }();
-        for (const auto id : normalized_order) plot_order.push_back(std::string(telemetry_plot_key(id)));
+            keys.reserve(order.size());
+            for (const auto id : order) keys.emplace_back(telemetry_plot_key(id));
+            for (const auto id : normalize_telemetry_plot_order(keys, all_separate)) {
+                output.push_back(std::string(telemetry_plot_key(id)));
+            }
+            return output;
+        };
+        auto telemetry_plot_order = serialize_plot_order(
+            preferences.telemetry_plot_order,
+            preferences.telemetry_graph_mode == GraphDisplayMode::AllSeparate);
+        auto compare_plot_order = serialize_plot_order(
+            preferences.compare_plot_order,
+            preferences.compare_graph_mode == GraphDisplayMode::AllSeparate);
+        auto recent_session_files = Json::array();
+        for (const auto& source : preferences.recent_session_files) {
+            if (recent_session_files.size() >= 8) break;
+            const auto encoded = path_utf8(source);
+            if (!encoded.empty() && encoded.size() <= 8'192) {
+                recent_session_files.push_back(encoded);
+            }
+        }
+        auto recent_race_day_files = Json::array();
+        for (const auto& source : preferences.recent_race_day_files) {
+            if (recent_race_day_files.size() >= 10) break;
+            const auto encoded = path_utf8(source);
+            if (!encoded.empty() && encoded.size() <= 8'192) {
+                recent_race_day_files.push_back(encoded);
+            }
+        }
 
         const auto& panels = preferences.workspace.utility_panels;
         const Json value{
@@ -217,16 +361,41 @@ bool save_ui_preferences_atomic(const std::filesystem::path& path, const UiPrefe
             {"analysis_aligned_map_traces", preferences.analysis_aligned_map_traces},
             {"telemetry_import_folder",
              path_utf8(preferences.telemetry_import_folder)},
+            {"recent_session_files", std::move(recent_session_files)},
+            {"recent_race_day_files", std::move(recent_race_day_files)},
             {"auto_detect_sanwa_usb",
              preferences.auto_detect_sanwa_usb},
             {"text_scale", normalize_text_scale(preferences.text_scale)},
             {"layout_version", std::max(0, preferences.layout_version)},
-            {"telemetry_plot_order", std::move(plot_order)},
+            // Retained for v1-v5 readers; v6 workspaces use the graph block.
+            {"telemetry_plot_order", telemetry_plot_order},
+            {"graphs",
+             {{"telemetry_mode", graph_display_mode_name(preferences.telemetry_graph_mode)},
+              {"compare_mode", graph_display_mode_name(preferences.compare_graph_mode)},
+              {"telemetry_order", std::move(telemetry_plot_order)},
+              {"compare_order", std::move(compare_plot_order)},
+              {"channel_palette",
+               {{"speed", graph_color_json(preferences.channel_palette.speed)},
+                {"lateral_g", graph_color_json(preferences.channel_palette.lateral_g)},
+                {"steering", graph_color_json(preferences.channel_palette.steering)},
+                {"longitudinal_g", graph_color_json(preferences.channel_palette.longitudinal_g)},
+                {"controls", graph_color_json(preferences.channel_palette.controls)}}},
+              {"comparison_palette",
+               {{"reference", graph_color_json(preferences.comparison_palette.reference)},
+                {"compare_a", graph_color_json(preferences.comparison_palette.compare_a)},
+                {"compare_b", graph_color_json(preferences.comparison_palette.compare_b)}}}}},
             {"workspace",
              {{"active", workspace_name(preferences.workspace.active)},
               {"telemetry_density", density_name(preferences.workspace.telemetry_density)},
               {"compare_b_enabled", preferences.workspace.compare_b_enabled},
               {"customize_layout", preferences.workspace.customize_layout},
+              {"race_day_panel_open", preferences.workspace.race_day_panel_open},
+              {"crew_chief_panel_open", preferences.workspace.crew_chief_panel_open},
+              {"panel_focus", preferences.workspace.panel_focus},
+              {"graph_focus", preferences.workspace.graph_focus},
+              {"race_day_panel_width", std::clamp(preferences.workspace.race_day_panel_width, 280.0F, 420.0F)},
+              {"crew_chief_panel_width", std::clamp(preferences.workspace.crew_chief_panel_width, 320.0F, 520.0F)},
+              {"map_height_ratio", std::clamp(preferences.workspace.map_height_ratio, 0.20F, 0.70F)},
               {"utility_panels",
                {{"radio_alignment", panels.radio_alignment},
                 {"theoretical_analysis", panels.theoretical_analysis},
@@ -271,11 +440,11 @@ bool save_ui_preferences_atomic(const std::filesystem::path& path, const UiPrefe
     }
 }
 
-LayoutMigrationPreparation prepare_layout_v4_migration(const std::filesystem::path& settings_directory,
+LayoutMigrationPreparation prepare_layout_v6_migration(const std::filesystem::path& settings_directory,
                                                         int source_layout_version) noexcept {
     LayoutMigrationPreparation result;
     result.rebuild_required = source_layout_version < kCurrentUiLayoutVersion;
-    result.backup_path = settings_directory / L"layout-pre-v4.ini";
+    result.backup_path = settings_directory / L"layout-pre-v6.ini";
     if (!result.rebuild_required) return result;
 
     try {

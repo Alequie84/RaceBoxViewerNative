@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Android's XML policy cannot express Tailscale's 100.64.0.0/10 CIDR.
+         GatewayClient validates every URL before opening it and permits HTTP
+         only inside that range. All other user-supplied hosts require HTTPS. -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

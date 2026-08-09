@@ -189,8 +189,10 @@ struct Insight {
     std::string id;
     std::string title;
     std::string detail;
+    std::string coaching;
     std::string corner_id;
     std::string corner_name;
+    std::string turn_direction;
     ComparisonSlot comparison{ComparisonSlot::CompareA};
     std::int32_t comparison_raw_lap{};
     MetricKind metric{};
@@ -218,6 +220,7 @@ struct Insight {
     std::optional<double> retained_interval_low_s;
     std::optional<double> retained_interval_high_s;
     std::vector<insight_evidence::Reason> evidence_reasons;
+    bool controls_measured{};
     NavigationTarget navigation;
 };
 

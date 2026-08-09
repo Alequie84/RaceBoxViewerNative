@@ -50,10 +50,121 @@ int main() {
                 "Before-lap load evidence is missing");
         require(evidence.at("after_minus_before").at("channels").contains("steering"),
                 "Steering delta evidence is missing");
+        require(!evidence.at("corner_metrics").empty() &&
+                    evidence.at("corner_metrics").at(0).at("channel_evidence")
+                        .at("reference").at("channels").contains("lateral_load") &&
+                    evidence.at("corner_metrics").at(0).at("channel_evidence")
+                        .at("compare_minus_reference").at("channels").contains("throttle"),
+                "Distance-aligned per-corner G-force and control evidence is missing");
         require(evidence.at("interpretation_limits").size() >= 3,
                 "Causality limitations were not disclosed");
+        require(!evidence.at("verified_insights").empty(),
+                "Crew Chief evidence did not include a verified driver insight");
+        const auto& driver_insight = evidence.at("verified_insights").at(0);
+        require(driver_insight.contains("driver_coaching") &&
+                    !driver_insight.at("driver_coaching").get<std::string>().empty() &&
+                    driver_insight.contains("turn_direction") &&
+                    driver_insight.contains("control_evidence"),
+                "Crew Chief evidence omitted natural driver coaching context");
+        require(driver_insight.at("detail").get<std::string>().find("Started steering") == std::string::npos &&
+                    driver_insight.at("detail").get<std::string>().find("(turn-in)") == std::string::npos,
+                "Crew Chief evidence retained the old engineering-style turn-in wording");
         require(evidence.dump().find(session.vbo_path.string()) == std::string::npos,
                 "Evidence packet leaked a local telemetry file path");
+
+        std::vector<racebox::crew_chief::ChatTurn> session_history;
+        for (auto index = 0; index < 12; ++index) {
+            session_history.push_back({"user", "question " + std::to_string(index)});
+        }
+        const auto enriched_context = nlohmann::json{
+            {"run", {{"label", "Q2"}}},
+            {"viewer", {{"active_comparison", {
+                {"active_comparison_is_user_selection", true},
+                {"comparisons", nlohmann::json::array({{
+                    {"role", "compare_a_minus_reference"},
+                    {"evidence", evidence},
+                }})},
+            }}}},
+        };
+        const auto session_chat = racebox::crew_chief::build_session_chat_request(
+            enriched_context,
+            "#contract,racebox-session-analytics-csv-v1\nheader\n",
+            "Did the car fade late in the run?",
+            nlohmann::json::array(), session_history);
+        require(session_chat.at("contract").get<std::string>() ==
+                    racebox::crew_chief::kSessionChatRequestVersion,
+                "Session chat request contract was not versioned");
+        require(session_chat.at("session").at("analytics_csv").get<std::string>().find(
+                    "racebox-session-analytics-csv-v1") != std::string::npos,
+                "Session chat did not carry the whole-run analytics document");
+        require(session_chat.at("history").size() == 10 &&
+                    session_chat.at("history").front().at("content").get<std::string>().find(
+                        "Earlier conversation memory") != std::string::npos &&
+                    session_chat.at("history")[1].at("content") == "question 3",
+                "Session chat did not retain compact older memory plus the newest nine turns");
+        require(session_chat.at("question") == "Did the car fade late in the run?",
+                "Routine Session questions were incorrectly forced into correlation reasoning");
+        const auto& selected_comparison = session_chat.at("session").at("context")
+            .at("viewer").at("active_comparison");
+        require(selected_comparison.at("active_comparison_is_user_selection").get<bool>() &&
+                    selected_comparison.at("comparisons").at(0).at("evidence")
+                        .at("corner_metrics").is_array(),
+                "Session chat dropped the Viewer's selected corner-by-corner comparison evidence");
+        require(session_chat.dump().find(session.vbo_path.string()) == std::string::npos,
+                "Enriched Session chat leaked a local telemetry file path");
+        const auto correlation_chat = racebox::crew_chief::build_session_chat_request(
+            nlohmann::json::object(),
+            "#contract,racebox-session-analytics-csv-v1\nheader\n",
+            "Compare steering input with lateral G and cornering response.",
+            nlohmann::json::array(), {});
+        require(correlation_chat.at("question").get<std::string>().starts_with(
+                    "Correlation review requested"),
+                "Input-versus-output Session question was not routed as a correlation review");
+
+        racebox::crew_chief::SetupSheetVision setup_vision;
+        setup_vision.previous.revision_id = "setup-before";
+        setup_vision.current.revision_id = "setup-after";
+        const std::vector<std::uint8_t> tiny_png{
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+            0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+        };
+        setup_vision.previous.pages.push_back({1, "image/png", tiny_png});
+        setup_vision.current.pages.push_back({1, "image/png", tiny_png});
+        const auto race_day_request = racebox::crew_chief::build_race_day_request(
+            nlohmann::json{{"setup_sheet", {{"exact_values_available", true}}}},
+            "#contract,racebox-session-analytics-csv-v1\nprevious\n",
+            nlohmann::json{{"setup_sheet", {{"exact_values_available", true}}}},
+            "#contract,racebox-session-analytics-csv-v1\ncurrent\n",
+            "Compare Previous and Current.", nlohmann::json::array(), {},
+            &setup_vision);
+        require(race_day_request.at("contract").get<std::string>() ==
+                    racebox::crew_chief::kRaceDayRequestVersion &&
+                    race_day_request.at("setup_sheet_vision").at("contract")
+                        .get<std::string>() ==
+                    racebox::crew_chief::kSetupSheetVisionVersion,
+                "Race-day setup-sheet vision contracts were not versioned");
+        const auto& encoded_page = race_day_request.at("setup_sheet_vision")
+            .at("previous").at("pages").at(0);
+        require(encoded_page.at("sha256").get<std::string>().size() == 64 &&
+                    encoded_page.at("data_base64").get<std::string>().find("C:") ==
+                    std::string::npos,
+                "Setup-sheet vision did not hash/embed the rendered page safely");
+        require(race_day_request.dump().find(session.vbo_path.string()) == std::string::npos,
+                "Race-day setup-sheet request leaked a telemetry path");
+
+        auto oversized_vision = setup_vision;
+        oversized_vision.current.pages.front().bytes.resize(3 * 1024 * 1024 + 1);
+        bool rejected_oversized_image = false;
+        try {
+            (void)racebox::crew_chief::build_race_day_request(
+                nlohmann::json::object(), "previous",
+                nlohmann::json::object(), "current", "question",
+                nlohmann::json::array(), {}, &oversized_vision);
+        } catch (const std::exception&) {
+            rejected_oversized_image = true;
+        }
+        require(rejected_oversized_image,
+                "Race-day request accepted an oversized setup-sheet image");
 
         const nlohmann::json gateway_response{
             {"ok", true},
@@ -155,6 +266,18 @@ int main() {
         const auto bounded = racebox::crew_chief::parse_report(invalid);
         require(bounded.verdict == "inconclusive" && bounded.confidence == 100,
                 "Crew Chief response validation did not enforce safe bounds");
+
+        const auto thinking_job = racebox::crew_chief::parse_companion_job_response({
+            {"contract", racebox::crew_chief::kCompanionContractVersion},
+            {"job_id", "job-live-viewer"},
+            {"status", "thinking"},
+            {"assistant_message_id", nullptr},
+            {"error", nullptr},
+        });
+        require(thinking_job.ok && thinking_job.status == "thinking" &&
+                    thinking_job.assistant_message_id.empty() &&
+                    thinking_job.error.empty(),
+                "Nullable companion job fields stopped Viewer polling");
 
         std::cout << "Crew Chief evidence and response tests passed\n";
         return 0;

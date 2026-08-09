@@ -14,8 +14,8 @@ $status = if ($state) {
 
 $context = @"
 RaceBox Telemetry Viewer v2 startup context:
-- Read C:\CodexProjects\RaceBoxViewerNative\HANDOFF.md and AGENTS.md before editing.
-- Use C:\CodexProjects\RaceBoxViewerNative\scripts\toolbox for repeatable build, test, launch, and health checks.
+- Read HANDOFF.md and AGENTS.md in this repository before editing.
+- Use scripts/toolbox for repeatable build, test, launch, and health checks.
 - Before broad code or layout work, launch the current native demo with Start-NativeDemo.ps1 and inspect it using the golden fixture.
 - The React/browser project is frozen history. Do not edit, build, test, or launch it unless the user explicitly reopens browser development.
 - Keep the guided Race Day, Session, Compare, Crew Chief, and Reports workflow understandable without exposing dock/layout complexity by default.

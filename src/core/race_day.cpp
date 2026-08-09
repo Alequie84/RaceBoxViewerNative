@@ -151,6 +151,166 @@ Conditions read_conditions(const json& value) {
     return result;
 }
 
+json car_profile_json(const CarProfileSnapshot& profile) {
+    return {
+        {"id", bounded(profile.id, 120)},
+        {"name", bounded(profile.name, 200)},
+        {"brand", bounded(profile.brand, 200)},
+        {"model", bounded(profile.model, 200)},
+        {"chassis", bounded(profile.chassis, 200)},
+        {"motor", bounded(profile.motor, 200)},
+        {"esc", bounded(profile.esc, 200)},
+        {"servo", bounded(profile.servo, 200)},
+        {"receiver", bounded(profile.receiver, 200)},
+        {"radio", bounded(profile.radio, 200)},
+        {"gearing", bounded(profile.gearing, 200)},
+        {"notes", bounded(profile.notes, 4'000)},
+    };
+}
+
+CarProfileSnapshot read_car_profile(const json& value) {
+    CarProfileSnapshot result;
+    if (!value.is_object()) return result;
+    result.id = bounded(value.value("id", std::string{}), 120);
+    result.name = bounded(value.value("name", std::string{}), 200);
+    result.brand = bounded(value.value("brand", std::string{}), 200);
+    result.model = bounded(value.value("model", std::string{}), 200);
+    result.chassis = bounded(value.value("chassis", std::string{}), 200);
+    result.motor = bounded(value.value("motor", std::string{}), 200);
+    result.esc = bounded(value.value("esc", std::string{}), 200);
+    result.servo = bounded(value.value("servo", std::string{}), 200);
+    result.receiver = bounded(value.value("receiver", std::string{}), 200);
+    result.radio = bounded(value.value("radio", std::string{}), 200);
+    result.gearing = bounded(value.value("gearing", std::string{}), 200);
+    result.notes = bounded(value.value("notes", std::string{}), 4'000);
+    return result;
+}
+
+json setup_field_json(const SetupFieldValue& field) {
+    return {
+        {"key", bounded(field.key, 200)},
+        {"label", bounded(field.label, 300)},
+        {"section", bounded(field.section, 200)},
+        {"value", bounded(field.value, 1'000)},
+        {"unit", bounded(field.unit, 80)},
+        {"page", std::clamp(field.page, 0, 100)},
+        {"rect", {field.left, field.top, field.right, field.bottom}},
+        {"confidence", std::clamp(field.confidence, 0, 100)},
+        {"confirmed", field.confirmed},
+    };
+}
+
+SetupFieldValue read_setup_field(const json& value) {
+    SetupFieldValue result;
+    if (!value.is_object()) return result;
+    result.key = bounded(value.value("key", std::string{}), 200);
+    result.label = bounded(value.value("label", std::string{}), 300);
+    result.section = bounded(value.value("section", std::string{}), 200);
+    result.value = bounded(value.value("value", std::string{}), 1'000);
+    result.unit = bounded(value.value("unit", std::string{}), 80);
+    result.page = std::clamp(value.value("page", 0), 0, 100);
+    if (const auto rect = value.find("rect"); rect != value.end() &&
+        rect->is_array() && rect->size() == 4) {
+        const auto number = [&](std::size_t index) {
+            if (!(*rect)[index].is_number()) return 0.0;
+            const auto coordinate = (*rect)[index].get<double>();
+            return std::isfinite(coordinate)
+                ? std::clamp(coordinate, -1'000'000.0, 1'000'000.0)
+                : 0.0;
+        };
+        result.left = number(0);
+        result.top = number(1);
+        result.right = number(2);
+        result.bottom = number(3);
+    }
+    result.confidence = std::clamp(value.value("confidence", 0), 0, 100);
+    result.confirmed = value.value("confirmed", false);
+    return result;
+}
+
+json setup_sheet_json(const SetupSheetSnapshot& sheet) {
+    json fields = json::array();
+    for (const auto& field : sheet.fields) {
+        if (fields.size() >= 512) break;
+        fields.push_back(setup_field_json(field));
+    }
+    return {
+        {"template_id", bounded(sheet.template_id, 160)},
+        {"revision_id", bounded(sheet.revision_id, 160)},
+        {"parent_revision_id", bounded(sheet.parent_revision_id, 160)},
+        {"display_name", bounded(sheet.display_name, 300)},
+        {"source_sha256", bounded(sheet.source_sha256, 80)},
+        {"rendered_sha256", bounded(sheet.rendered_sha256, 80)},
+        {"partially_known", sheet.partially_known},
+        {"needs_reconciliation", sheet.needs_reconciliation},
+        {"untracked_changes", bounded(sheet.untracked_changes, 16'000)},
+        {"fields", std::move(fields)},
+    };
+}
+
+SetupSheetSnapshot read_setup_sheet(const json& value) {
+    SetupSheetSnapshot result;
+    if (!value.is_object()) return result;
+    result.template_id = bounded(value.value("template_id", std::string{}), 160);
+    result.revision_id = bounded(value.value("revision_id", std::string{}), 160);
+    result.parent_revision_id = bounded(value.value("parent_revision_id", std::string{}), 160);
+    result.display_name = bounded(value.value("display_name", std::string{}), 300);
+    result.source_sha256 = bounded(value.value("source_sha256", std::string{}), 80);
+    result.rendered_sha256 = bounded(value.value("rendered_sha256", std::string{}), 80);
+    result.partially_known = value.value("partially_known", false);
+    result.needs_reconciliation = value.value("needs_reconciliation", false);
+    result.untracked_changes = bounded(value.value("untracked_changes", std::string{}), 16'000);
+    for (const auto& field : value.value("fields", json::array())) {
+        if (!field.is_object() || result.fields.size() >= 512) break;
+        auto parsed = read_setup_field(field);
+        if (!parsed.key.empty()) result.fields.push_back(std::move(parsed));
+    }
+    return result;
+}
+
+json chat_turn_json(const SessionChatTurn& turn) {
+    json linked = json::array();
+    for (const auto& run_id : turn.linked_run_ids) {
+        if (linked.size() >= 4) break;
+        const auto bounded_id = bounded(run_id, 120);
+        if (!bounded_id.empty()) linked.push_back(bounded_id);
+    }
+    return {
+        {"id", bounded(turn.id, 120)},
+        {"role", turn.role == "assistant" ? "assistant" : "user"},
+        {"content", bounded(turn.content, 4'000)},
+        {"created_at", turn.created_at},
+        {"origin", bounded(turn.origin, 80)},
+        {"linked_run_ids", std::move(linked)},
+        {"comparison_id", bounded(turn.comparison_id, 160)},
+    };
+}
+
+SessionChatTurn read_chat_turn(
+    const json& value, std::string fallback_id,
+    std::string_view fallback_run_id = {}) {
+    SessionChatTurn result;
+    if (!value.is_object()) return result;
+    result.id = bounded(value.value("id", std::move(fallback_id)), 120);
+    result.role = value.value("role", std::string{"user"}) == "assistant"
+        ? "assistant" : "user";
+    result.content = bounded(value.value("content", std::string{}), 4'000);
+    result.created_at = value.value("created_at", std::int64_t{});
+    result.origin = bounded(value.value("origin", std::string{"viewer"}), 80);
+    for (const auto& linked : value.value("linked_run_ids", json::array())) {
+        if (!linked.is_string() || result.linked_run_ids.size() >= 4) break;
+        const auto run_id = bounded(linked.get<std::string>(), 120);
+        if (!run_id.empty() && std::find(result.linked_run_ids.begin(), result.linked_run_ids.end(), run_id) == result.linked_run_ids.end()) {
+            result.linked_run_ids.push_back(run_id);
+        }
+    }
+    if (result.linked_run_ids.empty() && !fallback_run_id.empty()) {
+        result.linked_run_ids.emplace_back(fallback_run_id);
+    }
+    result.comparison_id = bounded(value.value("comparison_id", std::string{}), 160);
+    return result;
+}
+
 json evidence_json(const SetupKnowledgeEvidence& evidence) {
     return {
         {"analytics_contract", bounded(evidence.analytics_contract, 120)},
@@ -1153,6 +1313,18 @@ AttachSourcesResult attach_or_replace_telemetry_sources(
             result.error = "Selected telemetry source is missing or is not a file";
             return result;
         }
+        const auto file_size =
+            std::filesystem::file_size(path, file_error);
+        if (file_error) {
+            result.error = "Selected telemetry source could not be read: " +
+                path_to_utf8(path.filename());
+            return result;
+        }
+        if (file_size == 0) {
+            result.error = "Selected telemetry source is empty (0 bytes): " +
+                path_to_utf8(path.filename());
+            return result;
+        }
         const auto kind = telemetry_source_kind(path);
         if (kind == TelemetrySourceKind::Unsupported) {
             result.error = "Unsupported telemetry source: " +
@@ -1420,10 +1592,26 @@ bool save(const Day& day, const std::filesystem::path& destination, std::string&
             {"event_name", bounded(day.event_name, 200)},
              {"track_name", bounded(day.track_name, 200)},
              {"date", bounded(day.date, 40)},
+             {"car_profile_id", bounded(day.car_profile_id, 120)},
+             {"car_profile", car_profile_json(day.car_profile)},
              {"runs", json::array()},
+             {"conversation", json::array()},
              {"setup_knowledge", json::array()},
-         };
+        };
+        Day normalized_day = day;
+        normalize_day_conversation(normalized_day);
+        if (normalized_day.conversation.size() > kMaximumSessionChatTurns) {
+            throw std::runtime_error(
+                "Crew Chief Race Day conversation reached the 2000-message safety limit; export or clear it before saving");
+        }
+        for (const auto& turn : normalized_day.conversation) {
+            root["conversation"].push_back(chat_turn_json(turn));
+        }
         for (const auto& run : day.runs) {
+            if (run.session_chat.size() > kMaximumSessionChatTurns) {
+                throw std::runtime_error(
+                    "Crew Chief conversation reached the 2000-message safety limit; export or clear it before saving");
+            }
             json value{
                 {"id", bounded(run.id, 120)},
                 {"label", bounded(run.label, 120)},
@@ -1438,7 +1626,10 @@ bool save(const Day& day, const std::filesystem::path& destination, std::string&
                 {"setup_changes", bounded(run.setup_changes, 16'000)},
                 {"post_run_notes", bounded(run.post_run_notes, 16'000)},
                 {"conditions", conditions_json(run.conditions)},
+                {"setup_sheet_enabled", run.setup_sheet_enabled},
+                {"setup_sheet", setup_sheet_json(run.setup_sheet)},
                 {"checklist", json::array()},
+                {"session_chat", json::array()},
             };
             for (std::size_t index = 0;
                  index < run.telemetry_files.size() && index < 8;
@@ -1464,6 +1655,9 @@ bool save(const Day& day, const std::filesystem::path& destination, std::string&
                     {"id", bounded(item.id, 120)}, {"label", bounded(item.label, 300)},
                     {"checked", item.checked}, {"note", bounded(item.note, 1000)},
                 });
+            }
+            for (const auto& turn : run.session_chat) {
+                value["session_chat"].push_back(chat_turn_json(turn));
             }
             root["runs"].push_back(std::move(value));
         }
@@ -1590,6 +1784,12 @@ bool load(const std::filesystem::path& source, Day& day, std::string& error) noe
         loaded.event_name = bounded(root.value("event_name", std::string{}), 200);
         loaded.track_name = bounded(root.value("track_name", std::string{}), 200);
         loaded.date = bounded(root.value("date", std::string{}), 40);
+        loaded.car_profile_id = bounded(root.value("car_profile_id", std::string{}), 120);
+        if (const auto profile = root.find("car_profile"); profile != root.end()) {
+            loaded.car_profile = read_car_profile(*profile);
+        }
+        if (loaded.car_profile_id.empty()) loaded.car_profile_id = loaded.car_profile.id;
+        if (loaded.car_profile.id.empty()) loaded.car_profile.id = loaded.car_profile_id;
         const auto base = source.parent_path().empty() ? std::filesystem::current_path() : source.parent_path();
         std::unordered_set<std::string> ids;
         for (const auto& value : root.value("runs", json::array())) {
@@ -1610,6 +1810,10 @@ bool load(const std::filesystem::path& source, Day& day, std::string& error) noe
             run.post_run_notes = bounded(value.value("post_run_notes", std::string{}), 16'000);
             if (const auto conditions = value.find("conditions"); conditions != value.end()) {
                 run.conditions = read_conditions(*conditions);
+            }
+            run.setup_sheet_enabled = value.value("setup_sheet_enabled", false);
+            if (const auto sheet = value.find("setup_sheet"); sheet != value.end()) {
+                run.setup_sheet = read_setup_sheet(*sheet);
             }
             if (file_version >= 3 && value.contains("telemetry_sources") &&
                 value["telemetry_sources"].is_array() &&
@@ -1663,7 +1867,24 @@ bool load(const std::filesystem::path& source, Day& day, std::string& error) noe
                 });
             }
             if (run.checklist.empty()) run.checklist = default_pre_run_checklist();
+            std::size_t chat_index = 0;
+            for (const auto& turn : value.value("session_chat", json::array())) {
+                if (!turn.is_object() ||
+                    run.session_chat.size() >= kMaximumSessionChatTurns) {
+                    break;
+                }
+                auto id = bounded(turn.value("id", std::string{}), 120);
+                if (id.empty()) id = run.id + "-legacy-chat-" + std::to_string(chat_index);
+                run.session_chat.push_back(read_chat_turn(turn, std::move(id), run.id));
+                ++chat_index;
+            }
             loaded.runs.push_back(std::move(run));
+        }
+        std::size_t conversation_index = 0;
+        for (const auto& turn : root.value("conversation", json::array())) {
+            if (!turn.is_object() || loaded.conversation.size() >= kMaximumSessionChatTurns) break;
+            loaded.conversation.push_back(read_chat_turn(
+                turn, "day-chat-" + std::to_string(conversation_index++)));
         }
         std::unordered_set<std::string> knowledge_ids;
         for (const auto& value : root.value("setup_knowledge", json::array())) {
@@ -1719,6 +1940,7 @@ bool load(const std::filesystem::path& source, Day& day, std::string& error) noe
             }
             loaded.setup_knowledge.push_back(std::move(record));
         }
+        normalize_day_conversation(loaded);
         day = std::move(loaded);
         error.clear();
         return true;
@@ -1729,6 +1951,43 @@ bool load(const std::filesystem::path& source, Day& day, std::string& error) noe
         error = "Could not load the race-day file";
         return false;
     }
+}
+
+void normalize_day_conversation(Day& day) {
+    std::vector<SessionChatTurn> normalized;
+    normalized.reserve(std::min<std::size_t>(
+        kMaximumSessionChatTurns,
+        day.conversation.size() + day.runs.size() * 8));
+    std::unordered_set<std::string> seen;
+    const auto append = [&](SessionChatTurn turn, std::string_view fallback_run_id,
+                            auto& self) -> void {
+        if (normalized.size() >= kMaximumSessionChatTurns) return;
+        if (turn.id.empty()) {
+            turn.id = fallback_run_id.empty()
+                ? "day-chat-" + std::to_string(normalized.size())
+                : std::string(fallback_run_id) + "-legacy-chat-" +
+                    std::to_string(normalized.size());
+        }
+        if (!seen.insert(turn.id).second) return;
+        if (turn.linked_run_ids.empty() && !fallback_run_id.empty()) {
+            turn.linked_run_ids.emplace_back(fallback_run_id);
+        }
+        normalized.push_back(std::move(turn));
+        (void)self;
+    };
+    for (auto turn : day.conversation) append(std::move(turn), {}, append);
+    for (const auto& run : day.runs) {
+        for (auto turn : run.session_chat) append(std::move(turn), run.id, append);
+    }
+    std::stable_sort(normalized.begin(), normalized.end(),
+        [](const SessionChatTurn& left, const SessionChatTurn& right) {
+            const auto left_time = left.created_at > 0
+                ? left.created_at : std::numeric_limits<std::int64_t>::max();
+            const auto right_time = right.created_at > 0
+                ? right.created_at : std::numeric_limits<std::int64_t>::max();
+            return left_time < right_time;
+        });
+    day.conversation = std::move(normalized);
 }
 
 void upsert_setup_knowledge(Day& day, SetupKnowledgeRecord record) {

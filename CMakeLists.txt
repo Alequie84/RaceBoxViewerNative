@@ -46,6 +46,9 @@ option(RACEBOX_BUILD_MACOS_APP
   "Build the macOS SDL3/Metal application bundle"
   ${RACEBOX_MACOS_APP_DEFAULT})
 option(RACEBOX_BUILD_CLI "Build the platform-neutral telemetry CLI" ON)
+option(RACEBOX_ENABLE_CODEX_REVIEW
+  "Compile the one-way local Codex Review screenshot handoff into a development build"
+  OFF)
 
 if(RACEBOX_BUILD_WINDOWS_APP AND NOT WIN32)
   message(FATAL_ERROR
@@ -85,6 +88,25 @@ if(RACEBOX_BUILD_WINDOWS_APP OR RACEBOX_BUILD_MACOS_APP)
       GIT_REPOSITORY https://github.com/richgel999/miniz.git
       GIT_TAG 77d0dce8627735138c51770d1799a1ef48f2117d)
     FetchContent_MakeAvailable(miniz_src)
+
+    # Prebuilt public PDFium C API, pinned to an immutable Chromium branch and
+    # verified before extraction. This keeps PDF editing native and offline at
+    # runtime without introducing a package-manager dependency.
+    FetchContent_Declare(pdfium_binary
+      URL https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F7988/pdfium-win-x64.tgz
+      URL_HASH SHA256=654daf488d9357d2787cec439d0dbdb93d7e180e2cb28e5f1d41c66d2645daec)
+    FetchContent_MakeAvailable(pdfium_binary)
+    add_library(pdfium SHARED IMPORTED GLOBAL)
+    set_target_properties(pdfium PROPERTIES
+      IMPORTED_IMPLIB "${pdfium_binary_SOURCE_DIR}/lib/pdfium.dll.lib"
+      IMPORTED_LOCATION "${pdfium_binary_SOURCE_DIR}/bin/pdfium.dll"
+      INTERFACE_INCLUDE_DIRECTORIES "${pdfium_binary_SOURCE_DIR}/include")
+    function(racebox_copy_pdfium target)
+      add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          $<TARGET_FILE:pdfium> $<TARGET_FILE_DIR:${target}>
+        VERBATIM)
+    endfunction()
   endif()
 
 endif()
@@ -153,27 +175,31 @@ endif()
 if(RACEBOX_BUILD_WINDOWS_APP)
   # Existing Windows implementations are isolated from the portable targets.
   add_library(racebox_platform_windows STATIC
-    src/core/settings.cpp)
+    src/core/settings.cpp
+    src/core/credential_store.cpp)
   target_include_directories(racebox_platform_windows PUBLIC include)
-  target_link_libraries(racebox_platform_windows PUBLIC shell32 ole32)
+  target_link_libraries(racebox_platform_windows PUBLIC shell32 ole32 advapi32)
   target_compile_definitions(racebox_platform_windows PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   racebox_configure_cpp_target(racebox_platform_windows)
 
   add_library(racebox_storage_windows STATIC
     src/core/persistence.cpp
-    src/core/race_day.cpp)
+    src/core/race_day.cpp
+    src/core/setup_library.cpp
+    src/core/pdf_setup_editor.cpp)
   target_include_directories(racebox_storage_windows PUBLIC include)
   target_link_libraries(racebox_storage_windows
     PUBLIC racebox_domain nlohmann_json::nlohmann_json
-    PRIVATE miniz racebox_platform_windows)
+    PRIVATE miniz racebox_platform_windows winsqlite3 bcrypt pdfium windowscodecs ole32)
   racebox_configure_cpp_target(racebox_storage_windows)
 
   add_library(racebox_integrations_windows STATIC
-    src/core/crew_chief.cpp)
+    src/core/crew_chief.cpp
+    src/core/crew_chief_connection.cpp)
   target_include_directories(racebox_integrations_windows PUBLIC include)
   target_link_libraries(racebox_integrations_windows
     PUBLIC racebox_domain nlohmann_json::nlohmann_json
-    PRIVATE winhttp)
+    PRIVATE winhttp bcrypt)
   target_compile_definitions(racebox_integrations_windows PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   racebox_configure_cpp_target(racebox_integrations_windows)
 
@@ -195,11 +221,20 @@ if(RACEBOX_BUILD_WINDOWS_APP)
     src/app/file_dialog.cpp
     src/app/import_discovery.cpp
     src/app/texture_loader.cpp
+    third_party/qrcodegen/qrcodegen.cpp
     resources/RaceBoxViewer.rc)
-  target_include_directories(RaceBoxViewer PRIVATE include src/app "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  if(RACEBOX_ENABLE_CODEX_REVIEW)
+    target_sources(RaceBoxViewer PRIVATE src/app/codex_review.cpp)
+  endif()
+  target_include_directories(RaceBoxViewer PRIVATE
+    include src/app third_party/qrcodegen "${CMAKE_CURRENT_BINARY_DIR}/generated")
   target_link_libraries(RaceBoxViewer PRIVATE racebox_core imgui_native implot_native d3d11 dxgi d3dcompiler windowscodecs comdlg32 shell32 ole32 dwmapi dbghelp psapi)
   target_compile_definitions(RaceBoxViewer PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX IMGUI_DEFINE_MATH_OPERATORS)
+  if(RACEBOX_ENABLE_CODEX_REVIEW)
+    target_compile_definitions(RaceBoxViewer PRIVATE RACEBOX_ENABLE_CODEX_REVIEW=1)
+  endif()
   racebox_configure_cpp_target(RaceBoxViewer)
+  racebox_copy_pdfium(RaceBoxViewer)
   set_target_properties(RaceBoxViewer PROPERTIES OUTPUT_NAME RaceBoxTelemetryViewer)
 endif()
 
@@ -274,7 +309,7 @@ if(RACEBOX_BUILD_MACOS_APP)
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_BINARY_DIR}/generated/Info.plist"
     XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.alequie.raceboxtelemetryviewer"
     XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO"
-    XCODE_ATTRIBUTE_MACOSX_DEPLOYMENT_TARGET "13.0")
+    XCODE_ATTRIBUTE_MACOSX_DEPLOYMENT_TARGET "13.3")
 endif()
 
 if(RACEBOX_BUILD_WINDOWS_APP)
@@ -371,11 +406,32 @@ if(BUILD_TESTING)
     racebox_configure_cpp_target(racebox_crew_chief_tests)
     add_test(NAME racebox_crew_chief COMMAND racebox_crew_chief_tests)
 
+    add_executable(racebox_crew_chief_connection_tests
+      tests/crew_chief_connection_tests.cpp)
+    target_link_libraries(racebox_crew_chief_connection_tests PRIVATE racebox_core)
+    target_compile_definitions(racebox_crew_chief_connection_tests PRIVATE
+      WIN32_LEAN_AND_MEAN NOMINMAX)
+    racebox_configure_cpp_target(racebox_crew_chief_connection_tests)
+    add_test(NAME racebox_crew_chief_connection COMMAND racebox_crew_chief_connection_tests)
+
     add_executable(racebox_race_day_tests tests/race_day_tests.cpp)
     target_link_libraries(racebox_race_day_tests PRIVATE racebox_core)
     target_compile_definitions(racebox_race_day_tests PRIVATE GOLDEN_DIR="${CMAKE_SOURCE_DIR}/golden")
     racebox_configure_cpp_target(racebox_race_day_tests)
     add_test(NAME racebox_race_day COMMAND racebox_race_day_tests)
+
+    add_executable(racebox_setup_library_tests tests/setup_library_tests.cpp)
+    target_link_libraries(racebox_setup_library_tests PRIVATE racebox_core)
+    target_compile_definitions(racebox_setup_library_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    racebox_configure_cpp_target(racebox_setup_library_tests)
+    add_test(NAME racebox_setup_library COMMAND racebox_setup_library_tests)
+
+    add_executable(racebox_pdf_setup_tests tests/pdf_setup_tests.cpp)
+    target_link_libraries(racebox_pdf_setup_tests PRIVATE racebox_core pdfium)
+    target_compile_definitions(racebox_pdf_setup_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    racebox_configure_cpp_target(racebox_pdf_setup_tests)
+    racebox_copy_pdfium(racebox_pdf_setup_tests)
+    add_test(NAME racebox_pdf_setup COMMAND racebox_pdf_setup_tests)
   endif()
 endif()
 
@@ -388,7 +444,10 @@ if(RACEBOX_BUILD_WINDOWS_APP)
   install(FILES VERSION DESTINATION .)
   install(FILES README.md DESTINATION .)
   install(FILES HANDOFF.md DESTINATION .)
+  install(FILES LICENSE THIRD-PARTY-NOTICES.md DESTINATION .)
   install(FILES docs/race-day-crew-chief.md DESTINATION docs)
+  install(FILES docs/public-connection-guide.md DESTINATION docs)
+  install(FILES docs/codex-review.md DESTINATION docs)
   install(FILES docs/v2-architecture.md DESTINATION docs)
   install(FILES docs/macos-build.md DESTINATION docs)
   install(FILES "Start RaceBox Demo.cmd" DESTINATION .)
@@ -398,6 +457,9 @@ if(RACEBOX_BUILD_WINDOWS_APP)
   install(FILES ${implot_SOURCE_DIR}/LICENSE DESTINATION licenses RENAME implot-LICENSE.txt)
   install(FILES ${miniz_src_SOURCE_DIR}/LICENSE DESTINATION licenses RENAME miniz-LICENSE.txt)
   install(FILES ${json_SOURCE_DIR}/LICENSE.MIT DESTINATION licenses RENAME nlohmann-json-LICENSE.MIT)
+  install(FILES third_party/qrcodegen/LICENSE-AND-README.md DESTINATION licenses RENAME qrcodegen-LICENSE-AND-README.md)
+  install(FILES "${pdfium_binary_SOURCE_DIR}/bin/pdfium.dll" DESTINATION .)
+  install(FILES "${pdfium_binary_SOURCE_DIR}/LICENSE" DESTINATION licenses RENAME pdfium-LICENSE.txt)
 endif()
 
 if(RACEBOX_BUILD_MACOS_APP)

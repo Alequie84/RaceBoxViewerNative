@@ -65,6 +65,44 @@ double heading_rate_at(const TelemetrySeries& telemetry, Timestamp time) {
     return delta / (static_cast<double>(telemetry.time_us[after] - telemetry.time_us[before]) / kSecond);
 }
 
+double gps_path_yaw_rate_at(const TelemetrySeries& telemetry, Timestamp time) {
+    constexpr Timestamp kCourseWindow = 300'000;
+    const auto middle = nearest_index(telemetry.time_us, time);
+    const auto before = nearest_index(telemetry.time_us, time - kCourseWindow);
+    const auto after = nearest_index(telemetry.time_us, time + kCourseWindow);
+    if (before >= middle || middle >= after) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    constexpr double degrees_to_radians =
+        3.14159265358979323846 / 180.0;
+    const auto course = [&](std::size_t first, std::size_t last) {
+        const auto average_latitude =
+            (telemetry.latitude[first] + telemetry.latitude[last]) * 0.5;
+        const auto east =
+            (telemetry.longitude[last] - telemetry.longitude[first]) *
+            111'320.0 * std::cos(average_latitude * degrees_to_radians);
+        const auto north =
+            (telemetry.latitude[last] - telemetry.latitude[first]) * 110'540.0;
+        return std::pair{
+            std::atan2(east, north) / degrees_to_radians,
+            std::hypot(east, north)};
+    };
+    const auto [course_in, distance_in] = course(before, middle);
+    const auto [course_out, distance_out] = course(middle, after);
+    if (distance_in < 0.35 || distance_out < 0.35) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    auto delta = course_out - course_in;
+    while (delta > 180.0) delta -= 360.0;
+    while (delta < -180.0) delta += 360.0;
+    const auto centre_separation =
+        static_cast<double>(telemetry.time_us[after] - telemetry.time_us[before]) /
+        (2.0 * kSecond);
+    return centre_separation > 0.0
+        ? delta / centre_separation
+        : std::numeric_limits<double>::quiet_NaN();
+}
+
 struct TriggerScore {
     Timestamp correction{};
     int sign{1};
@@ -73,6 +111,158 @@ struct TriggerScore {
     double direction{};
     std::size_t overlap{};
 };
+
+struct LaunchCue {
+    Timestamp radio_onset_us{};
+    Timestamp telemetry_onset_us{};
+    Timestamp correction_us{};
+    int trigger_sign{1};
+    bool altitude_descent_supported{};
+};
+
+struct VehicleLaunchCue {
+    Timestamp onset_us{};
+    bool altitude_descent_supported{};
+};
+
+std::optional<Timestamp> first_sustained_forward_trigger(
+    const RadioSeries& radio, int sign) {
+    constexpr Timestamp kMinimumNeutralLead = 2 * kSecond;
+    // A transmitter tap can be a brake check or an accidental blip while the
+    // driver walks to the stand. The physical launch cue needs a deliberate,
+    // sustained pull before it is allowed to set the clock.
+    constexpr Timestamp kMinimumCommandDuration = 300'000;
+    for (std::size_t index = 0; index < radio.size() &&
+         radio.elapsed_us[index] < kMinimumNeutralLead; ++index) {
+        if (radio.trigger_percent[index] * sign >= 8.0F) {
+            return std::nullopt;
+        }
+    }
+    for (std::size_t begin = 0; begin < radio.size(); ++begin) {
+        if (radio.elapsed_us[begin] < kMinimumNeutralLead ||
+            radio.trigger_percent[begin] * sign < 8.0F) {
+            continue;
+        }
+        auto end = begin;
+        while (end + 1 < radio.size() &&
+               radio.trigger_percent[end + 1] * sign >= 8.0F) {
+            ++end;
+        }
+        if (radio.elapsed_us[end] - radio.elapsed_us[begin] >=
+            kMinimumCommandDuration) {
+            return radio.elapsed_us[begin];
+        }
+        begin = end;
+    }
+    return std::nullopt;
+}
+
+std::optional<VehicleLaunchCue> first_sustained_vehicle_launch(
+    const TelemetrySeries& telemetry) {
+    constexpr Timestamp kStationaryWindow = 10 * kSecond;
+    constexpr Timestamp kMinimumObservedStationaryTime = 8 * kSecond;
+    constexpr Timestamp kMovementWindow = 5 * kSecond;
+    for (std::size_t index = 0; index < telemetry.size(); ++index) {
+        const auto time = telemetry.time_us[index];
+        if (telemetry.speed_kmh[index] < 0.8F ||
+            (index > 0 && telemetry.speed_kmh[index - 1] >= 0.8F)) {
+            continue;
+        }
+
+        const auto stationary_begin = std::lower_bound(
+            telemetry.time_us.begin(), telemetry.time_us.end(),
+            time - kStationaryWindow);
+        const auto stationary_first = static_cast<std::size_t>(
+            stationary_begin - telemetry.time_us.begin());
+        if (stationary_first >= index ||
+            time - telemetry.time_us[stationary_first] <
+                kMinimumObservedStationaryTime) {
+            continue;
+        }
+        std::size_t stationary_count = 0;
+        for (auto before = stationary_first; before < index; ++before) {
+            if (telemetry.speed_kmh[before] <= 1.0F) ++stationary_count;
+        }
+        const auto stationary_samples = index - stationary_first;
+        if (stationary_samples < 4 ||
+            stationary_count * 10 < stationary_samples * 9) {
+            continue;
+        }
+
+        const auto movement_end_iterator = std::lower_bound(
+            telemetry.time_us.begin(), telemetry.time_us.end(),
+            time + kMovementWindow);
+        if (movement_end_iterator == telemetry.time_us.end()) break;
+        const auto movement_end = static_cast<std::size_t>(
+            movement_end_iterator - telemetry.time_us.begin());
+        std::size_t movement_count = 0;
+        float maximum_speed = 0.0F;
+        for (auto after = index; after <= movement_end; ++after) {
+            if (telemetry.speed_kmh[after] >= 3.0F) ++movement_count;
+            maximum_speed = std::max(
+                maximum_speed, telemetry.speed_kmh[after]);
+        }
+        const auto movement_samples = movement_end - index + 1;
+        if (movement_count * 10 >= movement_samples * 7 &&
+            maximum_speed >= 10.0F) {
+            auto last_handling = index > 0 ? index - 1 : 0;
+            while (last_handling > 0 &&
+                   telemetry.speed_kmh[last_handling] <= 3.0F) {
+                --last_handling;
+            }
+            const auto placement_time = telemetry.time_us[last_handling];
+            const auto altitude_mean = [&](Timestamp begin, Timestamp end) {
+                const auto first = std::lower_bound(
+                    telemetry.time_us.begin(), telemetry.time_us.end(), begin);
+                const auto last = std::lower_bound(
+                    telemetry.time_us.begin(), telemetry.time_us.end(), end);
+                double total = 0.0;
+                std::size_t count = 0;
+                for (auto sample = first; sample != last; ++sample) {
+                    const auto altitude_index = static_cast<std::size_t>(
+                        sample - telemetry.time_us.begin());
+                    total += telemetry.altitude_m[altitude_index];
+                    ++count;
+                }
+                return count ? std::optional(total / count) : std::nullopt;
+            };
+            const auto held_altitude = altitude_mean(
+                placement_time - 5 * kSecond, placement_time);
+            const auto placed_altitude = altitude_mean(
+                placement_time, placement_time + 5 * kSecond);
+            const auto descended = held_altitude && placed_altitude &&
+                *held_altitude - *placed_altitude >= 0.5;
+            const auto vertical_quiet = [&] {
+                const auto first = std::lower_bound(
+                    telemetry.time_us.begin(), telemetry.time_us.end(),
+                    placement_time);
+                const auto last = std::lower_bound(
+                    telemetry.time_us.begin(), telemetry.time_us.end(),
+                    placement_time + 5 * kSecond);
+                double sum = 0.0;
+                double squared = 0.0;
+                std::size_t count = 0;
+                for (auto sample = first; sample != last; ++sample) {
+                    const auto vertical_index = static_cast<std::size_t>(
+                        sample - telemetry.time_us.begin());
+                    const auto value = static_cast<double>(
+                        telemetry.vertical_g[vertical_index]);
+                    if (!std::isfinite(value)) continue;
+                    sum += value;
+                    squared += value * value;
+                    ++count;
+                }
+                if (count < 10) return false;
+                const auto mean = sum / static_cast<double>(count);
+                const auto variance = std::max(
+                    0.0, squared / static_cast<double>(count) - mean * mean);
+                return std::sqrt(variance) <= 0.15;
+            }();
+            return VehicleLaunchCue{time, descended && vertical_quiet};
+        }
+    }
+    return std::nullopt;
+}
 
 TriggerScore score_trigger(const TelemetrySeries& telemetry, const RadioSeries& radio, Timestamp anchor, Timestamp correction, int sign) {
     std::vector<double> commands;
@@ -184,40 +374,101 @@ AlignmentResult align_radio(const TelemetrySeries& telemetry, const RadioSeries&
         result.reason = "Telemetry or radio data is empty";
         return result;
     }
-    if (radio.filename_time_us && !telemetry.absolute_time_us.empty() && telemetry.absolute_time_us.front() > 0) {
-        const auto gap = std::llabs(*radio.filename_time_us - telemetry.absolute_time_us.front());
-        if (gap > 36LL * 3600LL * kSecond) {
-            result.reason = "RaceBox and Sanwa filename clocks are from different sessions";
-            return result;
-        }
-    }
     result.compatible = true;
     result.used_end_anchor = true;
     result.radio_anchor_us = telemetry.time_us.back() - radio.duration_us();
-    result.reason = "Sanwa filename is an export time; recording end anchored to RaceBox session end";
-
-    TriggerScore best;
-    for (const int sign : {1, -1}) {
-        for (Timestamp correction = -kSecond; correction <= kSecond; correction += 50'000) {
-            const auto candidate = score_trigger(telemetry, radio, result.radio_anchor_us, correction, sign);
-            if (candidate.score > best.score) best = candidate;
+    std::vector<LaunchCue> launch_cues;
+    const auto telemetry_onset =
+        first_sustained_vehicle_launch(telemetry);
+    if (telemetry_onset) {
+        for (const int sign : {1, -1}) {
+            const auto radio_onset =
+                first_sustained_forward_trigger(radio, sign);
+            if (!radio_onset) continue;
+            const auto nominal_command_time =
+                result.radio_anchor_us + *radio_onset;
+            const auto correction = telemetry_onset->onset_us -
+                nominal_command_time - result.throttle_response_us;
+            const auto launch_signal = score_trigger(
+                telemetry, radio, result.radio_anchor_us, correction, sign);
+            if (launch_signal.score >= 0.60 &&
+                launch_signal.direction >= 0.55) {
+                launch_cues.push_back(
+                    {*radio_onset, telemetry_onset->onset_us, correction, sign,
+                        telemetry_onset->altitude_descent_supported});
+            }
         }
     }
-    const auto fine_start = std::max(-kSecond, best.correction - 100'000);
-    const auto fine_end = std::min(kSecond, best.correction + 100'000);
-    for (Timestamp correction = fine_start; correction <= fine_end; correction += 1'000) {
-        const auto candidate = score_trigger(telemetry, radio, result.radio_anchor_us, correction, best.sign);
+
+    const auto evaluate = [&](Timestamp correction, int sign) {
+        auto candidate = score_trigger(
+            telemetry, radio, result.radio_anchor_us, correction, sign);
+        for (const auto& cue : launch_cues) {
+            if (cue.trigger_sign != sign) continue;
+            const auto launch_error = std::llabs(
+                correction - cue.correction_us);
+            constexpr Timestamp kLaunchTolerance = 600'000;
+            if (launch_error <= kLaunchTolerance) {
+                const auto agreement = 1.0 -
+                    static_cast<double>(launch_error) / kLaunchTolerance;
+                candidate.score += agreement * 0.25;
+            }
+        }
+        return candidate;
+    };
+
+    TriggerScore best;
+    const auto search = [&](int sign, Timestamp begin, Timestamp end) {
+        for (auto correction = begin; correction <= end;
+             correction += 50'000) {
+            const auto candidate = evaluate(correction, sign);
+            if (candidate.score > best.score) best = candidate;
+        }
+    };
+    for (const int sign : {1, -1}) {
+        search(sign, -kSecond, kSecond);
+    }
+    for (const auto& cue : launch_cues) {
+        search(cue.trigger_sign, cue.correction_us - kSecond,
+            cue.correction_us + kSecond);
+    }
+
+    const auto fine_start = best.correction - 100'000;
+    const auto fine_end = best.correction + 100'000;
+    for (auto correction = fine_start; correction <= fine_end;
+         correction += 1'000) {
+        const auto candidate = evaluate(correction, best.sign);
         if (candidate.score > best.score) best = candidate;
     }
     result.fine_correction_us = best.correction;
     result.trigger_sign = best.sign;
 
-    double best_steering = 0.0;
-    Timestamp best_lag = 200'000;
+    const auto selected_launch = std::find_if(
+        launch_cues.begin(), launch_cues.end(), [&](const LaunchCue& cue) {
+            return cue.trigger_sign == result.trigger_sign &&
+                std::llabs(cue.correction_us -
+                    result.fine_correction_us) <= 600'000;
+        });
+    result.reason = selected_launch != launch_cues.end()
+        ? selected_launch->altitude_descent_supported
+            ? "Final self-alignment ignored the manually set Sanwa time; a downward RaceBox altitude trend plus quiet vertical G supported car placement, and the first sustained forward trigger was matched to the first genuine GPS departure after the car sat stationary on the track; steering wiggles and brake-direction candidates did not set the clock"
+            : "Final self-alignment ignored the manually set Sanwa time and matched the first sustained forward trigger to the first genuine GPS departure after the car sat stationary on the track; steering wiggles and brake-direction candidates did not set the clock; altitude was not required"
+        : radio.filename_time_us
+            ? "Manually set Sanwa filename time was ignored; recording end supplied a rough fallback and signals supplied the final correction because no safe stationary-launch cue was present"
+            : "Sanwa recording has no usable time; recording end supplied a rough fallback and signals supplied the final correction because no safe stationary-launch cue was present";
+
+    double best_heading_steering = 0.0;
+    double best_gps_steering = 0.0;
+    Timestamp best_heading_lag = 200'000;
+    Timestamp best_gps_lag = 200'000;
+    std::size_t best_gps_samples = 0;
     for (Timestamp lag = 0; lag <= 400'000; lag += 20'000) {
-        std::vector<double> commands, yaw_rates;
-        commands.reserve(radio.size() / 4);
-        yaw_rates.reserve(radio.size() / 4);
+        std::vector<double> heading_commands, heading_yaw_rates;
+        std::vector<double> gps_commands, gps_yaw_rates;
+        heading_commands.reserve(radio.size() / 4);
+        heading_yaw_rates.reserve(radio.size() / 4);
+        gps_commands.reserve(radio.size() / 4);
+        gps_yaw_rates.reserve(radio.size() / 4);
         for (std::size_t index = 0; index < radio.size(); index += 4) {
             const auto command = static_cast<double>(radio.steering_percent[index]) / 100.0;
             if (std::abs(command) < 0.08) continue;
@@ -225,21 +476,45 @@ AlignmentResult align_radio(const TelemetrySeries& telemetry, const RadioSeries&
             if (time < telemetry.time_us.front() || time > telemetry.time_us.back()) continue;
             const auto row = nearest_index(telemetry.time_us, time);
             if (telemetry.speed_kmh[row] < 5.0F) continue;
-            const auto yaw = heading_rate_at(telemetry, time);
-            if (!std::isfinite(yaw)) continue;
-            commands.push_back(command);
-            yaw_rates.push_back(yaw);
+            const auto heading_yaw = heading_rate_at(telemetry, time);
+            if (std::isfinite(heading_yaw)) {
+                heading_commands.push_back(command);
+                heading_yaw_rates.push_back(heading_yaw);
+            }
+            const auto gps_yaw = gps_path_yaw_rate_at(telemetry, time);
+            if (std::isfinite(gps_yaw)) {
+                gps_commands.push_back(command);
+                gps_yaw_rates.push_back(gps_yaw);
+            }
         }
-        const auto correlation = pearson(commands, yaw_rates);
-        if (std::abs(correlation) > std::abs(best_steering)) {
-            best_steering = correlation;
-            best_lag = lag;
+        const auto heading_correlation = pearson(
+            heading_commands, heading_yaw_rates);
+        if (std::abs(heading_correlation) >
+            std::abs(best_heading_steering)) {
+            best_heading_steering = heading_correlation;
+            best_heading_lag = lag;
+        }
+        const auto gps_correlation = pearson(gps_commands, gps_yaw_rates);
+        if (gps_commands.size() >= 100 &&
+            std::abs(gps_correlation) > std::abs(best_gps_steering)) {
+            best_gps_steering = gps_correlation;
+            best_gps_lag = lag;
+            best_gps_samples = gps_commands.size();
         }
     }
-    result.steering_sign = best_steering < 0.0 ? -1 : 1;
-    result.steering_response_us = best_lag;
+    const auto use_gps_path = best_gps_samples >= 100 &&
+        std::abs(best_gps_steering) >= 0.35;
+    const auto steering_polarity_evidence = use_gps_path
+        ? best_gps_steering : best_heading_steering;
+    result.steering_sign = steering_polarity_evidence < 0.0 ? -1 : 1;
+    result.steering_response_us = use_gps_path
+        ? best_gps_lag : best_heading_lag;
+    result.steering_yaw_source = use_gps_path ? "gps_path" : "racebox_heading";
+    result.gps_yaw_samples = use_gps_path ? best_gps_samples : 0;
 
     std::vector<double> commands, responses, steering, yaw;
+    std::vector<double> steering_heading, heading_yaw;
+    std::vector<double> gps_yaw_for_heading, heading_for_gps;
     std::size_t direction_checks = 0, direction_matches = 0;
     for (std::size_t index = 0; index < telemetry.size(); index += 2) {
         const auto radio_elapsed = telemetry.time_us[index] - result.radio_anchor_us - result.fine_correction_us;
@@ -260,16 +535,45 @@ AlignmentResult align_radio(const TelemetrySeries& telemetry, const RadioSeries&
         }
         const auto corrected_steering = sample.steering * result.steering_sign / 100.0;
         if (std::abs(corrected_steering) >= 0.08) {
-            const auto yaw_rate = heading_rate_at(telemetry, telemetry.time_us[index] + result.steering_response_us);
-            if (std::isfinite(yaw_rate)) {
+            const auto response_time = telemetry.time_us[index] +
+                result.steering_response_us;
+            const auto racebox_heading_yaw = heading_rate_at(
+                telemetry, response_time);
+            const auto gps_yaw = gps_path_yaw_rate_at(
+                telemetry, response_time);
+            const auto selected_yaw = use_gps_path
+                ? gps_yaw : racebox_heading_yaw;
+            if (std::isfinite(selected_yaw)) {
                 steering.push_back(corrected_steering);
-                yaw.push_back(yaw_rate);
+                yaw.push_back(selected_yaw);
+            }
+            if (std::isfinite(racebox_heading_yaw)) {
+                steering_heading.push_back(corrected_steering);
+                heading_yaw.push_back(racebox_heading_yaw);
+            }
+            if (std::isfinite(racebox_heading_yaw) && std::isfinite(gps_yaw)) {
+                heading_for_gps.push_back(racebox_heading_yaw);
+                gps_yaw_for_heading.push_back(gps_yaw);
             }
         }
     }
     result.trigger_correlation = pearson(commands, responses);
     result.direction_agreement = direction_checks ? static_cast<double>(direction_matches) / direction_checks : 0.0;
     result.steering_yaw_correlation = pearson(steering, yaw);
+    result.steering_heading_correlation = pearson(
+        steering_heading, heading_yaw);
+    result.heading_gps_yaw_correlation = pearson(
+        heading_for_gps, gps_yaw_for_heading);
+    result.launch_cue_used = selected_launch != launch_cues.end();
+    result.altitude_supported = result.launch_cue_used &&
+        selected_launch->altitude_descent_supported;
+    result.reason += use_gps_path
+        ? "; steering left/right polarity was set independently from GPS path yaw so the map direction is authoritative"
+        : "; GPS path yaw was too weak for a direction check, so steering polarity used the RaceBox heading fallback";
+    if (use_gps_path && result.heading_gps_yaw_correlation < -0.50) {
+        result.reason +=
+            "; the RaceBox heading direction was inverted relative to the GPS trace and was not allowed to flip left/right";
+    }
 
     Session temporary;
     temporary.telemetry = telemetry;
@@ -300,7 +604,19 @@ AlignmentResult align_radio(const TelemetrySeries& telemetry, const RadioSeries&
         }
     }
     result.lap_steering_correlation = median(lap_correlations);
-    result.confidence = std::abs(result.trigger_correlation) >= 0.35 && std::abs(result.steering_yaw_correlation) >= 0.60 && result.lap_steering_correlation >= 0.70 ? "high" : "medium";
+    const auto lap_evidence_trusted = reference
+        ? result.lap_steering_correlation >= 0.70
+        : selected_launch != launch_cues.end();
+    const auto trusted = std::abs(result.trigger_correlation) >= 0.35 &&
+        result.direction_agreement >= 0.60 &&
+        result.steering_yaw_correlation >= 0.60 &&
+        lap_evidence_trusted;
+    result.confidence = trusted ? "high" : "low";
+    if (!trusted) {
+        result.compatible = false;
+        result.reason +=
+            "; alignment evidence is too weak, so Sanwa controls are withheld";
+    }
     return result;
 }
 

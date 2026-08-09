@@ -186,10 +186,27 @@ std::optional<std::int64_t> filename_epoch_us(const std::filesystem::path& path)
         tm.tm_hour = std::stoi(digits.substr(6, 2));
         tm.tm_min = std::stoi(digits.substr(8, 2));
         tm.tm_sec = std::stoi(digits.substr(10, 2));
-        const auto epoch = utc_epoch_seconds(tm);
-        if (epoch > 0) return epoch * kSecond;
+        tm.tm_isdst = -1;
+        const auto epoch = std::mktime(&tm);
+        if (epoch > 0) {
+            return static_cast<std::int64_t>(epoch) * kSecond;
+        }
     }
     return std::nullopt;
+}
+
+std::optional<std::int64_t> file_modified_epoch_us(
+    const std::filesystem::path& path) {
+    std::error_code error;
+    const auto modified = std::filesystem::last_write_time(path, error);
+    if (error) return std::nullopt;
+    const auto system_time = std::chrono::time_point_cast<
+        std::chrono::system_clock::duration>(
+        modified - std::filesystem::file_time_type::clock::now() +
+        std::chrono::system_clock::now());
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               system_time.time_since_epoch())
+        .count();
 }
 
 ParsedVbo parse_vbo_full(const std::filesystem::path& path, std::vector<std::string>& diagnostics) {
@@ -319,8 +336,36 @@ TelemetrySeries parse_racebox_csv(const std::filesystem::path& path, std::vector
     std::ifstream file(path);
     if (!file) throw std::runtime_error("Could not open RaceBox CSV: " + path.string());
     std::string line;
-    if (!std::getline(file, line)) throw std::runtime_error("RaceBox CSV is empty");
-    const auto header = split(line, ',');
+    std::vector<std::string> header;
+    std::size_t metadata_rows = 0;
+    constexpr std::size_t maximum_header_search_rows = 2'048;
+    while (metadata_rows < maximum_header_search_rows &&
+           std::getline(file, line)) {
+        auto candidate = split(line, ',');
+        const auto contains = [&](std::string_view name) {
+            return std::find(
+                       candidate.begin(), candidate.end(), name) !=
+                candidate.end();
+        };
+        if (contains("Time") && contains("Latitude") &&
+            contains("Longitude")) {
+            header = std::move(candidate);
+            break;
+        }
+        ++metadata_rows;
+    }
+    if (header.empty()) {
+        if (metadata_rows == 0) {
+            throw std::runtime_error("RaceBox CSV is empty");
+        }
+        throw std::runtime_error(
+            "RaceBox CSV is missing Time/Latitude/Longitude");
+    }
+    if (metadata_rows > 0) {
+        diagnostics.push_back(
+            "Skipped " + std::to_string(metadata_rows) +
+            " RaceBox CSV metadata rows before the telemetry header");
+    }
     const auto column = [&](std::string_view name) {
         for (std::size_t index = 0; index < header.size(); ++index) if (header[index] == name) return static_cast<int>(index);
         return -1;
@@ -417,14 +462,21 @@ RadioSeries parse_sanwa_csv(const std::filesystem::path& path, std::vector<std::
     if (!file) throw std::runtime_error("Could not open Sanwa CSV: " + path.string());
     std::string line;
     std::vector<std::string> header;
+    bool read_any_line = false;
     while (std::getline(file, line)) {
+        read_any_line = true;
         header = split(line, ',');
         if (std::find(header.begin(), header.end(), "REC TIME") != header.end() &&
             std::find(header.begin(), header.end(), "ST(%)") != header.end() &&
             std::find(header.begin(), header.end(), "TH(%)") != header.end()) break;
         header.clear();
     }
-    if (header.empty()) throw std::runtime_error("Sanwa CSV is missing REC TIME/ST(%)/TH(%)");
+    if (header.empty()) {
+        if (!read_any_line) {
+            throw std::runtime_error("Sanwa CSV is empty (0 bytes)");
+        }
+        throw std::runtime_error("Sanwa CSV is missing REC TIME/ST(%)/TH(%)");
+    }
     const auto column = [&](std::string_view name) {
         for (std::size_t index = 0; index < header.size(); ++index) if (header[index] == name) return static_cast<int>(index);
         return -1;
@@ -433,6 +485,7 @@ RadioSeries parse_sanwa_csv(const std::filesystem::path& path, std::vector<std::
     RadioSeries result;
     result.filename = path.filename().string();
     result.filename_time_us = filename_epoch_us(path);
+    result.file_modified_time_us = file_modified_epoch_us(path);
     while (std::getline(file, line)) {
         const auto fields = split(line, ',');
         if (time_col >= static_cast<int>(fields.size()) || steering_col >= static_cast<int>(fields.size()) || trigger_col >= static_cast<int>(fields.size())) continue;

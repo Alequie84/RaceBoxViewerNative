@@ -62,6 +62,34 @@ std::vector<std::filesystem::path> open_telemetry_files(
     return paths;
 }
 
+std::optional<std::filesystem::path> open_sanwa_file(
+    HWND owner,
+    const std::filesystem::path& initial_folder) {
+    IFileOpenDialog* dialog = nullptr;
+    if (FAILED(CoCreateInstance(
+            CLSID_FileOpenDialog, nullptr, CLSCTX_ALL,
+            IID_PPV_ARGS(&dialog)))) {
+        return std::nullopt;
+    }
+    dialog->SetTitle(L"Load or replace Sanwa controls");
+    const COMDLG_FILTERSPEC filters[] = {
+        {L"Sanwa telemetry CSV", L"*.csv"}};
+    dialog->SetFileTypes(1, filters);
+    dialog->SetOptions(
+        FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
+    set_initial_folder(dialog, initial_folder);
+    std::optional<std::filesystem::path> result;
+    if (SUCCEEDED(dialog->Show(owner))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&item))) {
+            result = shell_path(item);
+            item->Release();
+        }
+    }
+    dialog->Release();
+    return result;
+}
+
 std::optional<std::filesystem::path> choose_telemetry_folder(
     HWND owner,
     const std::filesystem::path& initial_folder) {
@@ -149,6 +177,30 @@ std::optional<std::filesystem::path> open_image_file(HWND owner) {
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&dialog)))) return std::nullopt;
     const COMDLG_FILTERSPEC filters[] = {{L"Map images", L"*.png;*.jpg;*.jpeg;*.bmp"}};
     dialog->SetFileTypes(1, filters);
+    std::optional<std::filesystem::path> result;
+    if (SUCCEEDED(dialog->Show(owner))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&item))) {
+            result = shell_path(item);
+            item->Release();
+        }
+    }
+    dialog->Release();
+    return result;
+}
+
+std::optional<std::filesystem::path> open_setup_pdf(HWND owner) {
+    IFileOpenDialog* dialog = nullptr;
+    if (FAILED(CoCreateInstance(
+            CLSID_FileOpenDialog, nullptr, CLSCTX_ALL,
+            IID_PPV_ARGS(&dialog)))) {
+        return std::nullopt;
+    }
+    dialog->SetTitle(L"Import setup sheet PDF");
+    const COMDLG_FILTERSPEC filters[] = {
+        {L"PDF setup sheets", L"*.pdf"}};
+    dialog->SetFileTypes(1, filters);
+    dialog->SetOptions(FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
     std::optional<std::filesystem::path> result;
     if (SUCCEEDED(dialog->Show(owner))) {
         IShellItem* item = nullptr;

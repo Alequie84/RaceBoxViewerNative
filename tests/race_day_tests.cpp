@@ -215,6 +215,8 @@ int main() {
             temporary_root / L"racebox-managed-source.rbxsession";
         const auto managed_unsupported =
             temporary_root / L"racebox-managed-source.txt";
+        const auto managed_empty_csv =
+            temporary_root / L"racebox-managed-empty.csv";
         const auto managed_missing =
             temporary_root / L"racebox-managed-missing.vbo";
         const auto write_fixture = [](const std::filesystem::path& path,
@@ -235,6 +237,7 @@ int main() {
         write_fixture(managed_gpx, "<gpx></gpx>");
         write_fixture(managed_archive, "native archive fixture");
         write_fixture(managed_unsupported, "unsupported fixture");
+        write_fixture(managed_empty_csv, {});
         std::error_code fixture_cleanup_error;
         std::filesystem::remove(
             managed_missing, fixture_cleanup_error);
@@ -402,6 +405,16 @@ int main() {
                 "Out-of-range removal changed the run");
 
         const auto before_atomic_rejection = managed_run.telemetry_files;
+        selected_sources = {managed_empty_csv};
+        attachment =
+            racebox::race_day::attach_or_replace_telemetry_sources(
+                managed_run, selected_sources);
+        require(
+            !attachment.ok &&
+                attachment.error.find("empty (0 bytes)") !=
+                    std::string::npos &&
+                managed_run.telemetry_files == before_atomic_rejection,
+            "Empty telemetry source was attached or lacked a clear error");
         selected_sources = {managed_gpx, managed_missing};
         attachment =
             racebox::race_day::attach_or_replace_telemetry_sources(
@@ -549,6 +562,21 @@ int main() {
                 "Removing the final source retained a stale recording timestamp");
 
         auto& current = day.runs[1];
+        day.car_profile_id = "car-awesomatix-a800r";
+        day.car_profile = {
+            .id = day.car_profile_id,
+            .name = "Awesomatix asphalt car",
+            .brand = "Awesomatix",
+            .model = "A800R",
+            .chassis = "A800R carbon",
+            .motor = "13.5T",
+            .esc = "Hobbywing XR10 Pro",
+            .servo = "Sanwa PGS-XR",
+            .receiver = "Sanwa RX-493i",
+            .radio = "Sanwa M17",
+            .gearing = "4.20 FDR",
+            .notes = "Club-race asphalt profile",
+        };
         current.recorded_at_utc = "2026-07-11T21:54:00.040Z";
         current.conditions.tire_set_id = "Set 3";
         current.conditions.tire_runs_before = 4;
@@ -558,7 +586,41 @@ int main() {
         current.conditions.tire_warmer_temperature_c = 60.0;
         current.setup_changes = "Rear spring 2.6 to 2.8";
         current.post_run_notes = "More rotation, but nervous on power.";
+        current.setup_sheet_enabled = true;
+        current.setup_sheet.template_id = "template-a800r";
+        current.setup_sheet.revision_id = "revision-current";
+        current.setup_sheet.parent_revision_id = "revision-previous";
+        current.setup_sheet.display_name = "A800R club base";
+        current.setup_sheet.source_sha256 = "source-pdf-sha256";
+        current.setup_sheet.rendered_sha256 = "rendered-pdf-sha256";
+        current.setup_sheet.fields.push_back({
+            .key = "rear-spring",
+            .label = "Rear spring",
+            .section = "Suspension",
+            .value = "2.8",
+            .unit = "lb/in",
+            .page = 0,
+            .left = 0.62,
+            .top = 0.34,
+            .right = 0.71,
+            .bottom = 0.38,
+            .confidence = 100,
+            .confirmed = true,
+        });
         current.checklist.front().checked = true;
+        current.session_chat = {
+            {"user", "Did the rear caster change help rotation?", "message-user-1", 1'700'000'000, "Alex S25 Ultra"},
+            {"assistant", "Yes, the matched-corner data shows more rotation per steering input.", "message-assistant-1", 1'700'000'001, "crew-chief"},
+        };
+        day.conversation.push_back({
+            "user",
+            "Compare the spring change.",
+            "message-comparison-1",
+            1'700'000'002,
+            "viewer",
+            {day.runs[0].id, current.id},
+            day.runs[0].id + "->" + current.id,
+        });
         const auto identity_source =
             std::filesystem::temp_directory_path() /
             L"racebox-race-day-\u03a9-source-identity.vbo";
@@ -669,6 +731,32 @@ int main() {
                 "Tire warmer temperature did not persist");
         require(restored.runs[1].checklist.front().checked, "Checklist state did not persist");
         require(restored.runs[1].setup_changes == current.setup_changes, "Setup changes did not persist");
+        require(restored.car_profile_id == day.car_profile_id &&
+                    restored.car_profile.model == "A800R" &&
+                    restored.car_profile.radio == "Sanwa M17",
+                "Race Day v6 car-profile snapshot did not persist");
+        require(restored.runs[1].setup_sheet_enabled &&
+                    restored.runs[1].setup_sheet.revision_id == "revision-current" &&
+                    restored.runs[1].setup_sheet.fields.size() == 1 &&
+                    restored.runs[1].setup_sheet.fields.front().value == "2.8" &&
+                    restored.runs[1].setup_sheet.fields.front().confirmed,
+                "Race Day v6 setup-sheet snapshot did not persist");
+        require(restored.runs[1].session_chat.size() == 2 &&
+                    restored.runs[1].session_chat.back().role == "assistant" &&
+                    restored.runs[1].session_chat.back().id == "message-assistant-1" &&
+                    restored.runs[1].session_chat.back().origin == "crew-chief" &&
+                    restored.runs[1].session_chat.back().content.find("more rotation") != std::string::npos,
+                "Per-run Crew Chief conversation did not persist");
+        const auto restored_comparison = std::find_if(
+            restored.conversation.begin(), restored.conversation.end(),
+            [](const auto& turn) {
+                return turn.id == "message-comparison-1";
+            });
+        require(restored_comparison != restored.conversation.end() &&
+                    restored_comparison->linked_run_ids.size() == 2 &&
+                    restored_comparison->comparison_id ==
+                        day.runs[0].id + "->" + current.id,
+                "Race Day v6 comparison conversation links did not persist");
         require(restored.runs[1].recorded_at_utc ==
                     current.recorded_at_utc,
                 "Run recording timestamp did not persist");
@@ -708,29 +796,88 @@ int main() {
                     .telemetry_source_identities.front().size_bytes == 31,
                 "Saving silently blessed the replacement telemetry file");
 
-        const auto legacy_path =
-            std::filesystem::temp_directory_path() / L"racebox-race-day-v1-test.rbxday";
-        {
+        std::vector<std::filesystem::path> legacy_paths;
+        for (int legacy_version = 1; legacy_version <= 5; ++legacy_version) {
+            const auto legacy_path = std::filesystem::temp_directory_path() /
+                (L"racebox-race-day-v" + std::to_wstring(legacy_version) +
+                 L"-test.rbxday");
+            legacy_paths.push_back(legacy_path);
             nlohmann::json legacy;
             std::ifstream saved(path, std::ios::binary);
             saved >> legacy;
-            legacy["version"] = 1;
-            legacy.erase("setup_knowledge");
+            legacy["version"] = legacy_version;
+            legacy.erase("car_profile_id");
+            legacy.erase("car_profile");
+            legacy.erase("conversation");
+            if (legacy_version == 1) legacy.erase("setup_knowledge");
             for (auto& legacy_run : legacy["runs"]) {
-                legacy_run.erase("recorded_at_utc");
+                legacy_run.erase("setup_sheet_enabled");
+                legacy_run.erase("setup_sheet");
+                if (legacy_version == 1) legacy_run.erase("recorded_at_utc");
+                for (auto& turn : legacy_run["session_chat"]) {
+                    turn.erase("id");
+                    turn.erase("created_at");
+                    turn.erase("origin");
+                }
             }
-            std::ofstream output(legacy_path, std::ios::binary | std::ios::trunc);
+            std::ofstream output(
+                legacy_path, std::ios::binary | std::ios::trunc);
             output << legacy.dump(2);
+            output.close();
+
+            racebox::race_day::Day legacy_restored;
+            require(racebox::race_day::load(
+                        legacy_path, legacy_restored, error),
+                    "Version 1-5 race-day files lost backward compatibility");
+            require(legacy_restored.runs[1].session_chat.size() == 2 &&
+                        !legacy_restored.runs[1].session_chat.front().id.empty() &&
+                        legacy_restored.runs[1].session_chat.front().created_at == 0 &&
+                        legacy_restored.runs[1].session_chat.front().origin == "viewer",
+                    "Legacy chat metadata was not migrated safely");
+            require(legacy_restored.conversation.size() >= 2 &&
+                        legacy_restored.conversation.front().linked_run_ids.size() == 1 &&
+                        legacy_restored.conversation.front().linked_run_ids.front() ==
+                            legacy_restored.runs[1].id,
+                    "Legacy per-run chat was not migrated into the Race Day timeline");
+            if (legacy_version == 1) {
+                require(legacy_restored.setup_knowledge.empty(),
+                        "Version-1 race-day file unexpectedly created setup knowledge");
+                require(legacy_restored.runs[1].recorded_at_utc.empty(),
+                        "Version-1 race-day file invented a recording timestamp");
+            }
         }
-        racebox::race_day::Day legacy_restored;
-        require(racebox::race_day::load(legacy_path, legacy_restored, error),
-                "Version-1 race-day files lost backward compatibility");
-        require(legacy_restored.setup_knowledge.empty(),
-                "Version-1 race-day file unexpectedly created setup knowledge");
-        require(legacy_restored.runs[1].recorded_at_utc.empty(),
-                "Version-1 race-day file invented a recording timestamp");
+
+        auto boundary_day = racebox::race_day::standard_day(false, false);
+        auto& boundary_chat = boundary_day.runs.front().session_chat;
+        boundary_chat.reserve(racebox::race_day::kMaximumSessionChatTurns + 1);
+        for (std::size_t index = 0;
+             index < racebox::race_day::kMaximumSessionChatTurns;
+             ++index) {
+            boundary_chat.push_back({
+                index % 2 == 0 ? "user" : "assistant",
+                "bounded conversation turn",
+                "boundary-message-" + std::to_string(index),
+                static_cast<std::int64_t>(index),
+                index % 2 == 0 ? "viewer" : "crew-chief",
+            });
+        }
+        const auto boundary_path = std::filesystem::temp_directory_path() /
+            L"racebox-race-day-chat-boundary.rbxday";
+        require(racebox::race_day::save(
+                    boundary_day, boundary_path, error),
+                "Exactly 2000 Crew Chief turns could not be saved");
+        boundary_chat.push_back({
+            "user", "one message too many", "boundary-message-overflow",
+            2'001, "viewer"});
+        require(!racebox::race_day::save(
+                    boundary_day, boundary_path, error) &&
+                    error.find("2000-message") != std::string::npos,
+                "More than 2000 Crew Chief turns were not rejected");
         std::filesystem::remove(path, ignored);
-        std::filesystem::remove(legacy_path, ignored);
+        std::filesystem::remove(boundary_path, ignored);
+        for (const auto& legacy_path : legacy_paths) {
+            std::filesystem::remove(legacy_path, ignored);
+        }
         std::filesystem::remove(identity_source, ignored);
         std::filesystem::remove(managed_vbo_a, ignored);
         std::filesystem::remove(managed_vbo_b, ignored);
@@ -739,6 +886,7 @@ int main() {
         std::filesystem::remove(managed_gpx, ignored);
         std::filesystem::remove(managed_archive, ignored);
         std::filesystem::remove(managed_unsupported, ignored);
+        std::filesystem::remove(managed_empty_csv, ignored);
 
         const auto session = synthetic_session();
         const auto imu = racebox::imu::analyze(session.telemetry);

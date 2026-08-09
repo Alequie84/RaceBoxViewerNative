@@ -4,11 +4,13 @@ Formula contract: `racebox-setup-analytics-v3`
 
 ## Event-day model
 
-A version-2 `.rbxday` file is a lightweight event book. It stores the
-event/track/date, run order, file references, conditions, checklist, notes, and
+A version-6 `.rbxday` file is a lightweight event book. It stores the
+event/track/date, run order, file references, conditions, checklist, notes,
+car-profile and immutable setup-revision references plus bounded snapshots,
+Setup Sheet ON/OFF state, known/untracked changes, day-level conversation, and
 bounded Setup Knowledge results; it does not keep every telemetry recording
-resident in memory. Version-1 event books remain readable with an empty Setup
-Knowledge history.
+resident in memory. Versions 1–5 remain readable and migrate without duplicating
+legacy conversation turns.
 
 Built-in run types are:
 
@@ -29,22 +31,151 @@ Every run stores:
 - tire warmer minutes and temperature;
 - battery pack/ID and optional voltage;
 - references to VBO, RaceBox CSV, Sanwa CSV, GPX, or native session archives.
+- setup-sheet state, immutable revision ancestry, and whether the physical setup
+  is fully known, partially known, or awaiting reconciliation.
 
-The Crew Chief lives in Race Day beside the notes and conditions it needs. Its
-primary action always names one **Previous / baseline** run and one
-**Current / changed** run. Both are loaded on a worker thread only for the
-analysis, converted to the canonical aligned CSV, and released afterward.
-Session has a separate Race Day run selector for choosing which recording is
-displayed on the map and graphs.
+Race Day is the persistent left panel and Crew Chief is the persistent right
+panel around the Run/Telemetry/Compare/Findings/Report center. The selected run
+is always **Current**; the nearest earlier data-ready run becomes **Previous**
+unless the driver overrides it. A run selection changes every visible context
+together. Both runs are loaded on a worker only for analysis, converted to the
+canonical aligned CSV, and released afterward. At narrow widths the panels are
+temporary overlays rather than shrinking the telemetry graphs.
 
 ## Disclosure and transport
 
 The collapsed advanced lap-to-lap Crew Chief check remains evidence-only.
+
+## Garage, setup revisions, and PDFs
+
+The reusable garage profile records chassis, electronics, radio, gearing, and
+notes. The local setup library uses schema-versioned SQLite under
+`%LOCALAPPDATA%\RaceBoxTelemetryViewer\2`. Imported PDFs are copied into a
+SHA-256 content-addressed managed store; the original download location is not
+needed afterward. Sources stay immutable and every saved physical setup is a
+child revision. A bounded snapshot inside the event file keeps the day
+understandable if the local library is missing.
+
+With **Setup Sheet ON**, a run begins from the latest physical revision and save
+creates the next immutable revision. With it OFF, free-text physical changes
+carry forward as a notes-only, partially-known revision. Re-enabling exact setup
+comparison requires the driver to reconcile the sheet with the real car.
+PDFium renders pages and preserves AcroForm editing. Flat sheets support one-time
+driver-confirmed rectangles, labels, and units; uncertain proposed mappings are
+never accepted silently.
+
+`racebox-race-day-request-v4` carries exact structured values and their diff.
+Only the explicit Previous-versus-Current action may additionally render up to
+two pages per run as bounded PNG/JPEG evidence under
+`racebox-setup-sheet-vision-v1`. No PDF bytes or local paths leave the Viewer,
+the gateway retains no image data, and structured values win over a visual
+reading. The registered OpenClaw lane must pass a real red-image capability
+probe before images are enabled; otherwise the editor and structured comparison
+continue and the UI reports vision unavailable.
+
+## Continuous Race Day conversation
+
+The Crew Chief panel keeps one day-level timeline while the center view changes.
+It filters Whole day or Selected run; every message stores a stable ID,
+timestamp, origin, linked run IDs, and optional Previous-to-Current comparison
+ID. The composer states whether it is sending Current only or Previous and
+Current. The single-run request uses
+`racebox-session-chat-request-v1` and includes one bounded
+`racebox-session-analytics-csv-v1` document covering the complete recording.
+The gateway reduces that CSV to `racebox-session-review-v5` before a language
+model is called.
+
+The single-run review contains every chronological lap or segment, its phase,
+duration, average and maximum speed, 90th-percentile absolute lateral G,
+longitudinal-G ranges, available steering/throttle/brake summaries, cautious
+braking indicators, best/median lap deltas, consistency, and first-third versus
+last-third trends. It also checks the whole run for a one-off abrupt near-stop
+that is unusually slow compared with other laps at the same track progress.
+When one clears the cautious threshold, the review calculates recent pre-event
+pace, the incident-lap delta, every later complete lap, and the cumulative
+impact-through-finish delta. Out-laps and in-laps are never presented as
+complete laps.
+Review v3 additionally builds one-percent progress profiles across all complete
+laps and finds repeatable corner zones from the chassis lateral-G pattern. It
+compares the fastest complete lap with the median of the other complete laps,
+including corner time, entry/minimum/exit speed, GPS line difference, and where
+GPS speed began falling before the apex. One whole-lap east/north translation
+per lap is removed only for the line comparison; the original telemetry is not
+changed. A local path shift above three metres is withheld as an alignment
+outlier. A different line is not automatically a better line or proof of why
+the lap was faster.
+The model receives the calculated review and entered Race Day/session context;
+it does not receive the raw CSV, original files, or local paths.
+
+If Sanwa coverage is absent or incomplete, the review still uses RaceBox lap
+timing, speed, GPS/progress, chassis G, and available calibrated yaw. It says
+that steering, throttle, and brake commands are unavailable and forbids
+inventing them. In this case the corner onset is described only as
+speed-derived slowing--where GPS speed began falling--and never as a brake
+trigger point. An unexplained abrupt stop is called only a possible incident;
+Crew Chief asks whether it was contact, a spin/flip, traffic, marshalling, or an
+intentional stop before assigning a cause. If the driver already reported an
+impact or damage, the report can connect that context to the measured
+before/after timing while retaining the causality warning. Single-run chat can
+explain what happened across the run, but it cannot prove a setup cause,
+measured tire temperature, tire load, suspension travel, or wheel lock. The
+adaptive router caps this task below Ultra; deeper intelligence cannot replace
+a controlled A/B comparison.
+
+Review v4 adds the fastest lap's minimum, average, and exit speed differences
+against the median of the other complete laps, plus speed-derived slowing time
+before the apex and an inside/outside GPS-path description when alignment quality
+supports it. For questions such as **what did I do best?** or **how can I go
+faster?**, Crew Chief must explain what changed and what happened afterward, then
+give one steering and one throttle/lift/brake instruction with a measurable
+next-lap checkpoint. It says `began turning left/right into the corner`, not
+`started steering` or a raw `(turn-in)` label. A single comparison is described
+as an association, not proof that the input caused the result.
+
+When Reference and Compare laps are selected in Viewer, Session chat also sends
+the existing local `racebox-driver-analysis-v2` evidence for those laps inside
+the open session context. The packet is distance-aligned and contains each
+corner's event/relative-time metrics plus measured steering, throttle, brake,
+speed, calibrated lateral/longitudinal/vertical G, and yaw summaries for both
+laps and their differences. Retention, repeated-lap support, confidence, GPS
+translation, and interpretation limits travel with the same packet. No source
+path is included. This is optional context within the existing Session and
+companion request contracts; it does not replace the whole-run chronological
+review.
+
+## Shared Viewer and phone session
+
+The default Session panel can promote that same processed review and the
+comparison selected when pairing begins into a
+`racebox-companion-session-v1` room on the user's configured gateway. The gateway parses
+the analytics CSV once, stores only the processed review and complete bounded
+transcript in local SQLite, and discards the raw CSV. A five-minute one-use QR
+or manual code gives the phone a revocable session-scoped token; it does not
+expose the OpenClaw credential or another run.
+
+Viewer and phone synchronize by stable message ID and cursor. Questions create
+jobs with queued, thinking, completed, or failed state, allowing either client
+to reconnect without duplicating a submission. Conversation is retained until
+the driver explicitly clears it. Clear first creates a timestamped JSON backup.
+The model receives recent turns plus a bounded summary of older context, while
+the full transcript remains in storage.
+Each shared assistant message contains the summary, measured observations,
+limitations, next test, and causality note, so the phone and Viewer do not lose
+the useful evidence behind a short headline.
+
+The `.rbxday` version-6 day transcript stores ID, timestamp, role, content,
+origin, linked run IDs, and comparison ID for up to 2,000 turns. Versions 1–5
+migrate with generated stable legacy IDs and de-duplicate existing per-run
+turns. Reaching 2,000 stops further saving until export or explicit clear; no
+old turn is silently dropped.
+
 Race-day analysis is a separate explicit-disclosure action. When the user
-clicks **Ask Crew Chief About These Runs**, the native app sends:
+clicks **Analyze Previous vs Current**, the native app sends:
 
 - two generated `racebox-session-analytics-csv-v1` documents;
 - the entered event/run labels, conditions, checklist, and notes;
+- tire preparation, car profile, setup revisions, structured field diff, and
+  known or untracked physical changes;
 - the user's question.
 
 The original files and file paths are not sent. The private Tailscale gateway
