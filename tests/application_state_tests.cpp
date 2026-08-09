@@ -1,4 +1,3 @@
-#include "racebox/application/services.hpp"
 #include "racebox/application/state.hpp"
 
 #include <array>
@@ -7,6 +6,12 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <version>
+
+#if defined(__cpp_lib_jthread) && __cpp_lib_jthread >= 201911L
+#include "racebox/application/services.hpp"
+#define RACEBOX_TEST_STOP_TOKEN_CONTRACT 1
+#endif
 
 namespace {
 
@@ -21,6 +26,7 @@ racebox::LapInfo lap(racebox::Timestamp duration, racebox::LapPhase phase) {
     return value;
 }
 
+#if defined(RACEBOX_TEST_STOP_TOKEN_CONTRACT)
 class FakeHttpTransport final : public racebox::application::HttpTransport {
 public:
     racebox::application::HttpResponse perform(
@@ -32,6 +38,7 @@ public:
 
     bool saw_stop_token{};
 };
+#endif
 
 }  // namespace
 
@@ -109,6 +116,7 @@ int main() {
         require(!state.selection.corner, "Document reset retained the old selection");
         require(state.notifications.empty(), "Document reset retained document-specific notifications");
 
+#if defined(RACEBOX_TEST_STOP_TOKEN_CONTRACT)
         FakeHttpTransport transport;
         std::stop_source stop_source;
         HttpRequest request;
@@ -120,6 +128,7 @@ int main() {
         PlatformServices services;
         services.http = &transport;
         require(!services.offline_ready(), "Network-only services must not claim offline readiness");
+#endif
 
         std::cout << "Application state/service contract tests passed\n";
         return 0;
